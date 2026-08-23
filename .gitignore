@@ -1,0 +1,61 @@
+# ============================================================
+# Portfolio GA + Backend - Python project .gitignore
+# ============================================================
+
+# ---------- Local data (large datasets - not committed) ------
+/data
+*.parquet
+*.xlsx
+
+# ---------- Python caches / compiled files -------------------
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.class
+
+# ---------- Build / packaging artifacts -----------------------
+dist/
+build/
+*.egg-info/
+.eggs/
+sdist/
+wheels/
+*.egg
+
+# ---------- Virtual environments ------------------------------
+.venv/
+venv/
+env/
+ENV/
+pyvenv.cfg
+
+# ---------- Environment / secrets (backend) -------------------
+.env
+.env.*
+!.env.example
+
+# ---------- Testing / coverage / linting ----------------------
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.pyre/
+
+# ---------- IDEs / editors / OS -------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ---------- Backend logs / runtime ----------------------------
+logs/
+*.log
+!logs/.gitkeep
+
+# ---------- GA run artifacts ----------------------------------
+*.csv
