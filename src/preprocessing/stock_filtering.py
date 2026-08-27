@@ -14,7 +14,7 @@ def fetch_fundamental_minimal(ticker):
             'Kode': ticker, # Samakan key dengan master agar mudah di-join
             'EPS': info.get('trailingEps', 0) or 0,
             'ROE': info.get('returnOnEquity', 0) or 0,
-            'DER': info.get('debtToEquity', 0) or 0
+            'DER': info.get('debtToEquity', None) or 0
         }
     except Exception:
         return None
@@ -72,7 +72,7 @@ def run_live_preprocessing():
     ticker_yf = [t + ".JK" for t in df_master.index] 
 
     # Tarik OHLCV (Hanya untuk keperluan ADTV 60 dan Vol Sporadis)
-    df_tech = yf.download(ticker_yf, period="90d", interval="1d", group_by='ticker')
+    df_tech = yf.download(ticker_yf, period="120d", interval="1d", group_by='ticker')
 
     # Eksekusi Multithreading untuk data fundamental (EPS, ROE, DER)
     fundamentals = []
@@ -95,19 +95,81 @@ def run_live_preprocessing():
             if len(df_saham) == 0:
                 continue
 
-            # ADTV 60 Hari
-            trading_value = df_saham['Close'] * df_saham['Volume']
-            adtv_60 = trading_value.tail(60).mean()
+            # # 1. Kalkulasi Nilai Transaksi Harian (Trading Value)
+            # trading_value = df_saham['Close'] * df_saham['Volume']
+            
+            # # 2. ADTV (Mean) dan MDTV (Median) 60 Hari
+            # val_60d_mean = float(trading_value.tail(60).mean())
+            # val_60d_median = float(trading_value.tail(60).median())
+            
+            # # Proteksi error division by zero jika median = 0
+            # if val_60d_median == 0:
+            #     is_sporadic = True
+            # else:
+            #     # 3. Rasio Skewness (Kemiringan Outlier)
+            #     # Jika Mean > 3x lipat Median, berarti ada outlier likuiditas semu
+            #     rasio_outlier = val_60d_mean / val_60d_median
+                
+            #     # Tambahkan Skenario Crossing dari diskusi sebelumnya
+            #     freq_today = float(df_master.loc[ticker, 'Frequency'])
+            #     vol_today = float(df_saham['Volume'].iloc[-1])
+            #     crossing_palsu = (vol_today > 1_000_000) and (freq_today < 100)
+                
+            #     # Eksekusi Filter Sporadis
+            #     is_sporadic = (rasio_outlier > 3.0) or crossing_palsu
 
-            # Deteksi Sporadis
-            vol_30d_median = df_saham['Volume'].tail(30).median()
-            vol_today = df_saham['Volume'].iloc[-1]
-            is_sporadic = (vol_30d_median < 1000) and (vol_today > 1000000)
+            # tech_metrics.append({
+            #     'Kode': ticker,
+            #     'ADTV_60': val_60d_mean,
+            #     'Is_Sporadic': is_sporadic
+            # })
+            
+            # 1. Kalkulasi Nilai Transaksi (Trading Value) & Median Volume
+            trading_value = df_saham['Close'] * df_saham['Volume']
+            val_60d_mean = float(trading_value.tail(60).mean())
+            val_60d_median = float(trading_value.tail(60).median())
+            vol_30d_median = float(df_saham['Volume'].tail(30).median())
+            
+            if val_60d_median == 0:
+                is_sporadic = True # Langsung buang jika median transaksinya 0 (saham mati total)
+            else:
+                # --- PELINDUNG 1: Deteksi Likuiditas Semu (Statistik Outlier) ---
+                rasio_outlier = val_60d_mean / val_60d_median
+                indikasi_likuiditas_semu = (rasio_outlier > 3.0)
+                
+                # --- PELINDUNG 2: Deteksi Transaksi Crossing ---
+                freq_today = float(df_master.loc[ticker, 'Frequency'])
+                vol_today = float(df_saham['Volume'].iloc[-1])
+                vol_30d_mean = float(df_saham['Volume'].tail(30).mean())
+                
+                # Hitung ukuran rata-rata per transaksi KHUSUS hari ini
+                avg_trade_size_today = vol_today / max(freq_today, 1)
+                avg_trade_value_today = (vol_today * float(df_saham['Close'].iloc[-1])) / max(freq_today, 1)
+
+                # Logika Crossing Baru:
+                # 1. Volume hari ini meledak (> 2x lipat dari rata-rata 30 hari)
+                # 2. DAN satu kali transaksi rata-rata memborong > 50.000 lembar (500 lot). 
+                # (Ritel normal jarang melakukan transaksi rata-rata sebesar ini dalam satu klik)
+                indikasi_crossing = (vol_today > (vol_30d_mean * 2)) and (avg_trade_value_today > 50_000)
+                
+                # --- PELINDUNG 3: Deteksi Kenaikan Harga Kosong (Fake Markup) ---
+                harga_naik = df_saham['Close'].diff() > 0
+                volume_tipis = df_saham['Volume'] < (vol_30d_median * 0.5)
+                pola_markup = (harga_naik & volume_tipis).tail(3)
+                indikasi_markup = pola_markup.sum() >= 2
+
+                # KESIMPULAN: Jika salah satu indikator menyala, tandai sebagai saham berbahaya
+                is_sporadic = indikasi_likuiditas_semu or indikasi_crossing or indikasi_markup
 
             tech_metrics.append({
                 'Kode': ticker,
-                'ADTV_60': float(adtv_60),
-                'Is_Sporadic': is_sporadic
+                'ADTV_60': val_60d_mean,
+                'Is_Sporadic': is_sporadic,
+                'Sporadic_Reason': [k for k, v in {
+                    'likuiditas_semu': indikasi_likuiditas_semu,
+                    'crossing': indikasi_crossing,
+                    'markup': indikasi_markup
+                }.items() if v]
             })
         except Exception:
             continue

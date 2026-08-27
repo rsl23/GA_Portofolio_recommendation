@@ -1,8 +1,9 @@
+from src.backend.core.config import settings
 import requests
 from datetime import datetime
 from sqlalchemy.orm import Session
 
-ZAPI_URL = "https://api.zpi.web.id/v1/finance:idx"
+ZAPI_URL = settings.BASE_URL
 
 def fetch_listing_date():
     """Fetch listing date for all ticker from 1977 to now using ZPI API."""

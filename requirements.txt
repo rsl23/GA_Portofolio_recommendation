@@ -2,3 +2,8 @@ numpy
 pandas
 openpyxl
 pyarrow
+fastapi
+uvicorn
+pydantic-settings
+sqlalchemy
+psycopg2-binary
