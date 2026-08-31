@@ -1,5 +1,6 @@
 from sqlalchemy import Column, String, Float, DateTime
 from datetime import datetime
+from sqlalchemy.sql import func
 # Asumsi Base berasal dari konfigurasi database.py milikmu
 from .database import Base 
 
@@ -16,12 +17,17 @@ class FilteredStockCache(Base):
     market_cap = Column(Float)
     
     # Metrik Fundamental
+    per = Column(Float)
+    pbv = Column(Float)
     eps = Column(Float)
     roe = Column(Float)
     der = Column(Float)
+    
+    dividend_yield = Column(Float, default=0.0)
     
     # Metrik Teknikal
     adtv_60 = Column(Float)
     
     # Waktu pembaruan data
-    updated_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    
