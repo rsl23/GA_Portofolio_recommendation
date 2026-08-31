@@ -8,6 +8,8 @@
 *.xlsx
 
 # ---------- Python caches / compiled files -------------------
+# __pycache__/ (tanpa path) mencakup SEMUA folder __pycache__
+# di level direktori mana pun (mis. src/gaengine/__pycache__/).
 __pycache__/
 *.py[cod]
 *.pyd
