@@ -20,7 +20,7 @@ def tournament_select(population, k: int = 5, rng=None):
             best = c
     return best
 
-
+#  ini menggunakan crossover yang biasa saja, tidak memperhatikan saham yg aktif
 def two_point_crossover(parent_a, parent_b, rng=None):
     """Swap the gene segment between two random cut points; return two children."""
     rng = _rng(rng)

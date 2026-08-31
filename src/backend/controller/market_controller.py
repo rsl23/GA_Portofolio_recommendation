@@ -30,11 +30,11 @@ def save_filtered_stocks_to_db(data_records: list):
             
         # Simpan ke database
         db.commit()
-        print(f"✅ Background Task: {len(data_records)} saham berhasil disimpan ke tabel FilteredStockCache.")
+        print(f"Background Task: {len(data_records)} saham berhasil disimpan ke tabel FilteredStockCache.")
     
     except Exception as e:
         db.rollback()
-        print(f"❌ Background Task Error saat menyimpan ke DB: {e}")
+        print(f"Background Task Error saat menyimpan ke DB: {e}")
     finally:
         # Tutup sesi agar memori tidak bocor
         db.close()
