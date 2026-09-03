@@ -1,5 +1,5 @@
 from sqlalchemy import Column, String, Date
-from database import Base # Sesuaikan dengan file koneksi DB-mu
+from .database import Base # Sesuaikan dengan file koneksi DB-mu
 
 class StockUniverse(Base):
     __tablename__ = "stock_universe"

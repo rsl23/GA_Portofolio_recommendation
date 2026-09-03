@@ -33,6 +33,13 @@ class Chromosome:
         self.budget_ok = True
         self.diversification_ok = True
 
+        # --- metrik yang disimpan untuk pelaporan hasil -----------------
+        self.sharpe_ratio = 0.0
+        self.roi_annual = 0.0
+        self.max_drawdown = 0.0
+        self.avg_correlation = 0.0
+        self.skor_fundamental = 0.0
+
     # ------------------------------------------------------------------
     # representation helpers
     # ------------------------------------------------------------------
@@ -195,4 +202,11 @@ class Chromosome:
             - budget_death
             - div_death
         )
+
+        # Simpan metrik lengkap agar bisa dilaporkan oleh controller
+        self.sharpe_ratio = sharpe
+        self.roi_annual = ret_ann
+        self.max_drawdown = abs(mdd)
+        self.avg_correlation = avg_corr
+        self.skor_fundamental = fund_avg
         return self.fitness
