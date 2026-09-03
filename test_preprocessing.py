@@ -16,11 +16,20 @@ def test_filtering():
         print("========================================")
         print(f"Total Saham Lolos Filter : {len(daftar_saham)} Saham")
         print(f"Daftar Ticker            : {daftar_saham}")
+        from src.backend.controller.market_controller import save_filtered_stocks_to_db
         
-        # Simpan hasilnya ke file Excel agar mudah dibaca dan divalidasi
+        # 1. Konversi ke bentuk Dictionary List
+        df_json = df_lolos.reset_index().to_dict(orient="records")
+        
+        # 2. Simpan ke Database
+        print("\n⏳ Menyimpan hasil filter ke dalam Database...")
+        save_filtered_stocks_to_db(df_json)
+        print("✅ Tersimpan di database!")
+        
+        # 3. Simpan hasilnya ke file Excel agar mudah dibaca secara manual
         file_excel = "hasil_filtering_saham.xlsx"
         
-        # Rapikan DataFrame sebelum di-export (tambahkan kolom Index/Kode ke dalam Excel)
+        # Rapikan DataFrame sebelum di-export
         df_export = df_lolos.copy()
         
         # Export ke excel
