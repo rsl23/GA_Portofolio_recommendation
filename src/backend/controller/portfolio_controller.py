@@ -1,33 +1,41 @@
+import logging
 from uuid import uuid4
 
 import numpy as np
-from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
-from src.backend.models.schemas.portfolio_schema import PortfolioGenerateRequest
+from src.backend.models.schemas.portfolio_schema import (
+    PortfolioGenerateRequest,
+    PortfolioResponse,
+)
 from src.gaengine.data_loader_live import build_market_data
 from src.gaengine.engine import GeneticEngine
 from src.gaengine.ga_config import GAConfig
 
+logger = logging.getLogger(__name__)
 
-def generate_new_portfolio(db: Session, request: PortfolioGenerateRequest, market_data=None):
+
+class MarketDataUnavailableError(Exception):
+    """Exception domain: MarketData gagal dibentuk / cache saham kosong."""
+
+
+def generate_new_portfolio(db: Session, request: PortfolioGenerateRequest, market_data=None) -> PortfolioResponse:
     """
     Controller Otak Utama:
     1. Memakai MarketData live (bisa reused dari app.state atau dibangun ulang).
     2. Menjalankan Algoritma Genetika sesuai modal & profil risiko pengguna.
     3. Menyusun laporan hasil (tanpa menyimpan ke database untuk sekarang).
     """
-    print(f"Menjalankan GA untuk profil {request.risk_profile} dengan modal Rp{request.budget:,.2f}")
+    logger.info("Menjalankan GA untuk profil %s dengan modal Rp%.2f", request.risk_profile, request.budget)
 
     # 1. Siapkan MarketData. Kalau tidak diberi (None) dari luar, bangun sendiri.
     if market_data is None:
-        print("Membentuk MarketData menggunakan data LIVE...")
+        logger.info("Membentuk MarketData menggunakan data LIVE...")
         market_data = build_market_data(min_price=50.0)
 
     if market_data is None or market_data.n_stocks == 0:
-        raise HTTPException(
-            status_code=500,
-            detail="Gagal membentuk MarketData. Pastikan tabel filtered_stock_cache sudah terisi.",
+        raise MarketDataUnavailableError(
+            "Gagal membentuk MarketData. Pastikan tabel filtered_stock_cache sudah terisi."
         )
 
     # 2. Konfigurasi GA mengikuti profil & modal dari payload request
@@ -44,7 +52,7 @@ def generate_new_portfolio(db: Session, request: PortfolioGenerateRequest, marke
     )
 
     # 3. Evolusi genetika
-    print("=== MEMULAI EVOLUSI GENETIKA ===")
+    logger.info("=== MEMULAI EVOLUSI GENETIKA ===")
     engine = GeneticEngine(config)
     solution = engine.run(verbose=True)
 
@@ -91,20 +99,20 @@ def generate_new_portfolio(db: Session, request: PortfolioGenerateRequest, marke
         f"Rekomendasi ini dihasilkan Algoritma Genetika dan belum disimpan ke database."
     )
 
-    return {
-        "id": str(uuid4()),
-        "fitness_score": float(solution.fitness),
-        "sharpe_ratio": float(solution.sharpe_ratio),
-        "expected_return": expected_return,
-        "max_drawdown": float(solution.max_drawdown),
-        "avg_correlation": float(solution.avg_correlation),
-        "skor_fundamental": float(solution.skor_fundamental),
-        "total_terpakai": total,
-        "sisa_budget": request.budget - total,
-        "n_active": int(solution.n_active),
-        "allocated_budget_ok": bool(solution.budget_ok),
-        "risk_profile": request.risk_profile,
-        "budget": request.budget,
-        "allocations": allocations,
-        "narasi_llm": narasi,
-    }
+    return PortfolioResponse(
+        id=str(uuid4()),
+        fitness_score=float(solution.fitness),
+        sharpe_ratio=float(solution.sharpe_ratio),
+        expected_return=expected_return,
+        max_drawdown=float(solution.max_drawdown),
+        avg_correlation=float(solution.avg_correlation),
+        skor_fundamental=float(solution.skor_fundamental),
+        total_terpakai=total,
+        sisa_budget=request.budget - total,
+        n_active=int(solution.n_active),
+        allocated_budget_ok=bool(solution.budget_ok),
+        risk_profile=request.risk_profile,
+        budget=request.budget,
+        allocations=allocations,
+        narasi_llm=narasi,
+    )

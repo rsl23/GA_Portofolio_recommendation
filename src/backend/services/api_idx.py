@@ -1,14 +1,9 @@
-import os
-from pathlib import Path
 import requests
 from datetime import datetime
-from dotenv import load_dotenv
 
-# Load variabel dari file .env
-env_path = Path('.') / '.env'
-load_dotenv(dotenv_path=env_path)
+from src.backend.core.config import settings
 
-BASE_URL = os.getenv("BASE_URL")
+BASE_URL = settings.BASE_URL
 
 def fetch_api_idx_saham(length: int = 1000, boards: list = ["Utama", "Pengembangan"]):
     """
@@ -16,7 +11,7 @@ def fetch_api_idx_saham(length: int = 1000, boards: list = ["Utama", "Pengembang
     """
     endpoint = f"{BASE_URL}/finance:idx/companies"
     
-    api_key = os.getenv("X_API_KEY") 
+    api_key = settings.X_API_KEY
     if not api_key:
         print("WARNING: x-api-key tidak ditemukan di .env!")
 
@@ -73,7 +68,7 @@ def fetch_api_stock_summary(length: int = 5000, target_date: str = None):
         
     endpoint = f"{BASE_URL}/finance:idx/stock-summary"
     
-    api_key = os.getenv("X_API_KEY") 
+    api_key = settings.X_API_KEY
     if not api_key:
         print("WARNING: x-api-key tidak ditemukan di .env!")
 

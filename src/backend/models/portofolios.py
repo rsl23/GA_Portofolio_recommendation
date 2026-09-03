@@ -1,10 +1,9 @@
-from sqlalchemy import Boolean, Column, Float, ForeignKey, String, DateTime, Text 
-from sqlalchemy.orm import declarative_base, relationship
+from sqlalchemy import Boolean, Column, Float, ForeignKey, String, DateTime, Text
+from sqlalchemy.orm import relationship
+from src.backend.models.database import Base
 from sqlalchemy.dialects.postgresql import UUID
 from datetime import datetime
 import uuid
-
-Base = declarative_base()
 
 class Portofolio(Base):
     __tablename__ = 'portofolios'

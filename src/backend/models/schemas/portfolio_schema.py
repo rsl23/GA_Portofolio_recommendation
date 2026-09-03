@@ -1,5 +1,16 @@
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Optional, Generic, TypeVar
+
+# Tipe generik untuk payload di dalam envelope ApiResponse
+T = TypeVar("T")
+
+
+# Envelope respons seragam untuk seluruh endpoint API.
+# Dipakai dengan mengisi T, contoh: ApiResponse[PortfolioResponse]
+class ApiResponse(BaseModel, Generic[T]):
+    status: str = "success"          # "success" atau "error"
+    message: str = ""                # deskripsi singkat hasil operasi
+    data: Optional[T] = None         # payload utama (None jika error)
 
 # Schema untuk Validasi Input (Request)
 class PortfolioGenerateRequest(BaseModel):

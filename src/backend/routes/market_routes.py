@@ -1,38 +1,26 @@
-from fastapi import APIRouter, BackgroundTasks
-from src.preprocessing.stock_filtering import run_live_preprocessing
-from src.backend.controller.market_controller import save_filtered_stocks_to_db
+from fastapi import APIRouter, BackgroundTasks, HTTPException
+from src.backend.models.schemas.market_schema import MarketFilterResponse
+from src.backend.models.schemas.portfolio_schema import ApiResponse
+from src.backend.controller.market_controller import (
+    StockFilteringError,
+    run_and_cache_stock_filtering,
+)
 
 router = APIRouter()
 
-@router.get("/filter-stocks")
+@router.get("/filter-stocks", response_model=ApiResponse[MarketFilterResponse])
 def filter_stocks_endpoint(background_tasks: BackgroundTasks):
     """
-    Endpoint ini akan menjalankan pipeline seleksi saham secara live.
-    1. Mengunduh data & memfilter saham (Synchronous - butuh 1-2 menit).
-    2. Mengirim hasilnya ke tabel Database secara Asynchronous (Background).
-    3. Mengembalikan format JSON ke Frontend (Response instan).
+    Endpoint tipis: seluruh logika ada di market_controller.
+    Respons dibungkus envelope seragam: {status, message, data}.
     """
     try:
-        # 1. Jalankan proses utama
-        daftar_saham, df_lolos = run_live_preprocessing()
-        
-        # 2. Konversi Pandas DataFrame ke format List of Dictionary agar menjadi JSON murni
-        # Kita menggunakan reset_index() karena 'Kode' tersembunyi sebagai index di df_lolos
-        df_json = df_lolos.reset_index().to_dict(orient="records")
-        
-        # 3. Lempar tugas simpan DB ke background
-        background_tasks.add_task(save_filtered_stocks_to_db, df_json)
-        
-        # 4. Kirim response ke Frontend langsung tanpa menunggu proses save DB selesai
-        return {
-            "status": "success",
-            "message": "Filtering berhasil dilakukan.",
-            "total_saham": len(daftar_saham),
-            "data": df_json
-        }
-    except Exception as e:
-        return {
-            "status": "error",
-            "message": str(e)
-        }
+        hasil = run_and_cache_stock_filtering(background_tasks)
+    except StockFilteringError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    return ApiResponse(
+        status="success",
+        message="Filtering berhasil dilakukan.",
+        data=hasil,
+    )
 

@@ -1,10 +1,9 @@
-from sqlalchemy import Column, String, DateTime 
-from sqlalchemy.orm import declarative_base, relationship
+from sqlalchemy import Column, String, DateTime
+from sqlalchemy.orm import relationship
+from src.backend.models.database import Base
 from sqlalchemy.dialects.postgresql import UUID
 from datetime import datetime
 import uuid
-
-Base = declarative_base()
 
 class User(Base):
     __tablename__ = 'users'
@@ -14,7 +13,7 @@ class User(Base):
     email = Column(String(100), unique=True, nullable=False)
     password_hash = Column(String(128), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
-    risk_profile = Column(String(50), nullable=False, default="Moderate")  # Conservative, Moderate, Aggressive
+    risk_profile = Column(String(50), nullable=True, default="Moderate")  # Conservative, Moderate, Aggressive
     
     portofolios = relationship("Portofolio", back_populates="user")
 
