@@ -27,7 +27,7 @@ def fetch_api_idx_saham(length: int = 1000, boards: list = ["Utama", "Pengembang
     hasil_format = []
     
     try:
-        response = requests.get(endpoint, headers=headers, params=params, timeout=20)
+        response = requests.get(endpoint, headers=headers, params=params, timeout=30)
         response.raise_for_status() 
         
         data = response.json()
@@ -88,7 +88,7 @@ def fetch_api_stock_summary(length: int = 5000, target_date: str = None):
     hasil_format = []
     
     try:
-        response = requests.get(endpoint, headers=headers, params=params, timeout=20)
+        response = requests.get(endpoint, headers=headers, params=params, timeout=30)
         response.raise_for_status() 
         
         data = response.json()

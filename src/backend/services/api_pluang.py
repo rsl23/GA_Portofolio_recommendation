@@ -28,7 +28,7 @@ def fetch_api_pluang_fundamentals(code: str):
     }
     
     try:
-        response = requests.get(endpoint, headers=headers, params=params, timeout=15)
+        response = requests.get(endpoint, headers=headers, params=params, timeout=30)
         response.raise_for_status() 
         return response.json()
     except requests.exceptions.RequestException as e:

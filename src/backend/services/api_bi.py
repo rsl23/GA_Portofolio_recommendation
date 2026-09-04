@@ -25,7 +25,7 @@ def fetch_bi_rate():
     }
     
     try:
-        response = requests.get(endpoint, headers=headers, timeout=15)
+        response = requests.get(endpoint, headers=headers, timeout=30)
         response.raise_for_status()  # Raise an error for bad responses
         data = response.json().get('data', {}).get('items', [])
         latest = max(data, key=lambda x: x.get("date", "")) if data else None
