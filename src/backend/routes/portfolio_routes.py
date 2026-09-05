@@ -12,6 +12,7 @@ from src.backend.models.schemas.portfolio_schema import (
 from src.backend.controller.portfolio_controller import (
     MarketDataUnavailableError,
     PortfolioNotFoundError,
+    StockNotFoundError,
     UserNotFoundError,
     generate_new_portfolio,
     get_active_portfolio,
@@ -47,6 +48,9 @@ def api_generate_portfolio(
     except MarketDataUnavailableError as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
+    except StockNotFoundError as e:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=str(e))
     except SQLAlchemyError as e:
         db.rollback()
         raise HTTPException(

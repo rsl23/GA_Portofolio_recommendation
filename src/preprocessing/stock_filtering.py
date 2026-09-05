@@ -5,6 +5,70 @@ from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from src.backend.services.api_idx import fetch_api_idx_saham, fetch_api_stock_summary
+from src.backend.models.database import SessionLocal
+from src.backend.models.stock_universe import StockUniverse
+
+
+def sync_stock_universe(df_companies: pd.DataFrame) -> tuple[int, int]:
+    """
+    Pastikan semua emiten hasil fetch API IDX terdaftar di tabel stock_universe.
+    - Ticker yang belum ada -> di-INSERT (listing_date dari TanggalPencatatan,
+      nama_perusahaan dari Nama).
+    - Ticker yang sudah ada -> dibiarkan (tidak di-update).
+    Returns: (jumlah_baru, jumlah_sudah_ada)
+    """
+    if df_companies.empty:
+        return 0, 0
+
+    tickers_api = df_companies['Kode'].astype(str).str.strip().tolist()
+
+    db = SessionLocal()
+    inserted = 0
+    skipped = 0
+    try:
+        # Satu query: ticker mana saja yang sudah terdaftar
+        existing = {
+            t for (t,) in (
+                db.query(StockUniverse.ticker)
+                .filter(StockUniverse.ticker.in_(tickers_api))
+                .all()
+            )
+        }
+
+        for _, row in df_companies.iterrows():
+            ticker = str(row['Kode']).strip()
+            if not ticker or ticker in existing:
+                skipped += 1
+                continue
+
+            # TanggalPencatatan -> listing_date (boleh None bila API kosong,
+            # kolom didefinisikan nullable=False -> fallback None ditolak DB)
+            listing = row.get('TanggalPencatatan')
+            if isinstance(listing, str) and listing:
+                try:
+                    listing = pd.to_datetime(listing).date()
+                except (ValueError, TypeError):
+                    listing = None
+
+            db.add(StockUniverse(
+                ticker=ticker,
+                nama_perusahaan=str(row.get('Nama', ''))[:100],
+                listing_date=listing,
+            ))
+            existing.add(ticker)
+            inserted += 1
+
+        if inserted:
+            db.commit()
+            print(f"   [+] Sync stock_universe: {inserted} emiten baru ditambahkan, {skipped} sudah terdaftar.")
+        else:
+            print(f"   [OK] Sync stock_universe: semua {skipped} emiten sudah terdaftar.")
+        return inserted, skipped
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 def fetch_fundamental_minimal(ticker):
     """Hanya mengambil EPS, ROE, dan DER. Market Cap & Sektor sudah di-handle API"""
@@ -30,6 +94,12 @@ def run_live_preprocessing():
 
     if df_companies.empty or df_summary.empty:
         raise ValueError("Data dari API ZPI kosong! Mohon cek koneksi atau konfigurasi API Key Anda.")
+
+    # SYNC STOCK_UNIVERSE: pastikan semua emiten terdaftar sebelum filtering.
+    # Emiten baru dari API langsung dimasukkan (listing_date <- TanggalPencatatan),
+    # sehingga generate portofolio tidak akan pernah gagal StockNotFoundError.
+    print("1a. Sinkronisasi stock_universe...")
+    sync_stock_universe(df_companies)
 
     # FILTER 1A: Usia IPO > 2 Tahun
     df_companies['TanggalPencatatan'] = pd.to_datetime(df_companies['TanggalPencatatan'])

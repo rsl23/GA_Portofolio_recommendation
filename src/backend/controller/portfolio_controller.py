@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from src.backend.models.users import User
 from src.backend.models.portofolios import Portofolio
 from src.backend.models.portofolio_items import PortofolioItem
+from src.backend.models.stock_universe import StockUniverse
 from src.backend.models.schemas.portfolio_schema import (
     PortfolioGenerateRequest,
     PortfolioResponse,
@@ -30,6 +31,10 @@ class UserNotFoundError(Exception):
 
 class PortfolioNotFoundError(Exception):
     """Exception domain: user belum memiliki portofolio aktif."""
+
+
+class StockNotFoundError(Exception):
+    """Exception domain: ticker dari market_data tidak terdaftar di stock_universe."""
 
 
 def generate_new_portfolio(
@@ -163,10 +168,26 @@ def generate_new_portfolio(
     db.add(portofolio)
     db.flush()  # dapatkan portofolio.id sebelum commit (id di-generate default-nya)
 
+    # Map ticker -> id_stock dari stock_universe (wajib terdaftar karena
+    # sync harian API ZPI; ticker asing = bug preprocessing, gagal keras).
+    needed_tickers = list({t for t, lot, _ in rows if lot > 0})
+    stock_rows = (
+        db.query(StockUniverse)
+        .filter(StockUniverse.ticker.in_(needed_tickers))
+        .all()
+    )
+    ticker_to_id = {s.ticker: s.id_stock for s in stock_rows}
+    missing = [t for t in needed_tickers if t not in ticker_to_id]
+    if missing:
+        db.rollback()
+        raise StockNotFoundError(
+            f"Ticker berikut tidak terdaftar di stock_universe: {', '.join(missing)}"
+        )
+
     items = [
         PortofolioItem(
             portofolio_id=portofolio.id,
-            ticker=ticker,
+            stock_id=ticker_to_id[ticker],
             bobot_persentase=float((lot * price / total) * 100.0) if total else 0.0,
             jumlah_lot=lot,
             harga_acuan=price,
@@ -214,15 +235,26 @@ def _parse_user_uuid(user_id: str, db: Session) -> UUID:
     return user_uuid
 
 
-def _to_item_response(item: PortofolioItem) -> PortfolioItem:
-    """Konversi PortofolioItem (ORM) ke schema PortfolioItem (response API)."""
+def _to_item_response(item: PortofolioItem, ticker: str) -> PortfolioItem:
+    """Konversi PortofolioItem (ORM) + ticker (dari join stock_universe) ke schema response."""
     total = item.total_investasi or 0.0
     return PortfolioItem(
-        ticker=item.ticker,
+        ticker=ticker,
         lots=item.jumlah_lot,
         price_per_lot=item.harga_acuan,
         allocation=total,
         weight=(item.bobot_persentase or 0.0) / 100.0,
+    )
+
+
+def _query_items_with_ticker(db: Session, portofolio_id) -> list[tuple[PortofolioItem, str]]:
+    """Query item portofolio di-join ke stock_universe agar ticker tersedia untuk response."""
+    return (
+        db.query(PortofolioItem, StockUniverse.ticker)
+        .join(StockUniverse, PortofolioItem.stock_id == StockUniverse.id_stock)
+        .filter(PortofolioItem.portofolio_id == portofolio_id)
+        .order_by(PortofolioItem.total_investasi.desc())
+        .all()
     )
 
 
@@ -249,12 +281,8 @@ def get_active_portfolio(db: Session, user_id: str) -> PortfolioResponse:
     if portofolio is None:
         raise PortfolioNotFoundError("User belum memiliki portofolio aktif.")
 
-    items = (
-        db.query(PortofolioItem)
-        .filter(PortofolioItem.portofolio_id == portofolio.id)
-        .order_by(PortofolioItem.total_investasi.desc())
-        .all()
-    )
+    item_pairs = _query_items_with_ticker(db, portofolio.id)
+    items = [pair[0] for pair in item_pairs]
 
     # Hitung ulang field yang tidak disimpan di DB
     total_terpakai = portofolio.total_terpakai
@@ -281,7 +309,7 @@ def get_active_portfolio(db: Session, user_id: str) -> PortfolioResponse:
         status_portofolio=portofolio.status_portofolio,
         created_at=portofolio.created_at,
         budget=portofolio.budget,
-        allocations=[_to_item_response(i) for i in items],
+        allocations=[_to_item_response(item, ticker) for item, ticker in item_pairs],
         narasi_llm=portofolio.narasi_llm,
     )
 
@@ -328,17 +356,18 @@ def get_portfolio_by_id(db: Session, portfolio_id: str) -> PortfolioResponse:
     if not portfolio:
         raise ValueError(f"Portofolio dengan ID {portfolio_id} tidak ditemukan.")
 
-    items = db.query(PortofolioItem).filter(PortofolioItem.portofolio_id == portfolio_uuid).all()
+    item_pairs = _query_items_with_ticker(db, portfolio_uuid)
+    items = [pair[0] for pair in item_pairs]
 
     allocations = [
         {
-            "ticker": item.ticker,
+            "ticker": ticker,
             "lots": item.jumlah_lot,
             "price_per_lot": item.harga_acuan,
             "allocation": item.total_investasi,
             "weight": item.bobot_persentase / 100.0,
         }
-        for item in items
+        for item, ticker in item_pairs
     ]
 
     return PortfolioResponse(
