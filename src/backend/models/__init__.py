@@ -7,6 +7,7 @@ from src.backend.models.portofolio_items import PortofolioItem
 from src.backend.models.stock_universe import StockUniverse
 from src.backend.models.market_status import DailyMarketStatus
 from src.backend.models.filtered_stocks_cache import FilteredStockCache
+from src.backend.models.market_data import MarketData
 
 __all__ = [
     "User",
@@ -15,4 +16,5 @@ __all__ = [
     "StockUniverse",
     "DailyMarketStatus",
     "FilteredStockCache",
+    "MarketData",
 ]
