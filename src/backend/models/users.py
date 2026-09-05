@@ -13,8 +13,7 @@ class User(Base):
     email = Column(String(100), unique=True, nullable=False)
     password_hash = Column(String(128), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
-    risk_profile = Column(String(50), nullable=True, default="Moderate")  # Conservative, Moderate, Aggressive
-    
+
     portofolios = relationship("Portofolio", back_populates="user")
 
     def __repr__(self):

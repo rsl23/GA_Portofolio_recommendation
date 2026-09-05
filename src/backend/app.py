@@ -14,13 +14,13 @@ async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
     
     # 2. Load data pasar ke memori untuk engine Algoritma Genetika
-    # print("Memuat MarketData ke RAM...")
-    # app.state.market_data_today = build_market_data()
+    print("Memuat MarketData ke RAM...")
+    app.state.market_data_today = build_market_data()
     
     yield
     
     # Clean up saat server dimatikan
-    # app.state.market_data_today = None
+    app.state.market_data_today = None
 
 # Gabungkan seluruh konfigurasi (metadata + lifespan) dalam SATU instance FastAPI
 app = FastAPI(

@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+﻿from pydantic import BaseModel, Field
 from typing import List, Optional, Generic, TypeVar
 
 # Tipe generik untuk payload di dalam envelope ApiResponse
@@ -14,7 +14,6 @@ class ApiResponse(BaseModel, Generic[T]):
 
 # Schema untuk Validasi Input (Request)
 class PortfolioGenerateRequest(BaseModel):
-    user_id: str
     budget: float = Field(..., gt=0, description="Total modal investasi dalam IDR")
     risk_profile: str = Field(..., description="Konservatif, Moderat, atau Agresif")
 

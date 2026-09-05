@@ -22,6 +22,9 @@ class Portofolio(Base):
     max_drawdown = Column(Float, nullable=False)
     avg_correlation = Column(Float, nullable=False)
     skor_fundamental = Column(Float, nullable=False)
+
+    # profil risiko saat portofolio digenerate (Conservative, Moderate, Aggressive)
+    risk_profile = Column(String(50), nullable=False, default="Moderate")
     
     # bobot pengali fitness
     mdd_lambda = Column(Float, nullable=False, default=1.0)
