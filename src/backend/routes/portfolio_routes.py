@@ -7,11 +7,15 @@ from src.backend.models.schemas.portfolio_schema import (
     ApiResponse,
     PortfolioGenerateRequest,
     PortfolioResponse,
+    PortfolioHistoryItem,
 )
 from src.backend.controller.portfolio_controller import (
     MarketDataUnavailableError,
+    PortfolioNotFoundError,
     UserNotFoundError,
     generate_new_portfolio,
+    get_active_portfolio,
+    list_portfolio_history,
 )
 
 router = APIRouter()
@@ -51,5 +55,48 @@ def api_generate_portfolio(
     return ApiResponse(
         status="success",
         message="Portofolio berhasil digenerate.",
+        data=hasil,
+    )
+
+
+@router.get("/my-portofolio", response_model=ApiResponse[PortfolioResponse])
+def api_my_portfolio(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Ambil portofolio AKTIF terbaru milik user (identitas diambil dari JWT,
+    bukan dari parameter). Dipakai halaman "My Portfolio".
+    404 jika user belum pernah generate portofolio.
+    """
+    try:
+        hasil = get_active_portfolio(db, user_id=current_user["sub"])
+    except UserNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except PortfolioNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return ApiResponse(
+        status="success",
+        message="Portofolio aktif berhasil diambil.",
+        data=hasil,
+    )
+
+
+@router.get("/my-portofolio/history", response_model=ApiResponse[list[PortfolioHistoryItem]])
+def api_my_portfolio_history(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Ambil seluruh histori portofolio milik user, terbaru dulu.
+    Portofolio lama yang sudah superseded berstatus "replaced" ikut tampil di sini.
+    """
+    try:
+        hasil = list_portfolio_history(db, user_id=current_user["sub"])
+    except UserNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return ApiResponse(
+        status="success",
+        message="Histori portofolio berhasil diambil.",
         data=hasil,
     )

@@ -1,5 +1,6 @@
 ﻿from pydantic import BaseModel, Field
 from typing import List, Optional, Generic, TypeVar
+from datetime import datetime
 
 # Tipe generik untuk payload di dalam envelope ApiResponse
 T = TypeVar("T")
@@ -25,20 +26,40 @@ class PortfolioItem(BaseModel):
     allocation: float              # alokasi dana = lots * price_per_lot
     weight: float                  # bobot alokasi terhadap total terpakai (0-1)
 
-# Schema untuk Standar Output (Response)
-class PortfolioResponse(BaseModel):
+
+# Baris riwayat portofolio (ringkasan, tanpa alokasi detail)
+class PortfolioHistoryItem(BaseModel):
     id: str
+    budget: float
+    total_terpakai: Optional[float]
+    sisa_budget: Optional[float]
     fitness_score: float
     sharpe_ratio: Optional[float]
-    expected_return: Optional[float]
+    max_drawdown: Optional[float]
+    risk_profile: str
+    status_portofolio: str
+    created_at: Optional[datetime] = None
+
+# Schema untuk Standar Output (Response)
+# Dipakai BERSAMA oleh generate (POST /generate), ambil aktif (GET /my-portofolio),
+# dan ambil by id. Field yang tidak tersimpan di DB (expected_return, n_active,
+# allocated_budget_ok) bersifat Optional — None saat dibaca dari database.
+class PortfolioResponse(BaseModel):
+    id: str
+    user_id: Optional[str] = None                 # pemilik portofolio (dari DB)
+    fitness_score: float
+    sharpe_ratio: Optional[float]
+    expected_return: Optional[float]              # hanya ada saat hasil GA (tidak disimpan)
     max_drawdown: Optional[float]
     avg_correlation: Optional[float]
     skor_fundamental: Optional[float]
     total_terpakai: Optional[float]
     sisa_budget: Optional[float]
-    n_active: Optional[int]
-    allocated_budget_ok: Optional[bool]
+    n_active: Optional[int]                       # jumlah saham aktif
+    allocated_budget_ok: Optional[bool]           # apakah alokasi muat dalam budget
     risk_profile: str
+    status_portofolio: Optional[str] = None       # active / replaced / dst (dari DB)
+    created_at: Optional[datetime] = None         # dari DB (None saat hasil GA sebelum refresh)
     budget: float
     allocations: List[PortfolioItem] = []
     narasi_llm: Optional[str]
