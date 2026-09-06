@@ -8,6 +8,7 @@ from src.backend.models.stock_universe import StockUniverse
 from src.backend.models.market_status import DailyMarketStatus
 from src.backend.models.filtered_stocks_cache import FilteredStockCache
 from src.backend.models.market_data import MarketData
+from src.backend.models.idx_composite import IdxComposite
 
 __all__ = [
     "User",
@@ -17,4 +18,5 @@ __all__ = [
     "DailyMarketStatus",
     "FilteredStockCache",
     "MarketData",
+    "IdxComposite",
 ]
