@@ -4,9 +4,7 @@ from src.backend.models.database import get_db
 from src.backend.models.schemas.market_schema import MarketFilterResponse
 from src.backend.models.schemas.portfolio_schema import ApiResponse
 from src.backend.controller.market_controller import (
-    PortfolioNotFoundError,
     StockFilteringError,
-    get_price_history,
     run_and_cache_stock_filtering,
 )
 from src.backend.services.price_history_service import sync_market_data
@@ -47,28 +45,5 @@ def sync_prices_endpoint(
         status="success",
         message="Sinkronisasi harga selesai.",
         data=stats,
-    )
-
-
-@router.get("/price-history", response_model=ApiResponse[dict])
-def price_history_endpoint(
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
-):
-    """
-    Ambil histori harga harian (OHLCV) semua saham milik user, dari tanggal
-    pembuatan portofolio terawal sampai tanggal data terbaru.
-    Identitas user diambil dari JWT (sub). Data di-group per ticker agar
-    langsung siap digambar chart (mis. performa portofolio vs IHSG).
-    404 jika user belum memiliki portofolio.
-    """
-    try:
-        hasil = get_price_history(db, user_id=current_user["sub"])
-    except PortfolioNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    return ApiResponse(
-        status="success",
-        message="Histori harga berhasil diambil.",
-        data=hasil,
     )
 

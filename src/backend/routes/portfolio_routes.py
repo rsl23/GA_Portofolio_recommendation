@@ -18,6 +18,11 @@ from src.backend.controller.portfolio_controller import (
     get_active_portfolio,
     list_portfolio_history,
 )
+from src.backend.controller.market_controller import (
+    get_portfolio_performance,
+    get_price_history,
+)
+from src.backend.core.deps import get_current_user
 
 router = APIRouter()
 
@@ -102,5 +107,52 @@ def api_my_portfolio_history(
     return ApiResponse(
         status="success",
         message="Histori portofolio berhasil diambil.",
+        data=hasil,
+    )
+
+
+@router.get("/price-history", response_model=ApiResponse[dict])
+def price_history_endpoint(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Ambil histori harga harian (OHLCV + adj_close) semua saham milik user pada
+    portofolio ACTIVE, dari tanggal pembuatan portofolio aktif sampai tanggal
+    data terbaru, beserta harga IHSG (benchmark) dari idx_composite.
+    Identitas user diambil dari JWT (sub). Data di-group per ticker agar
+    langsung siap digambar chart (mis. performa portofolio vs IHSG).
+    404 jika user belum memiliki portofolio aktif.
+    """
+    try:
+        hasil = get_price_history(db, user_id=current_user["sub"])
+    except PortfolioNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return ApiResponse(
+        status="success",
+        message="Histori harga berhasil diambil.",
+        data=hasil,
+    )
+
+
+@router.get("/portofolio_performance", response_model=ApiResponse[dict])
+def portofolio_performance_endpoint(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Hitung performa portofolio ACTIVE user vs IHSG dalam persentase return
+    kumulatif harian, sejak tanggal portofolio aktif dibuat.
+    Perhitungan berbasis kepemilikan lot: nilai portofolio harian =
+    SUM(jumlah_lot x 100 lembar x adj_close), return = nilai_t / nilai_t0 - 1.
+    404 jika user belum memiliki portofolio aktif / data harga belum tersedia.
+    """
+    try:
+        hasil = get_portfolio_performance(db, user_id=current_user["sub"])
+    except PortfolioNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return ApiResponse(
+        status="success",
+        message="Performa portofolio berhasil dihitung.",
         data=hasil,
     )
