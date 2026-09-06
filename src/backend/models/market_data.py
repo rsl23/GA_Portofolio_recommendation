@@ -23,6 +23,9 @@ class MarketData(Base):
     high = Column(Float, nullable=False)
     low = Column(Float, nullable=False)
     close = Column(Float, nullable=False)
+    # harga penutupan yang sudah disesuaikan aksi korporasi (split/dividen) —
+    # dipakai untuk hitung return portofolio yang akurat
+    adj_close = Column(Float, nullable=True)
     volume = Column(BigInteger, nullable=False)
 
     # satu saham hanya boleh punya satu baris harga per tanggal

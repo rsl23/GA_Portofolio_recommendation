@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 import logging
 
 from src.backend.models.market_data import MarketData
+from src.backend.models.idx_composite import IdxComposite
 from src.backend.models.portofolio_items import PortofolioItem
 from src.backend.models.portofolios import Portofolio
 from src.backend.models.stock_universe import StockUniverse
@@ -36,6 +37,78 @@ def _get_holdings_since(db: Session) -> list[tuple]:
     return [(r.stock_id, r.ticker, r.first_buy) for r in rows]
 
 
+IDX_TICKER = "^JKSE"  # IHSG di yfinance
+
+
+def _get_earliest_portfolio_date(db: Session):
+    """Tanggal pembentukan portofolio TERAWAL dari semua user (batas awal data IHSG)."""
+    dt = db.query(func.min(Portofolio.created_at)).scalar()
+    return dt.date() if dt is not None and hasattr(dt, "date") else dt
+
+
+def _sync_idx_composite(db: Session, start_date, errors: list[str]) -> int:
+    """
+    Sinkronisasi harga IHSG (^JKSE) via yfinance ke tabel idx_composite,
+    sejak tanggal portofolio terawal hingga hari ini. Upsert (ticker, date).
+    Returns: jumlah baris tersentuh.
+    """
+    try:
+        df = yf.download(
+            IDX_TICKER,
+            start=start_date.isoformat(),
+            interval="1d",
+            auto_adjust=False,
+            progress=False,
+        )
+        if df is None or df.empty:
+            errors.append(f"{IDX_TICKER}: tidak ada data harga dari yfinance")
+            return 0
+
+        # Normalisasi multi-index (yfinance kadang mengembalikan MultiIndex kolom)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        upserted = 0
+        for idx, row in df.iterrows():
+            row_date = idx.date() if hasattr(idx, "date") else idx
+            open_p = _to_float(row.get("Open"))
+            high_p = _to_float(row.get("High"))
+            low_p = _to_float(row.get("Low"))
+            close_p = _to_float(row.get("Close"))
+            if None in (open_p, high_p, low_p, close_p):
+                continue  # lewati baris NaN (hari libur / data kosong)
+
+            stmt = pg_insert(IdxComposite).values(
+                ticker=IDX_TICKER,
+                date=row_date,
+                open=open_p,
+                high=high_p,
+                low=low_p,
+                close=close_p,
+            )
+            # Upsert: baris (ticker, date) yang sudah ada di-update dengan harga terbaru
+            stmt = stmt.on_conflict_do_update(
+                constraint="uq_idx_composite_ticker_date",
+                set_={
+                    "open": stmt.excluded.open,
+                    "high": stmt.excluded.high,
+                    "low": stmt.excluded.low,
+                    "close": stmt.excluded.close,
+                },
+            )
+            db.execute(stmt)
+            upserted += 1
+
+        db.commit()
+        logger.info("idx_composite %s: %d baris tersinkron sejak %s", IDX_TICKER, upserted, start_date)
+        return upserted
+    except Exception as e:
+        db.rollback()
+        errors.append(f"{IDX_TICKER}: {e}")
+        logger.exception("Gagal sync harga IHSG")
+        return 0
+
+
 def sync_market_data(db: Session) -> dict:
     """
     Sinkronisasi histori harga harian (OHLCV) via yfinance untuk semua saham
@@ -46,13 +119,18 @@ def sync_market_data(db: Session) -> dict:
       ada di-UPDATE — penting agar harga hari ini selalu terbarui).
     Returns: statistik {stocks, rows_upserted, errors}.
     """
-    holdings = _get_holdings_since(db)
-    if not holdings:
-        logger.info("Sync market_data dilewati: belum ada saham yang dibeli user.")
-        return {"stocks": 0, "rows_upserted": 0, "errors": []}
+    earliest_portfolio_date = _get_earliest_portfolio_date(db)
+    if earliest_portfolio_date is None:
+        logger.info("Sync market_data dilewati: belum ada portofolio sama sekali.")
+        return {"stocks": 0, "rows_upserted": 0, "idx_rows_upserted": 0, "errors": []}
 
     errors: list[str] = []
     total_upserted = 0
+
+    # 1. Sinkronkan harga IHSG (benchmark) sejak portofolio terawal dibuat
+    idx_upserted = _sync_idx_composite(db, earliest_portfolio_date, errors)
+
+    holdings = _get_holdings_since(db)
 
     for stock_id, ticker, first_buy in holdings:
         start_date = first_buy.date() if hasattr(first_buy, "date") else first_buy
@@ -81,6 +159,7 @@ def sync_market_data(db: Session) -> dict:
                 low_p = _to_float(row.get("Low"))
                 close_p = _to_float(row.get("Close"))
                 volume = _to_float(row.get("Volume"))
+                adj_close_p = _to_float(row.get("Adj Close"))
                 if None in (open_p, high_p, low_p, close_p, volume):
                     continue  # lewati baris NaN (hari libur / data kosong)
 
@@ -91,6 +170,7 @@ def sync_market_data(db: Session) -> dict:
                     high=high_p,
                     low=low_p,
                     close=close_p,
+                    adj_close=adj_close_p,  # boleh None (mis. yfinance tidak menyediakan)
                     volume=int(volume),
                 )
                 # Upsert: baris (stock_id, date) yang sudah ada di-update dengan
@@ -102,6 +182,7 @@ def sync_market_data(db: Session) -> dict:
                         "high": stmt.excluded.high,
                         "low": stmt.excluded.low,
                         "close": stmt.excluded.close,
+                        "adj_close": stmt.excluded.adj_close,
                         "volume": stmt.excluded.volume,
                     },
                 )
@@ -119,6 +200,7 @@ def sync_market_data(db: Session) -> dict:
     return {
         "stocks": len(holdings),
         "rows_upserted": total_upserted,
+        "idx_rows_upserted": idx_upserted,
         "errors": errors,
     }
 

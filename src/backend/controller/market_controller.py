@@ -8,6 +8,7 @@ from src.backend.models.schemas.market_schema import MarketFilterResponse
 from src.backend.models.database import SessionLocal
 from src.backend.models.filtered_stocks_cache import FilteredStockCache
 from src.backend.models.market_data import MarketData
+from src.backend.models.idx_composite import IdxComposite
 from src.backend.models.portofolio_items import PortofolioItem
 from src.backend.models.portofolios import Portofolio
 from src.backend.models.stock_universe import StockUniverse
@@ -89,25 +90,34 @@ def save_filtered_stocks_to_db(data_records: list):
 
 def get_price_history(db: Session, user_id: str) -> dict:
     """
-    Ambil histori harga harian (OHLCV) semua saham yang dimiliki user,
+    Ambil histori harga harian (OHLCV + adj_close) semua saham yang dimiliki user
+    DAN harga IHSG (benchmark) dari tabel idx_composite,
     dari tanggal pembuatan portofolio TERAWAL milik user sampai data terbaru.
 
     Struktur return:
     {
         "start_date": "...",   # tanggal portofolio terawal user
-        "end_date": "...",     # tanggal data terbaru
+        "end_date": "...",     # tanggal data terbaru (saham maupun IHSG)
         "stocks": [
             {
                 "ticker": "BBCA",
-                "first_buy": "2026-08-01",
+                "stock_id": "...",
                 "prices": [
                     {"date": "2026-08-01", "open": ..., "high": ...,
-                     "low": ..., "close": ..., "volume": ...},
+                     "low": ..., "close": ..., "adj_close": ..., "volume": ...},
                     ...
                 ]
             },
             ...
-        ]
+        ],
+        "benchmark": {
+            "ticker": "^JKSE",
+            "prices": [
+                {"date": "2026-08-01", "open": ..., "high": ...,
+                 "low": ..., "close": ...},
+                ...
+            ]
+        }
     }
     Raises: PortfolioNotFoundError jika user belum punya portofolio.
     """
@@ -167,17 +177,40 @@ def get_price_history(db: Session, user_id: str) -> dict:
             "high": md.high,
             "low": md.low,
             "close": md.close,
+            "adj_close": md.adj_close,
             "volume": md.volume,
         })
 
-    max_date = max(
-        (md.date for md, _ in rows if isinstance(md.date, date)),
-        default=None,
+    all_dates = [md.date for md, _ in rows if isinstance(md.date, date)]
+
+    # Benchmark IHSG dari idx_composite (rentang sama: sejak portofolio terawal)
+    idx_rows = (
+        db.query(IdxComposite)
+        .filter(IdxComposite.date >= start_date)
+        .order_by(IdxComposite.date.asc())
+        .all()
     )
+    benchmark_prices = [
+        {
+            "date": ic.date.isoformat(),
+            "open": ic.open,
+            "high": ic.high,
+            "low": ic.low,
+            "close": ic.close,
+        }
+        for ic in idx_rows
+    ]
+    all_dates.extend(ic.date for ic in idx_rows if isinstance(ic.date, date))
+
+    max_date = max(all_dates, default=None)
 
     return {
         "start_date": start_dt.date().isoformat() if hasattr(start_dt, "date") else str(start_dt),
         "end_date": max_date.isoformat() if max_date else None,
         "stocks": [grouped[t] for t in sorted(grouped)],
+        "benchmark": {
+            "ticker": idx_rows[0].ticker if idx_rows else None,
+            "prices": benchmark_prices,
+        },
     }
 
