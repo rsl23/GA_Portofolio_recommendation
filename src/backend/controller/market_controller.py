@@ -49,6 +49,59 @@ def run_and_cache_stock_filtering(background_tasks: BackgroundTasks) -> MarketFi
     )
 
 
+def get_last_filter_update(db: Session):
+    """
+    Ambil updated_at dari salah satu baris filtered_stock_cache.
+    Semua baris ditulis bersamaan oleh job filtering (truncate + insert),
+    sehingga updated_at sinkron untuk semua row — cukup ambil MAX.
+    Returns: datetime atau None jika tabel kosong.
+    """
+    from sqlalchemy import func
+    from src.backend.models.filtered_stocks_cache import FilteredStockCache
+
+    return db.query(func.max(FilteredStockCache.updated_at)).scalar()
+
+
+def run_daily_pipeline() -> dict:
+    """
+    Pipeline harian (dipanggil scheduler jam 04:00 atau lifespan saat data basi):
+      1. Filtering saham hari ini -> simpan ke filtered_stock_cache.
+      2. build_market_data() -> muat data pasar + fundamental ke RAM untuk GA.
+      3. sync_market_data -> tarik harga terbaru (yfinance) untuk market_data
+         & idx_composite milik portofolio user.
+    Returns: statistik ringkas; 'market_data' berupa objek MarketData untuk
+    disimpan ke app.state oleh pemanggil.
+    """
+    from src.gaengine.data_loader_live import build_market_data
+    from src.backend.services.price_history_service import sync_market_data
+
+    db = SessionLocal()
+    try:
+        # 1. Filtering & simpan cache (SINKRON, bukan background task,
+        #    karena scheduler tidak punya BackgroundTasks FastAPI)
+        daftar_saham, df_lolos = run_live_preprocessing()
+        df_json = df_lolos.reset_index().to_dict(orient="records")
+        save_filtered_stocks_to_db(df_json)
+        logger.info("Pipeline harian [1/3]: filtering selesai (%d saham lolos).", len(daftar_saham))
+
+        # 2. Perakitan MarketData ke RAM (fundamental + OHLCV 1 tahun)
+        market_data = build_market_data()
+        logger.info("Pipeline harian [2/3]: build_market_data selesai (%s saham).",
+                    market_data.n_stocks if market_data else 0)
+
+        # 3. Sinkronisasi harga portofolio user + IHSG
+        stats = sync_market_data(db)
+        logger.info("Pipeline harian [3/3]: sync_market_data selesai (%s).", stats)
+
+        return {
+            "filtered_stocks": len(daftar_saham),
+            "market_data": market_data,
+            "sync_stats": stats,
+        }
+    finally:
+        db.close()
+
+
 def save_filtered_stocks_to_db(data_records: list):
     """
     Fungsi ini berjalan di background (Asynchronous Task).

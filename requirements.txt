@@ -9,3 +9,4 @@ sqlalchemy
 psycopg2-binary
 bcrypt
 email-validator
+apscheduler

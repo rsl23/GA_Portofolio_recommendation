@@ -5,6 +5,7 @@ from src.backend.models.schemas.market_schema import MarketFilterResponse
 from src.backend.models.schemas.portfolio_schema import ApiResponse
 from src.backend.controller.market_controller import (
     StockFilteringError,
+    get_last_filter_update,
     run_and_cache_stock_filtering,
 )
 from src.backend.services.price_history_service import sync_market_data
@@ -26,6 +27,24 @@ def filter_stocks_endpoint(background_tasks: BackgroundTasks):
         status="success",
         message="Filtering berhasil dilakukan.",
         data=hasil,
+    )
+
+
+@router.get("/filter-stocks/last-update", response_model=ApiResponse[dict])
+def filter_stocks_last_update_endpoint(db: Session = Depends(get_db)):
+    """
+    Kembalikan tanggal/waktu terakhir tabel filtered_stock_cache diperbarui.
+    Semua baris ditulis bersamaan oleh job filtering (truncate + insert),
+    jadi updated_at sinkron di semua row — cukup ambil salah satu (MAX).
+    Data berisi null jika tabel masih kosong (preprocessing belum pernah jalan).
+    """
+    last_update = get_last_filter_update(db)
+    return ApiResponse(
+        status="success",
+        message="Tanggal update terakhir berhasil diambil.",
+        data={
+            "last_updated_at": last_update.isoformat() if last_update else None,
+        },
     )
 
 
