@@ -67,7 +67,7 @@ async def lifespan(app: FastAPI):
     scheduler = BackgroundScheduler(timezone=SCHEDULER_TIMEZONE)
     scheduler.add_job(
         scheduled_daily_refresh,
-        CronTrigger(hour=4, minute=0),
+        CronTrigger(hour=17, minute=0),
         id="daily_market_refresh",
         replace_existing=True,
     )

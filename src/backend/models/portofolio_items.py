@@ -16,7 +16,10 @@ class PortofolioItem(Base):
     bobot_persentase = Column(Float, nullable=False)
     jumlah_lot = Column(Integer, nullable=False)
 
-    harga_acuan = Column(Float, nullable=False)
+    harga_acuan = Column(Float, nullable=False)  # harga per LEMBAR (1 lot = 100 lembar)
+    # harga beli aktual menurut user; default = harga_acuan saat item dibuat,
+    # bisa diubah user lewat endpoint PATCH (mis. harga eksekusi berbeda)
+    harga_beli = Column(Float, nullable=True)
     total_investasi = Column(Float, nullable=False)
 
     action_type = Column(String, nullable=False)  # buy, sell, hold, add-more, reduce, etc.

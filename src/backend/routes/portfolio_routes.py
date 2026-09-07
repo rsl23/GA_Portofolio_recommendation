@@ -8,8 +8,10 @@ from src.backend.models.schemas.portfolio_schema import (
     PortfolioGenerateRequest,
     PortfolioResponse,
     PortfolioHistoryItem,
+    UpdateHargaBeliRequest,
 )
 from src.backend.controller.portfolio_controller import (
+    ItemNotFoundError,
     MarketDataUnavailableError,
     PortfolioNotFoundError,
     StockNotFoundError,
@@ -17,9 +19,10 @@ from src.backend.controller.portfolio_controller import (
     generate_new_portfolio,
     get_active_portfolio,
     list_portfolio_history,
+    update_harga_beli,
+    get_portfolio_performance,
 )
 from src.backend.controller.market_controller import (
-    get_portfolio_performance,
     get_price_history,
 )
 from src.backend.core.deps import get_current_user
@@ -155,4 +158,40 @@ def portofolio_performance_endpoint(
         status="success",
         message="Performa portofolio berhasil dihitung.",
         data=hasil,
+    )
+
+
+@router.patch("/my-portofolio/items/{item_id}/harga-beli", response_model=ApiResponse[dict])
+def update_harga_beli_endpoint(
+    item_id: str,
+    body: UpdateHargaBeliRequest,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Ubah harga_beli (per lembar, IDR) milik user pada satu item portofolio ACTIVE.
+    Kepemilikan divalidasi dari JWT — user hanya bisa mengubah item di
+    portofolio aktif miliknya sendiri. total_investasi item ikut dihitung ulang:
+    jumlah_lot x 100 lembar x harga_beli.
+    """
+    try:
+        item = update_harga_beli(
+            db,
+            user_id=current_user["sub"],
+            item_id=item_id,
+            harga_beli=body.harga_beli,
+        )
+    except ItemNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return ApiResponse(
+        status="success",
+        message="Harga beli berhasil diperbarui.",
+        data={
+            "item_id": str(item.id),
+            "ticker": item.stock.ticker if item.stock else None,
+            "jumlah_lot": item.jumlah_lot,
+            "harga_acuan": item.harga_acuan,   # per lembar
+            "harga_beli": item.harga_beli,     # per lembar (hasil edit)
+            "total_investasi": item.total_investasi,
+        },
     )

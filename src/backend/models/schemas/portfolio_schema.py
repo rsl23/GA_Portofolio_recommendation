@@ -20,11 +20,18 @@ class PortfolioGenerateRequest(BaseModel):
 
 # Satu baris alokasi saham di dalam portofolio hasil GA
 class PortfolioItem(BaseModel):
+    item_id: str                   # ID item di portofolio_items (untuk PATCH harga_beli)
     ticker: str                    # kode saham, misal BBCA
     lots: int                      # jumlah lot (1 lot = 100 lembar)
-    price_per_lot: float           # harga 1 lot saat ini
+    price_per_lot: float           # harga 1 lot saat ini (100 lembar)
+    harga_beli: Optional[float] = None  # harga beli aktual user per lembar (bisa diedit)
     allocation: float              # alokasi dana = lots * price_per_lot
     weight: float                  # bobot alokasi terhadap total terpakai (0-1)
+
+
+# Request ubah harga beli milik user pada satu item portofolio
+class UpdateHargaBeliRequest(BaseModel):
+    harga_beli: float = Field(..., gt=0, description="Harga beli aktual per lembar (IDR)")
 
 
 # Baris riwayat portofolio (ringkasan, tanpa alokasi detail)
