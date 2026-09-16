@@ -2,6 +2,8 @@
 Fetch data Bursa Efek Indonesia (BEI) dari API ZPI:
     1. new-listings : https://api.zpi.web.id/v1/finance:idx/new-listings  -> kolom listing_date
     2. delistings   : https://api.zpi.web.id/v1/finance:idx/delistings    -> kolom delisting_date
+    3. companies    : https://api.zpi.web.id/v1/finance:idx/companies     -> 5 kolom klasifikasi
+                       (papan_pencatatan, sektor, sub_sektor, industri, sub_industri)
 lalu menyimpannya ke tabel `stock_universe` di database.
 
 Endpoint berjalan per-bulan, jadi skrip ini menggunakan loop for:
@@ -35,6 +37,7 @@ API_KEY = os.getenv("X_API_KEY")
 
 ENDPOINT = f"{BASE_URL}/finance:idx/new-listings"
 DELISTING_ENDPOINT = f"{BASE_URL}/finance:idx/delistings"
+COMPANIES_ENDPOINT = f"{BASE_URL}/finance:idx/companies"
 PAGE_LENGTH = 200          # length per permintaan
 START_YEAR = 1990
 END_YEAR = 2025            # inclusive
@@ -346,6 +349,153 @@ def save_delistings_to_database(records: list) -> None:
         db.close()
 
 
+def fetch_companies(length: int = 1000) -> list:
+    """
+    Ambil seluruh emiten tercatat dari endpoint /finance:idx/companies.
+    Respons berbentuk:
+        { "data": [ {KodeEmiten, NamaEmiten, PapanPencatatan, Sektor,
+                     SubSektor, Industri, SubIndustri, TanggalPencatatan, ...} ],
+          "recordsTotal": 958, ... }
+    (Beberapa bentuk respons lain membungkus list di dalam 'data' -> 'data'.
+     Keduanya ditangani di sini agar skrip tetap jalan.)
+    Menangani rate-limit (HTTP 429) dengan retry + exponential backoff.
+
+    Returns: list of dict (raw item API).
+    """
+    headers = _build_headers()
+    params = {"length": length}
+
+    payload = None
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            resp = requests.get(COMPANIES_ENDPOINT, headers=headers, params=params, timeout=60)
+
+            if resp.status_code == 429:
+                wait = BACKOFF_BASE ** attempt
+                print(f"  [429] companies: retry dalam {wait:.0f}s (percobaan {attempt+1}/{MAX_RETRIES+1})")
+                time.sleep(wait)
+                continue
+
+            resp.raise_for_status()
+            payload = resp.json()
+            break
+        except requests.exceptions.RequestException as e:
+            if attempt < MAX_RETRIES:
+                wait = BACKOFF_BASE ** attempt
+                print(f"  [ERR] companies (retry {attempt+1}): {e}")
+                time.sleep(wait)
+            else:
+                print(f"  [ERR] companies: {e}")
+                payload = None
+
+    if payload is None:
+        return []
+
+    data = payload.get("data", [])
+    if isinstance(data, dict):
+        data = data.get("data", [])
+    return data if isinstance(data, list) else []
+
+
+# 5 kolom klasifikasi emiten: nama kolom -> tipe data (dipakai untuk migrasi)
+CLASSIFICATION_COLUMNS = {
+    "papan_pencatatan": "VARCHAR(50)",
+    "sektor": "VARCHAR(100)",
+    "sub_sektor": "VARCHAR(100)",
+    "industri": "VARCHAR(100)",
+    "sub_industri": "VARCHAR(100)",
+}
+
+
+def ensure_classification_columns() -> None:
+    """
+    Tambahkan 5 kolom klasifikasi (papan_pencatatan, sektor, sub_sektor,
+    industri, sub_industri) ke tabel stock_universe yang SUDAH ADA di database.
+
+    StockUniverse.__table__.create(checkfirst=True) TIDAK menambahkan kolom
+    baru ke tabel yang sudah terbentuk, sehingga perlu ALTER TABLE eksplisit.
+    Aman dipanggil berulang karena memakai ADD COLUMN IF NOT EXISTS (PostgreSQL).
+    """
+    from sqlalchemy import text
+
+    with engine.begin() as conn:
+        for column, col_type in CLASSIFICATION_COLUMNS.items():
+            conn.execute(text(
+                f"ALTER TABLE stock_universe ADD COLUMN IF NOT EXISTS {column} {col_type}"
+            ))
+    print("Kolom klasifikasi (papan_pencatatan, sektor, sub_sektor, industri, "
+          "sub_industri) dipastikan tersedia di tabel stock_universe.")
+
+
+def save_companies_to_database(records: list) -> None:
+    """
+    Upsert klasifikasi emiten (papan_pencatatan, sektor, sub_sektor,
+    industri, sub_industri) ke tabel stock_universe, dicocokkan dengan
+    KodeEmiten = ticker.
+
+    - Ticker yang SUDAH ada  -> 5 field klasifikasi di-update.
+    - Ticker yang BELUM ada  -> di-insert baris baru (listing_date dari
+      TanggalPencatatan; fallback hari ini agar constraint NOT NULL terpenuhi).
+    - Field klasifikasi yang kosong di API akan tersimpan NULL.
+    """
+    # Pastikan tabel ada (aman jika masih kosong di database)
+    StockUniverse.__table__.create(engine, checkfirst=True)
+
+    # Pastikan 5 kolom klasifikasi tersedia di tabel yang sudah ada (migrasi)
+    ensure_classification_columns()
+
+    db = SessionLocal()
+    updated = 0
+    inserted = 0
+    skipped = 0
+
+    try:
+        for item in records:
+            ticker = str(item.get("KodeEmiten") or "").strip()
+            if not ticker:
+                skipped += 1
+                continue
+
+            fields = {
+                "papan_pencatatan": item.get("PapanPencatatan"),
+                "sektor": item.get("Sektor"),
+                "sub_sektor": item.get("SubSektor"),
+                "industri": item.get("Industri"),
+                "sub_industri": item.get("SubIndustri"),
+            }
+
+            stock = db.query(StockUniverse).filter(StockUniverse.ticker == ticker).first()
+
+            if stock is None:
+                # Ticker belum terdaftar -> insert baris baru.
+                listing_date = parse_date(str(item.get("TanggalPencatatan") or "")[:10])
+                if listing_date is None:
+                    listing_date = datetime.now().date()  # fallback constraint NOT NULL
+                stock = StockUniverse(
+                    ticker=ticker,
+                    nama_perusahaan=(item.get("NamaEmiten") or "")[:100],
+                    listing_date=listing_date,
+                    **fields,
+                )
+                db.add(stock)
+                inserted += 1
+            else:
+                # Ticker sudah ada -> update 5 field klasifikasinya saja.
+                for key, value in fields.items():
+                    setattr(stock, key, value)
+                updated += 1
+
+        db.commit()
+        print(f"\nKlasifikasi emiten: {updated} saham di-update, "
+              f"{inserted} saham baru di-insert ({skipped} dilewati karena KodeEmiten kosong).")
+    except Exception as e:
+        db.rollback()
+        print(f"[ERR] Gagal menyimpan klasifikasi emiten: {e}")
+        raise
+    finally:
+        db.close()
+
+
 def main(start_year: int = START_YEAR, end_year: int = END_YEAR) -> None:
     """Orkestrasi utama: fetch data new-listings & delistings lalu simpan ke database."""
     # 1) New-listings
@@ -357,14 +507,22 @@ def main(start_year: int = START_YEAR, end_year: int = END_YEAR) -> None:
     # if records:
         # save_to_database(records)
 
-    # 2) Delistings
-    print(f"\nMengambil seluruh delistings BEI dari tahun {start_year} s.d. {end_year}...")
+    # 2) Delistings — JANGAN dipanggil ulang (data delisting sudah tersimpan
+    #    di database dari eksekusi sebelumnya).
+    # print(f"\nMengambil seluruh delistings BEI dari tahun {start_year} s.d. {end_year}...")
 
-    delisted = fetch_all_delistings(start_year, end_year)
-    print(f"\nTotal ticker yang mengalami delisting: {len(delisted)}")
+    # delisted = fetch_all_delistings(start_year, end_year)
+    # print(f"\nTotal ticker yang mengalami delisting: {len(delisted)}")
 
-    if delisted:
-        save_delistings_to_database(delisted)
+    # if delisted:
+    #     save_delistings_to_database(delisted)
+
+    # 3) Klasifikasi emiten (papan, sektor, industri) dari /finance:idx/companies
+    print("\nMengambil klasifikasi seluruh emiten BEI (/finance:idx/companies)...")
+    companies = fetch_companies()
+    print(f"Total emiten dari API companies: {len(companies)}")
+    if companies:
+        save_companies_to_database(companies)
 
     # Ringkasan akhir
     db = SessionLocal()
