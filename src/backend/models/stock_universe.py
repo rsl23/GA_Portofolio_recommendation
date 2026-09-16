@@ -14,3 +14,12 @@ class StockUniverse(Base):
     listing_date = Column(Date, nullable=False)
     delisting_date = Column(Date, nullable=True) # Kosong jika masih aktif
     relisting_date = Column(Date, nullable=True)
+
+    # Klasifikasi emiten dari API IDX (/finance:idx/companies) —
+    # di-update via skrip fetch_all_stock_bei.py; NULL untuk emiten
+    # yang belum pernah disinkron klasifikasinya.
+    papan_pencatatan = Column(String(50), nullable=True)    # Utama / Pengembangan / dst
+    sektor = Column(String(100), nullable=True)
+    sub_sektor = Column(String(100), nullable=True)
+    industri = Column(String(100), nullable=True)
+    sub_industri = Column(String(100), nullable=True)
