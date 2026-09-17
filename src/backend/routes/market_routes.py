@@ -1,3 +1,5 @@
+from datetime import date
+
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlalchemy.orm import Session
 from src.backend.models.database import get_db
@@ -14,13 +16,19 @@ from src.backend.core.deps import get_current_user
 router = APIRouter()
 
 @router.get("/filter-stocks", response_model=ApiResponse[MarketFilterResponse])
-def filter_stocks_endpoint(background_tasks: BackgroundTasks):
+def filter_stocks_endpoint(
+    background_tasks: BackgroundTasks,
+    backtest: bool = False,
+    date_ref: date | None = None,
+):
     """
     Endpoint tipis: seluruh logika ada di market_controller.
+    Query param `backtest=true` -> pipeline dijalankan dalam mode backtest
+    (filter yang bergantung tanggal hari ini di-skip; lihat run_live_preprocessing).
     Respons dibungkus envelope seragam: {status, message, data}.
     """
     try:
-        hasil = run_and_cache_stock_filtering(background_tasks)
+        hasil = run_and_cache_stock_filtering(background_tasks, backtest=backtest, date_ref=date_ref)
     except StockFilteringError as e:
         raise HTTPException(status_code=500, detail=str(e))
     return ApiResponse(

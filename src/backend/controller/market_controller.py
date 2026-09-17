@@ -25,15 +25,21 @@ class PortfolioNotFoundError(Exception):
     """Exception domain: user belum memiliki portofolio (tidak ada histori harga)."""
 
 
-def run_and_cache_stock_filtering(background_tasks: BackgroundTasks) -> MarketFilterResponse:
+def run_and_cache_stock_filtering(
+    background_tasks: BackgroundTasks,
+    backtest: bool = False,
+    date_ref: date | None = None,
+) -> MarketFilterResponse:
     """
     Controller untuk endpoint /market/filter-stocks:
     1. Menjalankan pipeline seleksi saham secara live (1-2 menit).
+       Mode backtest=True -> filter yang bergantung "tanggal hari ini"
+       di-skip di dalam run_live_preprocessing.
     2. Mengirim tugas simpan ke DB sebagai background task (asynchronous).
     3. Mengembalikan hasil domain (MarketFilterResponse) untuk dibungkus envelope oleh routes.
     """
     try:
-        daftar_saham, df_lolos = run_live_preprocessing()
+        daftar_saham, df_lolos = run_live_preprocessing(backtest=backtest, date=date_ref)
     except Exception as e:
         logger.exception("Gagal menjalankan pipeline filtering saham")
         raise StockFilteringError(f"Filtering saham gagal: {e}")
@@ -41,7 +47,8 @@ def run_and_cache_stock_filtering(background_tasks: BackgroundTasks) -> MarketFi
     # 'Kode' tersembunyi sebagai index di df_lolos, jadi di-reset dulu
     df_json = df_lolos.reset_index().to_dict(orient="records")
 
-    background_tasks.add_task(save_filtered_stocks_to_db, df_json)
+    if not backtest:
+        background_tasks.add_task(save_filtered_stocks_to_db, df_json)
 
     return MarketFilterResponse(
         total_saham=len(daftar_saham),
@@ -79,7 +86,7 @@ def run_daily_pipeline() -> dict:
     try:
         # 1. Filtering & simpan cache (SINKRON, bukan background task,
         #    karena scheduler tidak punya BackgroundTasks FastAPI)
-        daftar_saham, df_lolos = run_live_preprocessing()
+        daftar_saham, df_lolos = run_live_preprocessing(False)
         df_json = df_lolos.reset_index().to_dict(orient="records")
         save_filtered_stocks_to_db(df_json)
         logger.info("Pipeline harian [1/3]: filtering selesai (%d saham lolos).", len(daftar_saham))
