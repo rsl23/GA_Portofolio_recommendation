@@ -1,3 +1,5 @@
+from datetime import date
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -42,20 +44,59 @@ def api_generate_portfolio(
     type token divalidasi oleh get_current_user (core/deps.py).
     user_id diambil dari payload JWT (sub), BUKAN dari body, agar user
     tidak dapat menyimpan portofolio atas nama user lain.
-    Respons dibungkus envelope seragam: {status, message, data}.
+
+    Body (JSON):
+      - budget (float, wajib), risk_profile (str, wajib)
+      - backtest (bool, default false): true = jalankan GA memakai data
+        HISTORIS LOKAL (bukan data pasar hari ini). Lihat data_loader.
+      - date_ref (YYYY-MM-DD): WAJIB bila backtest=true; tanggal acuan
+        simulasi, mis. {"backtest": true, "date_ref": "2024-06-28"}
+
+    Endpoint: POST /api/v1/portfolios/generate
+
+    Catatan: hasil backtest DISIMPAN sebagai portofolio berstatus
+    "active_backtest" (portofolio live berstatus "active" tidak tersentuh;
+    portofolio backtest lama hanya berubah status menjadi "replaced_backtest").
+    Respons memakai envelope seragam: {status, message, data}.
     """
-    # Data market sudah dimuat di app.state saat startup oleh lifespan (app.py)
-    market_data = request.app.state.market_data_today
+    # Data market LIVE sudah dimuat di app.state saat startup oleh lifespan
+    # (app.py). Mode backtest TIDAK memakai cache live ini — controller akan
+    # merakit ulang MarketData dari data historis lokal via data_loader.
+    # getattr defensif: bila lifespan belum sempat mengisi app.state (startup
+    # parsial / scheduler gagal), controller akan merakit MarketData live sendiri.
+    backtest = body.backtest
+
+    # date_ref sudah divalidasi & dikonversi 'YYYY-MM-DD' -> datetime.date oleh
+    # Pydantic (lihat PortfolioGenerateRequest), jadi bisa dipakai langsung.
+    # Konversi defensif tetap disiapkan bila nilainya datang sebagai string.
+    date_ref = body.date_ref
+    if isinstance(date_ref, str):
+        try:
+            date_ref = date.fromisoformat(date_ref)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Format date_ref tidak valid: {date_ref!r} (gunakan YYYY-MM-DD).",
+            )
+
+    market_data = None if backtest else getattr(request.app.state, "market_data_today", None)
     try:
         hasil = generate_new_portfolio(
-            db, body, user_id=current_user["sub"], market_data=market_data
+            db,
+            body,
+            user_id=current_user["sub"],
+            market_data=market_data,
+            backtest=backtest,
+            date_ref=date_ref,
         )
     except UserNotFoundError as e:
         db.rollback()
         raise HTTPException(status_code=404, detail=str(e))
     except MarketDataUnavailableError as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        # Param backtest yang salah/kurang -> 400 Bad Request; kegagalan data
+        # live tetap 500 karena bukan kesalahan pemanggil.
+        raise HTTPException(status_code=400 if backtest else 500, detail=str(e))
     except StockNotFoundError as e:
         db.rollback()
         raise HTTPException(status_code=422, detail=str(e))
@@ -66,7 +107,11 @@ def api_generate_portfolio(
         )
     return ApiResponse(
         status="success",
-        message="Portofolio berhasil digenerate.",
+        message=(
+            f"Portofolio backtest per {date_ref} berhasil digenerate (status active_backtest)."
+            if backtest
+            else "Portofolio berhasil digenerate."
+        ),
         data=hasil,
     )
 

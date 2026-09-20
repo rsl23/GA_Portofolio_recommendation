@@ -1,6 +1,6 @@
 ﻿from pydantic import BaseModel, Field
 from typing import List, Optional, Generic, TypeVar
-from datetime import datetime
+from datetime import date, datetime
 
 # Tipe generik untuk payload di dalam envelope ApiResponse
 T = TypeVar("T")
@@ -17,6 +17,13 @@ class ApiResponse(BaseModel, Generic[T]):
 class PortfolioGenerateRequest(BaseModel):
     budget: float = Field(..., gt=0, description="Total modal investasi dalam IDR")
     risk_profile: str = Field(..., description="Konservatif, Moderat, atau Agresif")
+    backtest: bool = Field(False, description="Jika True, lakukan backtest portofolio terhadap data historis")
+    date_ref: Optional[date] = Field(
+        None,
+        description="Tanggal acuan untuk backtest (format: YYYY-MM-DD). "
+                    "Pydantic mengubah string ISO ini menjadi objek date, sehingga "
+                    "langsung bisa dipakai oleh run_live_preprocessing/build_market_data.",
+    )
 
 # Satu baris alokasi saham di dalam portofolio hasil GA
 class PortfolioItem(BaseModel):

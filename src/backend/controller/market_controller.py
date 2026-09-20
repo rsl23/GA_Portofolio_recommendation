@@ -79,7 +79,7 @@ def run_daily_pipeline() -> dict:
     Returns: statistik ringkas; 'market_data' berupa objek MarketData untuk
     disimpan ke app.state oleh pemanggil.
     """
-    from src.gaengine.data_loader_live import build_market_data
+    from src.gaengine.data_loader import build_market_data
     from src.backend.services.price_history_service import sync_market_data
 
     db = SessionLocal()

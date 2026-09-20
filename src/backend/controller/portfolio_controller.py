@@ -1,5 +1,6 @@
 ﻿import logging
-from uuid import uuid4, UUID
+from datetime import date
+from uuid import UUID
 
 import numpy as np
 from sqlalchemy import func
@@ -17,11 +18,24 @@ from src.backend.models.schemas.portfolio_schema import (
     PortfolioHistoryItem,
     PortfolioItem,
 )
-from src.gaengine.data_loader_live import build_market_data
+from src.gaengine.data_loader import build_market_data
 from src.gaengine.engine import GeneticEngine
 from src.gaengine.ga_config import GAConfig
 
 logger = logging.getLogger(__name__)
+
+# ----------------------------------------------------------------------
+# Status portofolio
+# ----------------------------------------------------------------------
+# Setiap user bisa memiliki DUA jenis portofolio terpisah:
+#   LIVE     : "active"             -> sedang dipakai; digantikan -> "replaced"
+#   BACKTEST : "active_backtest"    -> simulasi terbaru; digantikan -> "replaced_backtest"
+# Keduanya TIDAK saling menimpa. Portofolio juga TIDAK PERNAH dihapus —
+# generate ulang hanya mengubah STATUS portofolio lama.
+STATUS_ACTIVE = "active"                          # portofolio live terbaru
+STATUS_REPLACED = "replaced"                      # portofolio live yang digantikan
+STATUS_ACTIVE_BACKTEST = "active_backtest"        # hasil simulasi backtest terbaru
+STATUS_REPLACED_BACKTEST = "replaced_backtest"    # hasil simulasi yang digantikan
 
 
 class MarketDataUnavailableError(Exception):
@@ -45,16 +59,27 @@ def generate_new_portfolio(
     request: PortfolioGenerateRequest,
     user_id: str,
     market_data=None,
+    backtest: bool = False,
+    date_ref: date | None = None,
 ) -> PortfolioResponse:
     """
     Controller Otak Utama:
-    1. Memakai MarketData live (bisa reused dari app.state atau dibangun ulang).
+    1. Menyiapkan MarketData:
+         - LIVE     : pakai market_data dari app.state (bila ada) atau rakit
+                      sendiri dari data live (DB cache + yfinance + ZAPI).
+         - BACKTEST : WAJIB rakit dari data historis lokal pada `date_ref`
+                      (lihat src/gaengine/data_loader.build_market_data).
     2. Menjalankan Algoritma Genetika sesuai modal & profil risiko pengguna.
     3. Menyimpan hasil ke tabel portofolios + portofolio_items.
+       Status portofolio mengikuti mode:
+         - LIVE     : baru = "active";            lama = "replaced"
+         - BACKTEST : baru = "active_backtest";   lama = "replaced_backtest"
+       Jadi portofolio LIVE dan BACKTEST berdampingan (tidak saling menimpa),
+       dan portofolio lama TIDAK PERNAH dihapus — hanya berubah status.
     """
     logger.info(
-        "Menjalankan GA untuk user %s dengan profil %s dan modal Rp%.2f",
-        user_id, request.risk_profile, request.budget,
+        "Menjalankan GA untuk user %s dengan profil %s dan modal Rp%.2f (backtest=%s, date=%s)",
+        user_id, request.risk_profile, request.budget, backtest, date_ref,
     )
 
     # 0. Validasi user dari payload JWT (sub). Lempar error jika sudah terhapus.
@@ -66,14 +91,33 @@ def generate_new_portfolio(
     if user is None:
         raise UserNotFoundError("User pada token tidak ditemukan di database.")
 
-    # 1. Siapkan MarketData. Kalau tidak diberi (None) dari luar, bangun sendiri.
-    if market_data is None:
+    # 1. Siapkan MarketData.
+    #    - Mode BACKTEST: SELALU rakit ulang dari data historis lokal pada
+    #      `date_ref`; market_data live dari app.state tidak boleh dipakai.
+    #    - Mode LIVE: pakai market_data yang diberikan (app.state) bila ada,
+    #      kalau None baru rakit sendiri dari data live.
+    if backtest:
+        if date_ref is None:
+            raise MarketDataUnavailableError(
+                "Mode backtest memerlukan parameter 'date_ref' (format YYYY-MM-DD)."
+            )
+        logger.info("Membentuk MarketData BACKTEST per %s...", date_ref)
+        try:
+            market_data = build_market_data(
+                min_price=1.0, backtest=True, date_ref=date_ref
+            )
+        except Exception as e:
+            raise MarketDataUnavailableError(
+                f"Gagal merakit MarketData backtest untuk {date_ref}: {e}"
+            ) from e
+    elif market_data is None:
         logger.info("Membentuk MarketData menggunakan data LIVE...")
-        market_data = build_market_data(min_price=50.0)
+        market_data = build_market_data(min_price=1.0)
 
     if market_data is None or market_data.n_stocks == 0:
         raise MarketDataUnavailableError(
-            "Gagal membentuk MarketData. Pastikan tabel filtered_stock_cache sudah terisi."
+            "Gagal membentuk MarketData. Pastikan tabel filtered_stock_cache sudah terisi "
+            "(live) atau tanggal backtest memiliki data (backtest)."
         )
 
     # 2. Konfigurasi GA mengikuti profil & modal dari payload request
@@ -112,6 +156,7 @@ def generate_new_portfolio(
             "ticker": code,
             "lots": lot,
             "price_per_lot": price,
+            "harga_beli": price,  # default: user bisa edit lewat PATCH
             "allocation": float(lot * price),
             "weight": float(lot * price / total) if total else 0.0,
         }
@@ -138,12 +183,40 @@ def generate_new_portfolio(
         f"Rekomendasi ini dihasilkan Algoritma Genetika."
     )
 
-    # 5. Supersede (Opsi B): tandai portofolio aktif lama milik user sebagai "replaced".
+    if backtest:
+        narasi += (
+            f" Hasil ini berasal dari SIMULASI BACKTEST per {date_ref} "
+            f"(data historis, bukan kondisi pasar hari ini) dan disimpan sebagai "
+            f"portofolio simulasi (status {STATUS_ACTIVE_BACKTEST}) sehingga tidak "
+            f"mengubah portofolio live Anda."
+        )
+
+    # 5. Supersede: portofolio lama DIGANTIKAN STATUSNYA (tidak dihapus).
+    #    Mode LIVE     : active            -> replaced
+    #    Mode BACKTEST : active_backtest   -> replaced_backtest
     #    Riwayat tetap tersimpan dan bisa diambil via /my-portofolio/history.
-    db.query(Portofolio).filter(
-        Portofolio.user_id == user_uuid,
-        Portofolio.status_portofolio == "active",
-    ).update({"status_portofolio": "replaced"}, synchronize_session=False)
+    if backtest:
+        status_baru = STATUS_ACTIVE_BACKTEST
+        status_lama = STATUS_ACTIVE_BACKTEST
+        status_digantikan = STATUS_REPLACED_BACKTEST
+    else:
+        status_baru = STATUS_ACTIVE
+        status_lama = STATUS_ACTIVE
+        status_digantikan = STATUS_REPLACED
+
+    replaced = (
+        db.query(Portofolio)
+        .filter(
+            Portofolio.user_id == user_uuid,
+            Portofolio.status_portofolio == status_lama,
+        )
+        .update({"status_portofolio": status_digantikan}, synchronize_session=False)
+    )
+    if replaced:
+        logger.info(
+            "Supersede (%s): %d portofolio '%s' -> '%s'.",
+            "backtest" if backtest else "live", replaced, status_lama, status_digantikan,
+        )
 
     # 6. Simpan hasil ke database: portofolios + portofolio_items
     portofolio = Portofolio(
@@ -160,9 +233,10 @@ def generate_new_portfolio(
         # bobot pengali fitness persis seperti yang dipakai GA saat evaluasi
         mdd_lambda=float(config.lambda_mdd),           # lambda MDD per profil risiko
         avg_korelasi_gamma=float(config.correlation_penalty),  # gamma = 0.5
-        funda_alpha=float(config.fundamental_bonus),   # alpha = 0.3
+        funda_alpha=float(config.fundamental_bonus),   # alpha (bonus fundamental) per profil
         narasi_llm=narasi,
-        status_portofolio="active",
+        # "active" untuk mode live, "active_backtest" untuk mode simulasi
+        status_portofolio=status_baru,
         # field rebalance: ini portofolio baru, bukan hasil rebalance
         is_rebalance=False,
         parent_portofolio_id=None,
@@ -274,9 +348,11 @@ def _query_items_with_ticker(db: Session, portofolio_id) -> list[tuple[Portofoli
     )
 
 
-def get_active_portfolio(db: Session, user_id: str) -> PortfolioResponse:
+def get_active_portfolio(db: Session, user_id: str, backtest: bool = False) -> PortfolioResponse:
     """
     Ambil portofolio AKTIF terbaru milik user (dari payload JWT).
+    `backtest=False` (default) -> portofolio LIVE berstatus "active".
+    `backtest=True`            -> portofolio SIMULASI berstatus "active_backtest".
     Ordering: created_at terbaru, dengan id sebagai tiebreaker.
     Respons memakai schema yang SAMA dengan hasil generate (PortfolioResponse):
     field yang tidak disimpan di DB (expected_return) bernilai None,
@@ -285,17 +361,22 @@ def get_active_portfolio(db: Session, user_id: str) -> PortfolioResponse:
             PortfolioNotFoundError jika user belum pernah generate.
     """
     user_uuid = _parse_user_uuid(user_id, db)
+    status_target = STATUS_ACTIVE_BACKTEST if backtest else STATUS_ACTIVE
     portofolio = (
         db.query(Portofolio)
         .filter(
             Portofolio.user_id == user_uuid,
-            Portofolio.status_portofolio == "active",
+            Portofolio.status_portofolio == status_target,
         )
         .order_by(Portofolio.created_at.desc(), Portofolio.id.desc())
         .first()
     )
     if portofolio is None:
-        raise PortfolioNotFoundError("User belum memiliki portofolio aktif.")
+        raise PortfolioNotFoundError(
+            "User belum memiliki portofolio backtest aktif."
+            if backtest
+            else "User belum memiliki portofolio aktif."
+        )
 
     item_pairs = _query_items_with_ticker(db, portofolio.id)
     items = [pair[0] for pair in item_pairs]

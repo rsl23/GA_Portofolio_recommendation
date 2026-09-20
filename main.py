@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import argparse
+from datetime import date
 
-from src.gaengine.data_loader_backtest import build_market_data
+from src.gaengine.data_loader import build_market_data
 from src.gaengine.engine import GeneticEngine
 from src.gaengine.ga_config import GAConfig
 
@@ -21,15 +22,39 @@ def _parse_args():
     p.add_argument("--universe", type=int, default=None,
                    help="Cap the candidate universe to the most liquid N stocks")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--backtest", action="store_true",
+                   help="Pakai data historis lokal (bukan data live). "
+                        "Otomatis aktif bila --date-ref diisi.")
+    p.add_argument("--date-ref", type=str, default=None,
+                   help="Tanggal acuan backtest (YYYY-MM-DD), mis. 2024-06-28")
+    p.add_argument("--lookback-days", type=int, default=365,
+                   help="Panjang window return (hari) untuk mode backtest")
     return p.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
 
-    print("Loading market data ...")
-    data = build_market_data(min_price=50.0, max_stocks=args.universe)
+    # Mode backtest: aktif bila --backtest ATAU --date-ref diisi.
+    date_ref = date.fromisoformat(args.date_ref) if args.date_ref else None
+    backtest = args.backtest or date_ref is not None
 
+    if backtest and date_ref is None:
+        raise SystemExit("Mode backtest butuh --date-ref (contoh: --date-ref 2024-06-28)")
+
+    print("Loading market data ...")
+    data = build_market_data(
+        min_price=50.0,
+        max_stocks=args.universe,
+        backtest=backtest,
+        date_ref=date_ref,
+        lookback_days=args.lookback_days,
+    )
+
+    if data is None:
+        raise SystemExit("Gagal merakit MarketData (cache kosong / data tidak tersedia).")
+
+    print(f"  mode         : {'BACKTEST ' + str(date_ref) if backtest else 'LIVE'}")
     print(f"  universe     : {data.n_stocks} stocks")
     print(f"  risk-free rf : {data.risk_free_rate:.4f} ({data.risk_free_rate*100:.2f} %)")
 
