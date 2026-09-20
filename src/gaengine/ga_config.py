@@ -82,7 +82,7 @@ class GAConfig:
     risk_profile: str = "Moderate"
     risk_free_rate: float = 0.0625
     correlation_penalty: float = 0.5   # gamma
-    fundamental_bonus: float = 0.3     # alpha
+    fundamental_bonus: float = 0.8     # alpha
     death_penalty: float = 50000.0
     annualization: float = math.sqrt(252.0)
 

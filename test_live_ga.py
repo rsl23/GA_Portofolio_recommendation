@@ -1,6 +1,6 @@
 """Skrip untuk mengetes Algoritma Genetika dengan data LIVE dari ZAPI & Yahoo Finance."""
 
-from src.gaengine.data_loader_live import build_market_data
+from src.gaengine.data_loader import build_market_data
 from src.gaengine.engine import GeneticEngine
 from src.gaengine.ga_config import GAConfig
 
