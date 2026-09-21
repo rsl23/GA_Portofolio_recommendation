@@ -73,7 +73,7 @@ async def lifespan(app: FastAPI):
     )
     scheduler.start()
     app.state.scheduler = scheduler
-    print("[Scheduler] Berjalan — job 'daily_market_refresh' dijadwalkan pukul 04:00 WIB.")
+    print("[Scheduler] Berjalan — job 'daily_market_refresh' dijadwalkan pukul 17:00 WIB.")
 
     # 4. Cek staleness saat startup: kalau filtered_stock_cache belum diperbarui
     #    hari ini, langsung jalankan pipeline sekali (jangan tunggu jam 04:00).
@@ -138,6 +138,14 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         status_code=422,
         content={"status": "error", "message": message, "data": errors},
     )
+
+import logging
+
+# Ubah batas minimal logging menjadi INFO
+logging.basicConfig(level=logging.INFO)
+
+# Sekarang ini akan muncul di terminal!
+logging.info("Memulai aplikasi backend...")
 
 # Daftarkan semua route ke dalam API dengan prefix standar
 app.include_router(api_router, prefix="/api/v1")

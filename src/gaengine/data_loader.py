@@ -24,8 +24,10 @@ Penggunaan:
 
 from __future__ import annotations
 
+import logging
 import os
-from datetime import date
+import time
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -59,6 +61,11 @@ RISKFREE_FILE    = DATA_DIR / "BI-7Day-RR.xlsx"
 # Window return default: 1 tahun (paritas dengan period="1y" yfinance di LIVE).
 DEFAULT_LOOKBACK_DAYS = 365
 
+# Panjang window likuiditas: ADTV 60 hari bursa terakhir.
+# Nilai ETV harian = Close x Volume; rata-ratanya dipakai untuk memilih
+# N kandidat paling likuid (sama seperti metrik ADTV_60 di stock_filtering).
+LIQUIDITY_WINDOW_DAYS = 60
+
 # Fundamental metric columns: PER, PBV, ROE, DER, Dividend-Yield.
 # ``+1`` berarti "lower is better", ``-1`` berarti "higher is better".
 _METRIC_DIRECTION = [+1, +1, -1, +1, -1]
@@ -69,6 +76,98 @@ _NAMA_BULAN_ID = {
     'juli': 7, 'agustus': 8, 'september': 9, 'oktober': 10, 'november': 11,
     'desember': 12,
 }
+
+
+# ======================================================================
+# LOGGING (observability saja — TIDAK mengubah alur / hasil perhitungan)
+# ======================================================================
+# Semua log memakai prefix "[DataLoader]" + nama fungsi, sehingga mudah
+# dicari di terminal. Nilai yang dicetak adalah nilai yang benar-benar
+# dipakai oleh fungsi tsb (parameter masuk, nilai antara, dan nilai balik).
+logger = logging.getLogger(__name__)
+
+TRACE_SAMPLE = 5          # jumlah contoh item yang ditampilkan di ringkasan
+METRIC_NAMES = ["PER", "PBV", "ROE", "DER", "DivYld"]
+
+
+def _ensure_logging_visible() -> None:
+    """
+    Pastikan log modul ini SELALU tampil di terminal, apa pun konfigurasi
+    logging global (basicConfig root, uvicorn, dll.):
+      - Pasang StreamHandler langsung di logger modul ini (bukan bergantung
+        pada root logger yang level-nya mungkin WARNING / sudah dikonfigurasi
+        pihak lain).
+      - propagate=False agar pesan tidak dobel lewat handler root.
+      - idempotent: bila handler sudah pernah dipasang, jangan tambah lagi.
+    """
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    if not any(
+        isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
+        for h in logger.handlers
+    ):
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
+        logger.addHandler(handler)
+
+
+_ensure_logging_visible()
+
+
+def _probe_series(s, n: int = TRACE_SAMPLE) -> str:
+    """Ringkasan Series untuk log: jumlah valid, min/max, dan contoh nilai."""
+    if s is None:
+        return "None"
+    if not isinstance(s, pd.Series) or s.empty:
+        return "kosong"
+    num = pd.to_numeric(s, errors="coerce")
+    valid = num.dropna()
+    if valid.empty:
+        return f"n={len(s)}, semua NaN"
+    contoh = ", ".join(f"{k}={valid[k]:,.4g}" for k in valid.index[:n])
+    return (f"n={len(s)}, valid={len(valid)}, "
+            f"min={valid.min():,.6g}, max={valid.max():,.6g} | {contoh}")
+
+
+def _probe_frame(df, n: int = TRACE_SAMPLE) -> str:
+    """Ringkasan DataFrame untuk log: bentuk + rentang tanggal + contoh kolom."""
+    if df is None:
+        return "None"
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return "kosong"
+    dim = f"{df.shape[0]} baris x {df.shape[1]} kolom"
+    kolom = ", ".join(str(c) for c in list(df.columns)[:n])
+    if isinstance(df.index, pd.DatetimeIndex) and len(df.index):
+        return (f"{dim}, rentang {df.index.min().date()}..{df.index.max().date()}, "
+                f"kolom[:{n}]={kolom}")
+    return f"{dim}, kolom[:{n}]={kolom}"
+
+
+def _probe_metrics_map(metrics_map: Dict[str, List[float]],
+                       n: int = TRACE_SAMPLE) -> str:
+    """Ringkasan metrics_map: jumlah emiten, contoh baris, dan NaN per metrik."""
+    if not metrics_map:
+        return "kosong"
+    arr = np.asarray(list(metrics_map.values()), dtype=float)
+    nan_per_metrik = np.isnan(arr).sum(axis=0) if arr.ndim == 2 else []
+    detail = ", ".join(f"{METRIC_NAMES[j]}={int(nan_per_metrik[j])}"
+                       for j in range(len(nan_per_metrik)))
+    contoh = "; ".join(
+        f"{k}=[{', '.join(f'{v:,.4g}' for v in vals)}]"
+        for k, vals in list(metrics_map.items())[:n]
+    )
+    return (f"n_emiten={len(metrics_map)} | NaN per metrik: {detail} | "
+            f"contoh (urut {METRIC_NAMES}): {contoh}")
+
+
+def _fmt_rf(rf: Optional[float]) -> str:
+    """Format risk-free rate untuk log (fraksi + persen)."""
+    if rf is None:
+        return "None"
+    try:
+        return f"{float(rf):.6f} ({float(rf) * 100:.4f}%)"
+    except (TypeError, ValueError):
+        return str(rf)
 
 
 # ======================================================================
@@ -209,9 +308,11 @@ def take_fundamental_data():
 def take_bi_rate():
     """LIVE: Take the latest BI rate data (fraksi desimal, mis. 0.0575)."""
     try:
-        return fetch_bi_rate()
+        rf = fetch_bi_rate()
+        logger.info("take_bi_rate: API BI -> risk_free=%s", _fmt_rf(rf))
+        return rf
     except Exception as e:
-        print(f"Terjadi kesalahan saat mengambil data BI Rate: {e}")
+        logger.warning("take_bi_rate: GAGAL mengambil BI rate (%s) -> None", e)
         return None
 
 
@@ -276,10 +377,11 @@ def _load_bi_rate_history(date_ref: date) -> Optional[float]:
     BACKTEST: BI-7Day-RR pada/atau sebelum `date_ref` sebagai fraksi desimal.
     Mengembalikan None bila file tidak ada / tidak ada baris yang cocok.
     """
+    logger.info("_load_bi_rate_history: date_ref=%s (ambil baris TERAKHIR <= date_ref)", date_ref)
     try:
         df = pd.read_excel(RISKFREE_FILE, header=None)
     except Exception as e:
-        print(f"   [!] Gagal membaca {RISKFREE_FILE.name} ({e}).")
+        logger.warning("_load_bi_rate_history: Gagal membaca %s (%s) -> None", RISKFREE_FILE.name, e)
         return None
 
     try:
@@ -297,34 +399,92 @@ def _load_bi_rate_history(date_ref: date) -> Optional[float]:
         )
         data = data[data["tanggal"] <= date_ref]
         if data.empty:
+            logger.warning("_load_bi_rate_history: tidak ada baris BI rate <= %s -> None", date_ref)
             return None
-        return float(data["rate"].iloc[-1]) / 100.0
+        tanggal_dipakai = data["tanggal"].iloc[-1]
+        hasil = float(data["rate"].iloc[-1]) / 100.0
+        logger.info("_load_bi_rate_history: baris terakhir <= date_ref -> tanggal=%s, "
+                    "rate_raw=%.2f%%, risk_free=%s",
+                    tanggal_dipakai, float(data["rate"].iloc[-1]), _fmt_rf(hasil))
+        return hasil
     except Exception as e:
-        print(f"   [!] Gagal parsing BI rate historis ({e}).")
+        logger.warning("_load_bi_rate_history: Gagal parsing BI rate historis (%s) -> None", e)
         return None
 
 
-def _load_dividend_yields(codes: List[str], date_ref: date) -> Dict[str, float]:
-    """
-    BACKTEST: dividend yield (fraksi) dari event ex-dividend TERAKHIR
-    pada/atau sebelum `date_ref` (anti look-ahead). Default 0.0.
-    """
-    try:
-        df = pd.read_excel(DIVIDEND_FILE)
-    except Exception as e:
-        print(f"   [!] Gagal membaca {DIVIDEND_FILE.name} ({e}) -> dividend yield dianggap 0.")
-        return {}
+# def _load_dividend_yields(codes: List[str], date_ref: date) -> Dict[str, float]:
+#     """
+#     BACKTEST: dividend yield (fraksi) dari event ex-dividend TERAKHIR
+#     pada/atau sebelum `date_ref` (anti look-ahead). Default 0.0.
+#     """
+#     try:
+#         df = pd.read_excel(DIVIDEND_FILE)
+#     except Exception as e:
+#         print(f"   [!] Gagal membaca {DIVIDEND_FILE.name} ({e}) -> dividend yield dianggap 0.")
+#         return {}
 
-    df["Ex_Dividend_Date"] = pd.to_datetime(df["Ex_Dividend_Date"], errors="coerce")
-    df = df[df["Ticker"].isin(codes) & (df["Ex_Dividend_Date"].dt.date <= date_ref)]
-    if df.empty:
-        return {}
+#     df["Ex_Dividend_Date"] = pd.to_datetime(df["Ex_Dividend_Date"], errors="coerce")
+#     df = df[df["Ticker"].isin(codes) & (df["Ex_Dividend_Date"].dt.date <= date_ref)]
+#     if df.empty:
+#         return {}
 
-    df = df.assign(Dy=pd.to_numeric(df["Dividend_Yield_ExDate_%"], errors="coerce") / 100.0)
-    last = df.groupby("Ticker")["Ex_Dividend_Date"].transform("max")
-    df = df[df["Ex_Dividend_Date"] == last]
-    mean = df.groupby("Ticker")["Dy"].mean()
-    return {t: float(mean[t]) if t in mean.index else 0.0 for t in codes}
+#     df = df.assign(Dy=pd.to_numeric(df["Dividend_Yield_ExDate_%"], errors="coerce") / 100.0)
+#     last = df.groupby("Ticker")["Ex_Dividend_Date"].transform("max")
+#     df = df[df["Ex_Dividend_Date"] == last]
+#     mean = df.groupby("Ticker")["Dy"].mean()
+#     return {t: float(mean[t]) if t in mean.index else 0.0 for t in codes}
+
+def _load_dividend_yields(
+    codes: List[str],
+    date_ref: date,
+    prices: pd.Series
+) -> Dict[str, float]:
+
+    logger.info("_load_dividend_yields: n_codes=%d, window 1 tahun (%s .. %s), "
+                "contoh prices=%s",
+                len(codes), date_ref - timedelta(days=365), date_ref,
+                _probe_series(prices))
+    df = pd.read_excel(DIVIDEND_FILE)
+
+    df["Ex_Dividend_Date"] = pd.to_datetime(
+        df["Ex_Dividend_Date"],
+        errors="coerce"
+    )
+
+    start_date = pd.Timestamp(date_ref) - pd.DateOffset(years=1)
+    end_date = pd.Timestamp(date_ref)
+
+    df = df[
+        df["Ticker"].isin(codes)
+        & (df["Ex_Dividend_Date"] > start_date)
+        & (df["Ex_Dividend_Date"] <= end_date)
+    ]
+
+    dividend_ttm = (
+        df.groupby("Ticker")["Dividend_Per_Saham"]
+        .sum()
+    )
+
+    n_nonzero = int((dividend_ttm > 0).sum())
+    logger.info("_load_dividend_yields: %d emiten punya dividen > 0 dalam window | contoh TTM: %s",
+                n_nonzero, _probe_series(dividend_ttm))
+
+    result = {}
+
+    for ticker in codes:
+        dividend = float(dividend_ttm.get(ticker, 0.0))
+        price = prices.get(ticker, np.nan)
+
+        if pd.isna(price) or price <= 0:
+            result[ticker] = np.nan
+        else:
+            result[ticker] = dividend / price
+
+    valid = {t: v for t, v in result.items() if pd.notna(v)}
+    contoh = ", ".join(f"{t}={valid[t]:.4%}" for t in list(valid)[:TRACE_SAMPLE])
+    logger.info("_load_dividend_yields: hasil -> n=%d, valid(non-NaN)=%d | contoh DivYld: %s",
+                len(result), len(valid), contoh or "-")
+    return result
 
 
 def _to_float(value) -> float:
@@ -369,6 +529,11 @@ def _provide_backtest_data(date_ref: date, lookback_days: int):
     if date_ref is None:
         raise ValueError("Mode backtest memerlukan parameter 'date_ref' yang valid.")
 
+    _t0 = time.perf_counter()
+    logger.info("[BACKTEST] _provide_backtest_data: mulai | date_ref=%s, lookback_days=%d "
+                "(window return %s .. %s)",
+                date_ref, lookback_days, date_ref - timedelta(days=lookback_days), date_ref)
+
     print(f"[DataLoader] Mode BACKTEST - merakit data per {date_ref}...")
 
     # 1. Universe + fundamental dasar (EPS/ROE/DER/ADTV) dari pipeline backtest
@@ -377,6 +542,8 @@ def _provide_backtest_data(date_ref: date, lookback_days: int):
         raise ValueError(f"Tidak ada saham yang lolos preprocessing pada {date_ref}.")
     codes = list(df_lolos.index)
     print(f"[DataLoader] Universe backtest: {len(codes)} saham lolos filter.")
+    logger.info("[BACKTEST] preprocessing selesai -> %d saham lolos | ROE: %s | DER: %s",
+                len(codes), _probe_series(df_lolos["ROE"]), _probe_series(df_lolos["DER"]))
 
     # 2. OHLCV historis (window `lookback_days` hari ke belakang dari date_ref)
     df_price = pd.read_parquet(PRICE_FILE)
@@ -396,7 +563,26 @@ def _provide_backtest_data(date_ref: date, lookback_days: int):
         window.pivot_table(index="Date", columns="Ticker", values="Close", aggfunc="last")
         .sort_index()
     )
-    liquidity = (window["Close"] * window["Volume"]).groupby(window["Ticker"]).mean()
+
+    # Likuiditas = ADTV 60 HARI BURSA TERAKHIR (ETV = Close x Volume), bukan
+    # rata-rata seluruh window. Urutkan kronologis per ticker dulu agar
+    # tail(60) benar-benar 60 hari terakhir sebelum date_ref.
+    etv = (
+        pd.DataFrame({
+            "Ticker": window["Ticker"],
+            "Date": window["Date"],
+            "ETV": window["Close"] * window["Volume"],
+        })
+        .sort_values(["Ticker", "Date"])
+    )
+    liquidity = etv.groupby("Ticker")["ETV"].apply(
+        lambda s: s.tail(LIQUIDITY_WINDOW_DAYS).mean()
+    )
+    logger.info("[BACKTEST] df_close=%s", _probe_frame(df_close))
+    top_liq = liquidity.sort_values(ascending=False).head(TRACE_SAMPLE)
+    logger.info("[BACKTEST] liquidity (ADTV %d hari terakhir, IDR) -> n=%d | Top-%d: %s",
+                LIQUIDITY_WINDOW_DAYS, len(liquidity), TRACE_SAMPLE,
+                ", ".join(f"{t}={v:,.0f}" for t, v in top_liq.items()))
 
     # 3. PER & PBV dari fundamental kuartalan (periode fiskal relevan)
     try:
@@ -408,13 +594,22 @@ def _provide_backtest_data(date_ref: date, lookback_days: int):
         per = _positive_or_nan(piv.get("PE Ratio (Quarter)"))
         pbv = _positive_or_nan(piv.get("Price to Book Value (Quarter)"))
         print(f"[DataLoader] Fundamental backtest: periode fiskal {period_str}.")
+        logger.info("[BACKTEST] fundamental periode %s | PER: %s | PBV: %s",
+                    period_str, _probe_series(per), _probe_series(pbv))
     except Exception as e:
         print(f"   [!] Gagal membaca {FUND_FILE.name} ({e}) -> PER/PBV dianggap tidak tersedia.")
+        logger.warning("[BACKTEST] Gagal membaca %s (%s) -> PER/PBV = None", FUND_FILE.name, e)
         per = pbv = None
 
     # 4. Dividend yield & risk-free yang bebas look-ahead
-    div_map = _load_dividend_yields(codes, date_ref)
+    #    `prices` = harga terakhir per ticker (<= date_ref) dipakai sebagai
+    #    penyebut dividend yield TTM: yield = sigma(dividen 1 tahun) / harga.
+    last_prices = df_close.ffill().iloc[-1]
+    logger.info("[BACKTEST] last_prices (penyebut DivYld)=%s", _probe_series(last_prices))
+    div_map = _load_dividend_yields(codes, date_ref, last_prices)
     risk_free = _load_bi_rate_history(date_ref)
+    logger.info("[BACKTEST] risk_free yang akan dipakai (dari BI-7Day-RR <= %s): %s",
+                date_ref, _fmt_rf(risk_free))
 
     # 5. Rakit metrics_map: [PER, PBV, ROE, DER, DivYld]
     #    DER backtest dari pipeline berbentuk PERSEN -> dijadikan RASIO (÷100)
@@ -432,6 +627,11 @@ def _provide_backtest_data(date_ref: date, lookback_days: int):
             div_map.get(t, 0.0),
         ]
 
+    logger.info("[BACKTEST] metrics_map selesai: %s", _probe_metrics_map(metrics_map))
+    logger.info("[BACKTEST] _provide_backtest_data selesai dalam %.2fs -> "
+                "df_close=%s, metrics_map(%d), risk_free=%s, liquidity(n=%d)",
+                time.perf_counter() - _t0, _probe_frame(df_close), len(metrics_map),
+                _fmt_rf(risk_free), len(liquidity))
     return df_close, metrics_map, risk_free, liquidity
 
 
@@ -458,11 +658,13 @@ def _provide_live_data():
     df_close = df_ohlcv["Close"].ffill().fillna(0)
     df_close.columns = [str(c).replace(".JK", "") for c in df_close.columns]
 
-    # Likuiditas = rata-rata nilai transaksi harian (Close x Volume)
+    # Likuiditas = ADTV 60 HARI BURSA TERAKHIR (ETV = Close x Volume).
+    # df_ohlcv sudah terurut berdasarkan tanggal (index=Date), sehingga
+    # tail(60) mengambil 60 hari bursa terakhir per ticker.
     try:
         tv = df_ohlcv["Close"] * df_ohlcv["Volume"]
         tv.columns = [str(c).replace(".JK", "") for c in tv.columns]
-        liquidity = tv.mean()
+        liquidity = tv.tail(LIQUIDITY_WINDOW_DAYS).mean()
     except Exception:
         liquidity = pd.Series(dtype=float)
 
@@ -479,6 +681,11 @@ def _provide_live_data():
         db.close()
 
     risk_free = take_bi_rate()
+    logger.info("[LIVE] df_close=%s", _probe_frame(df_close))
+    logger.info("[LIVE] liquidity (ADTV %d hari, IDR)=%s",
+                LIQUIDITY_WINDOW_DAYS, _probe_series(liquidity))
+    logger.info("[LIVE] metrics_map: %s", _probe_metrics_map(metrics_map))
+    logger.info("[LIVE] risk_free dari API BI: %s", _fmt_rf(risk_free))
     return df_close, metrics_map, risk_free, liquidity
 
 
@@ -525,7 +732,8 @@ def _assemble_market_data(
         df_close    : index=Date, kolom=ticker (tanpa '.JK')
         metrics_map : {ticker: [PER, PBV, ROE, DER, DivYld]}
         risk_free   : fraksi tahunan (mis. 0.0575)
-        liquidity   : rata-rata nilai transaksi per ticker (untuk pemilihan N)
+        liquidity   : ADTV 60 hari terakhir per ticker (IDR/hari), dipakai
+                      untuk memilih `max_stocks` kandidat paling likuid
     """
     if df_close is None or df_close.empty or not metrics_map:
         print("Error: Data OHLCV / fundamental kosong. Perakitan dibatalkan.")
@@ -565,6 +773,12 @@ def _assemble_market_data(
 
     # 7. Risk-free: fallback 6.25% bila gagal diambil
     rf = risk_free if risk_free is not None else 0.0625
+    if risk_free is None:
+        logger.warning("_assemble_market_data: risk_free=None -> fallback %.4f (6.25%%)", rf)
+    logger.info("_assemble_market_data: n_candidates=%d, min_price=%.0f, max_stocks=%s, "
+                "n_final=%d, rf=%s",
+                len(candidates), min_price, max_stocks, len(candidates), _fmt_rf(rf))
+    logger.info("_assemble_market_data: kandidat final: %s", candidates[:TRACE_SAMPLE])
 
     return MarketData(
         stock_codes=candidates,
@@ -606,6 +820,14 @@ def build_market_data(
         df_close, metrics_map, risk_free, liquidity = _provide_backtest_data(date_ref, lookback_days)
     else:
         df_close, metrics_map, risk_free, liquidity = _provide_live_data()
+
+    logger.info("build_market_data: parameter -> min_price=%.0f, max_stocks=%s, "
+                "backtest=%s, date_ref=%s, lookback_days=%d",
+                min_price, max_stocks, backtest, date_ref, lookback_days)
+    logger.info("build_market_data: provider mengembalikan -> df_close=%s, "
+                "metrics_map: %s, risk_free=%s, liquidity: %s",
+                _probe_frame(df_close), _probe_metrics_map(metrics_map),
+                _fmt_rf(risk_free), _probe_series(liquidity))
 
     market_data = _assemble_market_data(
         df_close, metrics_map, risk_free, liquidity, min_price, max_stocks
