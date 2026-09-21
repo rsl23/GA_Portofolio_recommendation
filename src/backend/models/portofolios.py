@@ -37,6 +37,7 @@ class Portofolio(Base):
     # status dan penjelasan
     status_portofolio = Column(String, nullable=False, default="active")  # active, rebalanced, inactive, etc.
     created_at = Column(DateTime, default=datetime.utcnow)
+    date_ref = Column(DateTime, nullable=True)  # acuan simulasi backtest
     
     # rebalance
     is_rebalance = Column(Boolean, nullable=False, default=False)  # yes or no

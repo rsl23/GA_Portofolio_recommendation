@@ -183,20 +183,43 @@ def price_history_endpoint(
     )
 
 
-@router.get("/portofolio_performance", response_model=ApiResponse[dict])
+@router.get("/portofolio_performance/{portfolio_id}", response_model=ApiResponse[dict])
 def portofolio_performance_endpoint(
+    portfolio_id: str,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
+    end_date: date | None = None,
+    backtest: bool = False,
 ):
     """
-    Hitung performa portofolio ACTIVE user vs IHSG dalam persentase return
-    kumulatif harian, sejak tanggal portofolio aktif dibuat.
-    Perhitungan berbasis kepemilikan lot: nilai portofolio harian =
-    SUM(jumlah_lot x 100 lembar x adj_close), return = nilai_t / nilai_t0 - 1.
-    404 jika user belum memiliki portofolio aktif / data harga belum tersedia.
+    Hitung performa portofolio TERTENTU (path param {portfolio_id}) milik user
+    vs IHSG dalam persentase return kumulatif harian, dari portofolio.date_ref
+    (backtest: tanggal simulasi; live: sekarang) sampai query param `end_date`
+    (YYYY-MM-DD) — atau sampai data terakhir bila `end_date` tidak diberikan.
+    Perhitungan berbasis kepemilikan lot PER ITEM (window start_date/end_date
+    milik item dihormati), sehingga perubahan kepemilikan akibat rebalance
+    ikut terhitung: nilai portofolio harian = SUM(lot aktif x 100 lembar x
+    adj_close), return = nilai_t / nilai_t0 - 1.
+
+    Path param:
+      - portfolio_id (UUID, wajib): ID portofolio yang akan dihitung.
+        Wajib milik user pada JWT — portofolio user lain -> 404.
+
+    Query param:
+      - end_date (YYYY-MM-DD, opsional): batas akhir perhitungan (inklusif).
+      - backtest (bool, default false): true = hitung performa portofolio backtest
+
+    404 jika portofolio tidak ditemukan / bukan milik user / data harga
+    belum tersedia pada rentang tsb.
     """
     try:
-        hasil = get_portfolio_performance(db, user_id=current_user["sub"])
+        hasil = get_portfolio_performance(
+            db,
+            user_id=current_user["sub"],
+            portfolio_id=portfolio_id,
+            end_date=end_date,
+            backtest=backtest,
+        )
     except PortfolioNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     return ApiResponse(

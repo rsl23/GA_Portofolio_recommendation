@@ -191,6 +191,15 @@ def generate_new_portfolio(
             f"mengubah portofolio live Anda."
         )
 
+    # 5a. date_ref acuan portofolio (kolom Portofolio.date_ref):
+    #     - BACKTEST : tanggal simulasi dari parameter.
+    #     - LIVE     : sekarang (selaras created_at).
+    from datetime import datetime as _dt
+    if backtest:
+        date_ref_dt = _dt.combine(date_ref, _dt.min.time())
+    else:
+        date_ref_dt = _dt.now()
+
     # 5. Supersede: portofolio lama DIGANTIKAN STATUSNYA (tidak dihapus).
     #    Mode LIVE     : active            -> replaced
     #    Mode BACKTEST : active_backtest   -> replaced_backtest
@@ -242,6 +251,8 @@ def generate_new_portfolio(
         parent_portofolio_id=None,
         turnover_rate=None,          # turnover hanya relevan saat rebalance
         turnover_penalty_beta=None,  # beta hanya dipakai saat rebalance
+        # acuan tanggal portofolio: tanggal simulasi (backtest) / sekarang (live)
+        date_ref=date_ref_dt,
     )
     db.add(portofolio)
     db.flush()  # dapatkan portofolio.id sebelum commit (id di-generate default-nya)
@@ -274,6 +285,10 @@ def generate_new_portfolio(
             harga_beli=price / 100.0,  # default: user bisa edit lewat PATCH
             total_investasi=float(lot * price),
             action_type="buy",  # portofolio baru: semua posisi adalah pembelian awal
+            # window kepemilikan: mulai pada date_ref portofolio;
+            # end_date NULL = masih dipegang (diisi saat rebalance/sell).
+            start_date=date_ref_dt,
+            end_date=None,
         )
         for ticker, lot, price in rows
         if lot > 0
@@ -556,49 +571,80 @@ def update_harga_beli(db: Session, user_id: str, item_id: str, harga_beli: float
     return item
 
 
-def get_portfolio_performance(db: Session, user_id: str) -> dict:
+def get_portfolio_performance(
+    db: Session,
+    user_id: str,
+    portfolio_id: str,
+    end_date: date | None = None,
+    backtest: bool = False,
+) -> dict:
     """
-    Hitung performa (persentase return kumulatif harian) portofolio ACTIVE user
-    vs IHSG, sejak tanggal portofolio aktif dibuat.
+    Hitung performa (persentase return kumulatif harian) portofolio TERTENTU
+    milik user (identifikasi via portfolio_id dari path) vs IHSG.
 
-    Metode (berbasis KEPEMILIKAN LOT, bukan bobot investasi):
-      nilai_portofolio(t) = SUM( jumlah_lot_i * adj_close_i(t) )
+    Rentang perhitungan:
+      mulai  : portofolio.date_ref (kolom acuan; fallback created_at)
+      akhir  : parameter `end_date` (YYYY-MM-DD) bila diberikan,
+               selain itu sampai data harga terakhir yang tersedia.
+
+    Metode (berbasis KEPEMILIKAN LOT per item, bukan bobot investasi):
+      nilai_portofolio(t) = SUM over item(
+          jumlah_lot_i(t) * adj_close_i(t) )   bila t di dalam window
+                                               [item.start_date, item.end_date]
       return(t)           = nilai_portofolio(t) / nilai_portofolio(t0) - 1
-    Kontribusi tiap emiten otomatis mengikuti pergerakan harganya, sehingga
-    return portofolio total lebih akurat.
+    Karena tiap item punya start_date/end_date sendiri, kepemilikan bisa
+    berubah sepanjang waktu (efek rebalance: buy/sell/add/reduce) dan semua
+    item milik ticker yang sama diakumulasi lewat interval masing-masing.
 
-    Raises: PortfolioNotFoundError jika user belum punya portofolio aktif.
+    Args:
+        portfolio_id : ID portofolio (path param). Portofolio HARUS milik
+                       user pada JWT — portofolio user lain -> 404.
+        end_date     : batas akhir perhitungan (inklusif); None = data terakhir.
+
+    Raises: PortfolioNotFoundError jika ID tidak valid / bukan milik user /
+            data harga belum tersedia pada rentang tsb.
     """
     import pandas as pd
-    from uuid import UUID
 
     try:
         user_uuid = UUID(user_id)
+        portfolio_uuid = UUID(portfolio_id)
     except (ValueError, TypeError, AttributeError) as e:
-        raise PortfolioNotFoundError(f"User ID pada token tidak valid: {user_id}") from e
+        raise PortfolioNotFoundError(f"ID tidak valid: {e}") from e
 
-    # 1. Portofolio ACTIVE user — ambil yang TERBARU secara eksplisit
-    #    (bukan MIN/MAX sembarang active), jadi basis perhitungan jelas.
+    # 1. Portofolio by ID — WAJIB milik user dari JWT (privasi antar user:
+    #    portofolio milik orang lain diperlakukan seperti tidak ada).
     portfolio = (
         db.query(Portofolio)
-        .filter(
-            Portofolio.user_id == user_uuid,
-            Portofolio.status_portofolio == "active",
-        )
-        .order_by(Portofolio.created_at.desc(), Portofolio.id.desc())
+        .filter(Portofolio.id == portfolio_uuid, Portofolio.user_id == user_uuid)
         .first()
     )
     if portfolio is None:
-        raise PortfolioNotFoundError("User belum memiliki portofolio aktif.")
-    start_dt = portfolio.created_at
+        raise PortfolioNotFoundError(
+            f"Portofolio {portfolio_id} tidak ditemukan (atau bukan milik Anda)."
+        )
+
+    # Deteksi mode: dari PARAMETER atau otomatis dari status portofolio,
+    # sehingga portofolio backtest selalu dihitung dari data parquet historis
+    # walau frontend lupa mengirim ?backtest=true.
+    is_backtest = (
+        backtest
+        or portfolio.status_portofolio in (STATUS_ACTIVE_BACKTEST, STATUS_REPLACED_BACKTEST)
+    )
+
+    # Awal hitung = date_ref portofolio (backtest: tanggal simulasi;
+    # live: sekarang). Fallback created_at untuk baris lama tanpa date_ref.
+    start_dt = portfolio.date_ref or portfolio.created_at
     start_date = start_dt.date() if hasattr(start_dt, "date") else start_dt
 
-    # 2. Kepemilikan lot per emiten dari portofolio active tersebut (by id)
+    # 2. Item kepemilikan (window start_date/end_date ikut diambil)
     holdings_rows = (
         db.query(
             PortofolioItem.stock_id,
             StockUniverse.ticker,
             PortofolioItem.jumlah_lot,
+            PortofolioItem.start_date,
+            PortofolioItem.end_date,
         )
         .join(Portofolio, PortofolioItem.portofolio_id == Portofolio.id)
         .join(StockUniverse, PortofolioItem.stock_id == StockUniverse.id_stock)
@@ -609,74 +655,168 @@ def get_portfolio_performance(db: Session, user_id: str) -> dict:
         raise PortfolioNotFoundError("User belum memiliki saham di portofolio aktifnya.")
 
     stock_ids = [r.stock_id for r in holdings_rows]
-    lots_map = {r.ticker: int(r.jumlah_lot) for r in holdings_rows}
+    id_to_ticker = {str(r.stock_id): r.ticker for r in holdings_rows}
 
-    # 3. Harga per (date, stock_id) sejak start_date
-    price_rows = (
-        db.query(MarketData.stock_id, MarketData.date, MarketData.adj_close, MarketData.close)
-        .filter(
-            MarketData.stock_id.in_(stock_ids),
-            MarketData.date >= start_date,
+    if not is_backtest:
+        # 3. Harga per (date, stock_id) sejak start_date (<= end_date bila ada) (LIVE)
+        price_query = (
+            db.query(MarketData.stock_id, MarketData.date, MarketData.adj_close, MarketData.close)
+            .filter(
+                MarketData.stock_id.in_(stock_ids),
+                MarketData.date >= start_date,
+            )
         )
-        .all()
-    )
-    if not price_rows:
-        raise PortfolioNotFoundError(
-            "Belum ada data harga tersimpan untuk saham portofolio aktif. "
-            "Jalankan sync-prices terlebih dahulu."
-        )
+        if end_date is not None:
+            price_query = price_query.filter(MarketData.date <= end_date)
+        price_rows = price_query.all()
+        if not price_rows:
+            raise PortfolioNotFoundError(
+                "Belum ada data harga tersimpan untuk saham portofolio aktif. "
+                "Jalankan sync-prices terlebih dahulu."
+            )
 
-    # 4. Vectorization: pivot date x stock (adj_close; fallback close bila adj kosong)
-    recs = [
-        {"date": r.date, "stock_id": str(r.stock_id),
-         "price": r.adj_close if r.adj_close is not None else r.close}
-        for r in price_rows
-        if (r.adj_close is not None or r.close is not None)
-    ]
-    if not recs:
-        raise PortfolioNotFoundError("Data harga (adj_close/close) belum tersedia untuk saham portofolio aktif.")
+        # 4. Pivot date x stock (adj_close; fallback close bila adj kosong)
+        recs = [
+            {"date": r.date, "stock_id": str(r.stock_id),
+             "price": r.adj_close if r.adj_close is not None else r.close}
+            for r in price_rows
+            if (r.adj_close is not None or r.close is not None)
+        ]
+        if not recs:
+            raise PortfolioNotFoundError("Data harga (adj_close/close) belum tersedia untuk saham portofolio aktif.")
 
-    df_price = pd.DataFrame(recs).pivot_table(
-        index="date", columns="stock_id", values="price", aggfunc="last"
-    ).sort_index()
-    # dropna eksplisit bertahap:
-    # a) ffill: isi tanggal bolong per saham selama saham tsb sudah punya harga
-    #    sebelumnya (mis. saham suspension 1 hari)
-    df_price = df_price.ffill()
-    # b) buang baris yang KOSONG SEMUA (hari libur bersama sebelum saham manapun
-    #    punya harga — biasanya di awal rentang)
-    df_price = df_price.dropna(how="all")
-    # c) basis t0 harus tanggal di mana SEMUA saham portofolio sudah punya harga,
-    #    supaya nilai portofolio t0 benar-benar mencakup seluruh kepemilikan
-    df_price = df_price.dropna(axis=0, how="any")
+        df_price = pd.DataFrame(recs).pivot_table(
+            index="date", columns="stock_id", values="price", aggfunc="last"
+        ).sort_index()
+    else:
+        # 3 & 4. Harga historis dari Parquet (BACKTEST)
+        from pathlib import Path
+        ROOT = Path(__file__).resolve().parent.parent.parent.parent
+        PRICE_FILE = ROOT / "data" / "Master_OHLCV_15Tahun.parquet"
+
+        # Karena di Parquet masih ada ".JK", kita tambahkan untuk keperluan filter
+        tickers = list(id_to_ticker.values())
+        tickers_jk = [t + ".JK" for t in tickers]
+        
+        # Susun filter Predicate Pushdown untuk PyArrow
+        parquet_filters = [
+            ("Date", ">=", pd.Timestamp(start_date)),
+            ("Ticker", "in", tickers_jk)
+        ]
+        if end_date is not None:
+            parquet_filters.append(("Date", "<=", pd.Timestamp(end_date)))
+
+        try:
+            # Pandas hanya akan menarik baris yang lolos filter dari hard disk (RAM sangat aman)
+            window = pd.read_parquet(PRICE_FILE, filters=parquet_filters)
+        except Exception as e:
+            raise PortfolioNotFoundError(f"Gagal membaca data Parquet: {e}")
+
+        # Rapihkan formatnya sesuai dengan kebutuhan kode di bawahnya
+        window["Date"] = pd.to_datetime(window["Date"])
+        window["Ticker"] = window["Ticker"].astype(str).str.replace(".JK", "", regex=False)
+
+        if window.empty:
+            # Pesan informatif: tunjukkan rentang yang diminta vs cakupan data
+            # agar jelas apakah date_ref di luar cakupan parquet.
+            data_min, data_max = window["Date"].min().date(), window["Date"].max().date()
+            raise PortfolioNotFoundError(
+                f"Belum ada data harga tersimpan di rentang simulasi ini "
+                f"(diminta {start_date} s/d {end_date or data_max}; "
+                f"data parquet hanya mencakup {data_min} s/d {data_max}). "
+                f"Pilih date_ref/backtest dalam cakupan data."
+            )
+            
+        ticker_to_id = {t: str(i) for i, t in id_to_ticker.items()}
+        window["stock_id"] = window["Ticker"].map(ticker_to_id)
+        
+        if "Adj Close" in window.columns:
+            window["price"] = window["Adj Close"].fillna(window["Close"])
+        else:
+            window["price"] = window["Close"]
+            
+        df_price = window.pivot_table(
+            index="Date", columns="stock_id", values="price", aggfunc="last"
+        ).sort_index()
+
+    # Normalisasi: MarketData.date bisa berupa datetime.date -> Timestamp,
+    # agar perbandingan window item (pd.Timestamp) tidak TypeError.
+    df_price.index = pd.to_datetime(df_price.index)
+    df_price = df_price.ffill()            # isi hari bolong per saham (suspensi)
+    df_price = df_price.dropna(how="all")  # buang baris libur bersama
     if df_price.empty:
         raise PortfolioNotFoundError("Data harga belum cukup untuk menghitung performa.")
 
-    id_to_ticker = {str(r.stock_id): r.ticker for r in holdings_rows}
     df_price.columns = [id_to_ticker[c] for c in df_price.columns]
 
-    # 5. Nilai portofolio harian = SUM(lots * price).
-    #    PENTING: adj_close dari yfinance adalah harga PER LEMBAR, sedangkan
-    #    jumlah_lot = 100 lembar, jadi konversi lot -> lembar (x 100).
+    # 5. Nilai portofolio harian = SUM(lot aktif pada t x harga(t) x 100).
+    #    Lot aktif ditentukan window [start_date, end_date] MILIK ITEM,
+    #    sehingga perubahan kepemilikan akibat rebalance ikut terhitung.
     LOTS_PER_SHARE = 100
-    lots = pd.Series({t: lots_map[t] * LOTS_PER_SHARE for t in df_price.columns if t in lots_map})
-    df_price = df_price[list(lots.index)]
-    portfolio_value = df_price.mul(lots, axis=1).sum(axis=1)
-    portfolio_return = portfolio_value / portfolio_value.iloc[0] - 1
+    portfolio_value = pd.Series(0.0, index=df_price.index)
+    for r in holdings_rows:
+        ticker = r.ticker
+        if ticker not in df_price.columns:
+            continue
+        item_start = (
+            pd.Timestamp(r.start_date) if r.start_date is not None
+            else pd.Timestamp(start_date)
+        )
+        # Item lama tanpa start_date / mulai sebelum rentang data -> aktif
+        # sejak awal rentang (tidak boleh hilang dari perhitungan).
+        item_start = max(item_start, df_price.index.min())
+        mask = df_price.index >= item_start
+        if r.end_date is not None:
+            mask &= df_price.index <= pd.Timestamp(r.end_date)
+        contribution = float(r.jumlah_lot) * LOTS_PER_SHARE * df_price[ticker]
+        portfolio_value += contribution.where(mask, 0.0)
 
-    # 6. Return IHSG sejak tanggal yang sama
-    idx_rows = (
-        db.query(IdxComposite)
-        .filter(IdxComposite.date >= df_price.index.min())
-        .order_by(IdxComposite.date.asc())
-        .all()
-    )
+    # t0 = tanggal pertama dengan nilai > 0 (fallback: tanggal pertama).
+    nonzero = portfolio_value[portfolio_value > 0]
+    if nonzero.empty:
+        raise PortfolioNotFoundError("Tidak ada kepemilikan aktif pada rentang perhitungan.")
+    portfolio_return = (portfolio_value / nonzero.iloc[0] - 1).fillna(0.0)
+
+    # 6. Return IHSG pada rentang yang sama
     ihsg_return = None
-    if idx_rows:
-        idx_series = pd.Series(
-            {r.date: r.close for r in idx_rows if r.close is not None}
-        ).sort_index()
-        ihsg_return = idx_series / idx_series.iloc[0] - 1
+    
+    if not is_backtest:
+        idx_query = (
+            db.query(IdxComposite)
+            .filter(IdxComposite.date >= df_price.index.min())
+        )
+        if end_date is not None:
+            idx_query = idx_query.filter(IdxComposite.date <= pd.Timestamp(end_date))
+        idx_rows = idx_query.order_by(IdxComposite.date.asc()).all()
+        if idx_rows:
+            idx_series = pd.Series(
+                {r.date: r.close for r in idx_rows if r.close is not None}
+            ).sort_index()
+            ihsg_return = idx_series / idx_series.iloc[0] - 1
+    else:
+        # BACKTEST: Baca dari context parquet
+        CONTEXT_FILE = ROOT / "data" / "Master_Market_Context_15Tahun.parquet"
+        try:
+            ihsg_filters = [
+                ("Ticker", "==", "^JKSE"),
+                ("Date", ">=", df_price.index.min())
+            ]
+            if end_date is not None:
+                ihsg_filters.append(("Date", "<=", pd.Timestamp(end_date)))
+                
+            # Tarik HANYA data IHSG pada rentang tanggal yang diminta
+            ihsg_data = pd.read_parquet(CONTEXT_FILE, filters=ihsg_filters)
+            
+            if not ihsg_data.empty:
+                ihsg_data["Date"] = pd.to_datetime(ihsg_data["Date"])
+                
+            if not ihsg_data.empty:
+                ihsg_data = ihsg_data.set_index("Date").sort_index()
+                idx_series = ihsg_data["Close"].dropna()
+                if not idx_series.empty:
+                    ihsg_return = idx_series / idx_series.iloc[0] - 1
+        except Exception as e:
+            logger.warning(f"Gagal membaca IHSG dari Parquet: {e}")
 
     # 7. Gabungkan (inner join tanggal agar kedua garis selalu punya nilai)
     combined = pd.DataFrame({"portfolio_return": portfolio_return})
@@ -700,9 +840,17 @@ def get_portfolio_performance(db: Session, user_id: str) -> dict:
 
     end = combined.index.max() if len(combined) else df_price.index.max()
 
+    # Snapshot lot aktif per ticker pada akhir rentang (untuk respons holdings)
+    final_lots: dict[str, int] = {}
+    for r in holdings_rows:
+        if r.end_date is not None and pd.Timestamp(r.end_date) < end:
+            continue  # sudah dijual sebelum akhir rentang
+        final_lots[r.ticker] = final_lots.get(r.ticker, 0) + int(r.jumlah_lot)
+    final_lots = {t: l for t, l in final_lots.items() if l > 0}
+
     return {
-        "start_date": start_dt.date().isoformat() if hasattr(start_dt, "date") else str(start_dt),
+        "start_date": start_date.isoformat() if hasattr(start_date, "isoformat") else str(start_date),
         "end_date": end.isoformat() if hasattr(end, "isoformat") else str(end),
-        "holdings": {t: lots_map[t] for t in sorted(lots_map)},
+        "holdings": {t: final_lots[t] for t in sorted(final_lots)},
         "series": series,
     }

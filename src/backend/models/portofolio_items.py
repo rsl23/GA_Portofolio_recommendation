@@ -25,6 +25,9 @@ class PortofolioItem(Base):
     action_type = Column(String, nullable=False)  # buy, sell, hold, add-more, reduce, etc.
 
     created_at = Column(DateTime, default=datetime.utcnow)
+    
+    start_date = Column(DateTime, nullable=True)  # tanggal mulai kepemilikan (untuk backtest)
+    end_date = Column(DateTime, nullable=True)    # tanggal akhir kepemilikan
 
     portofolio = relationship("Portofolio", back_populates="items")
     stock = relationship("StockUniverse")
