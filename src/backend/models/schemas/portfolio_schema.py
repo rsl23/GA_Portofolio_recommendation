@@ -74,6 +74,8 @@ class PortfolioResponse(BaseModel):
     risk_profile: str
     status_portofolio: Optional[str] = None       # active / replaced / dst (dari DB)
     created_at: Optional[datetime] = None         # dari DB (None saat hasil GA sebelum refresh)
+    date_ref: Optional[datetime] = None           # acuan tanggal portofolio (dari DB):
+                                                  # backtest = tanggal simulasi, live = waktu generate
     budget: float
     allocations: List[PortfolioItem] = []
     narasi_llm: Optional[str]

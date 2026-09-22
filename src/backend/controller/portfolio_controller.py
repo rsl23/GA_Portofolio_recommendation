@@ -320,6 +320,7 @@ def generate_new_portfolio(
         risk_profile=request.risk_profile,
         status_portofolio=portofolio.status_portofolio,
         created_at=portofolio.created_at,
+        date_ref=portofolio.date_ref,
         budget=request.budget,
         allocations=allocations,
         narasi_llm=narasi,
@@ -363,6 +364,44 @@ def _query_items_with_ticker(db: Session, portofolio_id) -> list[tuple[Portofoli
     )
 
 
+def _to_portfolio_response(db: Session, portofolio: Portofolio) -> PortfolioResponse:
+    """Bangun PortfolioResponse dari satu baris Portofolio + item-itemnya.
+
+    Dipakai BERSAMA oleh get_active_portfolio & get_all_my_portfolios agar bentuk
+    respons selalu identik. Field yang tidak disimpan di DB (expected_return)
+    bernilai None, n_active dihitung dari jumlah item, sedangkan total_terpakai &
+    sisa_budget dihitung ULANG dari total_investasi item (berbasis harga_beli
+    milik user) karena kolom di tabel portofolios bisa basi setelah user
+    mengedit harga_beli lewat PATCH.
+    """
+    item_pairs = _query_items_with_ticker(db, portofolio.id)
+    items = [pair[0] for pair in item_pairs]
+
+    total_terpakai = sum((it.total_investasi or 0.0) for it in items)
+
+    return PortfolioResponse(
+        id=str(portofolio.id),
+        user_id=str(portofolio.user_id),
+        fitness_score=portofolio.fitness_score,
+        sharpe_ratio=portofolio.sharpe_ratio,
+        expected_return=None,  # tidak disimpan di DB (hanya dihitung saat generate)
+        max_drawdown=portofolio.max_drawdown,
+        avg_correlation=portofolio.avg_correlation,
+        skor_fundamental=portofolio.skor_fundamental,
+        total_terpakai=total_terpakai,
+        sisa_budget=portofolio.budget - total_terpakai,
+        n_active=len(items),
+        allocated_budget_ok=total_terpakai <= portofolio.budget,
+        risk_profile=portofolio.risk_profile,
+        status_portofolio=portofolio.status_portofolio,
+        created_at=portofolio.created_at,
+        date_ref=portofolio.date_ref,
+        budget=portofolio.budget,
+        allocations=[_to_item_response(item, ticker) for item, ticker in item_pairs],
+        narasi_llm=portofolio.narasi_llm,
+    )
+
+
 def get_active_portfolio(db: Session, user_id: str, backtest: bool = False) -> PortfolioResponse:
     """
     Ambil portofolio AKTIF terbaru milik user (dari payload JWT).
@@ -371,7 +410,9 @@ def get_active_portfolio(db: Session, user_id: str, backtest: bool = False) -> P
     Ordering: created_at terbaru, dengan id sebagai tiebreaker.
     Respons memakai schema yang SAMA dengan hasil generate (PortfolioResponse):
     field yang tidak disimpan di DB (expected_return) bernilai None,
-    n_active dihitung dari jumlah item, allocated_budget_ok dihitung ulang.
+    n_active dihitung dari jumlah item, allocated_budget_ok dihitung ulang,
+    date_ref diambil dari kolom Portofolio.date_ref (backtest = tanggal
+    simulasi, live = waktu portofolio digenerate).
     Raises: UserNotFoundError jika user tidak valid / tidak ada.
             PortfolioNotFoundError jika user belum pernah generate.
     """
@@ -393,36 +434,62 @@ def get_active_portfolio(db: Session, user_id: str, backtest: bool = False) -> P
             else "User belum memiliki portofolio aktif."
         )
 
-    item_pairs = _query_items_with_ticker(db, portofolio.id)
-    items = [pair[0] for pair in item_pairs]
+    # Respons dibangun lewat helper bersama _to_portfolio_response (bentuk
+    # respons identik dengan get_all_my_portfolios): total_terpakai & sisa_budget
+    # dihitung ulang dari item (total_investasi berbasis harga_beli milik user)
+    # — nilai kolom portofolio bisa basi setelah user mengedit harga_beli lewat PATCH.
+    return _to_portfolio_response(db, portofolio)
 
-    # total_terpakai & sisa_budget dihitung ulang dari item (total_investasi
-    # berbasis harga_beli milik user) — nilai kolom portofolio bisa basi
-    # setelah user mengedit harga_beli lewat PATCH.
-    total_terpakai = sum((it.total_investasi or 0.0) for it in items)
-    sisa_budget = portofolio.budget - total_terpakai
-    allocated_budget_ok = total_terpakai <= portofolio.budget
 
-    return PortfolioResponse(
-        id=str(portofolio.id),
-        user_id=str(portofolio.user_id),
-        fitness_score=portofolio.fitness_score,
-        sharpe_ratio=portofolio.sharpe_ratio,
-        expected_return=None,  # tidak disimpan di DB (hanya dihitung saat generate)
-        max_drawdown=portofolio.max_drawdown,
-        avg_correlation=portofolio.avg_correlation,
-        skor_fundamental=portofolio.skor_fundamental,
-        total_terpakai=total_terpakai,
-        sisa_budget=sisa_budget,
-        n_active=len(items),
-        allocated_budget_ok=allocated_budget_ok,
-        risk_profile=portofolio.risk_profile,
-        status_portofolio=portofolio.status_portofolio,
-        created_at=portofolio.created_at,
-        budget=portofolio.budget,
-        allocations=[_to_item_response(item, ticker) for item, ticker in item_pairs],
-        narasi_llm=portofolio.narasi_llm,
+def get_all_my_portfolios(
+    db: Session,
+    user_id: str,
+    backtest: bool = False,
+) -> list[PortfolioResponse]:
+    """
+    Ambil SEMUA portofolio milik user (identitas dari payload JWT) yang dipisah
+    berdasarkan MODE lewat kolom `status_portofolio`:
+
+      backtest=False -> mode LIVE     : status "active"  + "replaced"
+      backtest=True  -> mode BACKTEST : status "active_backtest" + "replaced_backtest"
+
+    Karena pemisahan mode memakai status_portofolio, TIDAK ada portofolio yang
+    tertukar antar mode: portofolio live yang sudah digantikan ("replaced") tetap
+    tampil di mode live, dan hasil simulasi lama ("replaced_backtest") tetap
+    tampil di mode backtest. Portofolio berstatus "replaced_*" TIDAK dihapus dari DB.
+    Urutan: created_at terbaru dulu (id sebagai tiebreaker).
+    Respons memakai schema yang SAMA dengan GET /my-portofolio
+    (PortfolioResponse, lengkap dengan daftar alokasi itemnya), termasuk
+    `date_ref` (kolom Portofolio.date_ref) sehingga frontend bisa membedakan
+    tanggal simulasi portofolio backtest dan tanggal dibuat portofolio live.
+    User yang belum punya portofolio pada mode tsb -> list kosong (bukan error).
+    Raises: UserNotFoundError jika user pada token tidak valid / tidak ada.
+    """
+    user_uuid = _parse_user_uuid(user_id, db)
+
+    # Filter status sesuai mode: LIVE (active/replaced) vs BACKTEST (active/replaced _backtest)
+    status_targets = (
+        (STATUS_ACTIVE_BACKTEST, STATUS_REPLACED_BACKTEST)
+        if backtest
+        else (STATUS_ACTIVE, STATUS_REPLACED)
     )
+
+    rows = (
+        db.query(Portofolio)
+        .filter(
+            Portofolio.user_id == user_uuid,
+            Portofolio.status_portofolio.in_(status_targets),
+        )
+        .order_by(Portofolio.created_at.desc(), Portofolio.id.desc())
+        .all()
+    )
+    logger.info(
+        "Mengambil %d portofolio %s untuk user %s (status: %s).",
+        len(rows), "backtest" if backtest else "live", user_uuid,
+        ", ".join(status_targets),
+    )
+
+    return [_to_portfolio_response(db, portofolio) for portofolio in rows]
 
 
 def list_portfolio_history(db: Session, user_id: str) -> list[PortfolioHistoryItem]:
@@ -503,6 +570,7 @@ def get_portfolio_by_id(db: Session, portfolio_id: str) -> PortfolioResponse:
         risk_profile=portfolio.risk_profile,
         status_portofolio=portfolio.status_portofolio,
         created_at=portfolio.created_at,
+        date_ref=portfolio.date_ref,  # acuan tanggal: tanggal simulasi (backtest) / waktu generate (live)
         budget=portfolio.budget,
         allocations=allocations,
         narasi_llm=portfolio.narasi_llm,

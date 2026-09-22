@@ -20,6 +20,7 @@ from src.backend.controller.portfolio_controller import (
     UserNotFoundError,
     generate_new_portfolio,
     get_active_portfolio,
+    get_all_my_portfolios,
     list_portfolio_history,
     update_harga_beli,
     get_portfolio_performance,
@@ -116,30 +117,40 @@ def api_generate_portfolio(
     )
 
 
-@router.get("/my-portofolio", response_model=ApiResponse[PortfolioResponse])
+@router.get("/my-portfolio", response_model=ApiResponse[PortfolioResponse])
 def api_my_portfolio(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
+    backtest: bool = False,
 ):
     """
     Ambil portofolio AKTIF terbaru milik user (identitas diambil dari JWT,
     bukan dari parameter). Dipakai halaman "My Portfolio".
-    404 jika user belum pernah generate portofolio.
+
+    Query param:
+      - backtest (bool, default false): false = portofolio LIVE (status "active"),
+        true = portofolio SIMULASI terbaru (status "active_backtest").
+
+    404 jika user belum pernah generate portofolio pada mode tsb.
     """
     try:
-        hasil = get_active_portfolio(db, user_id=current_user["sub"])
+        hasil = get_active_portfolio(db, user_id=current_user["sub"], backtest=backtest)
     except UserNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except PortfolioNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     return ApiResponse(
         status="success",
-        message="Portofolio aktif berhasil diambil.",
+        message=(
+            "Portofolio backtest aktif berhasil diambil."
+            if backtest
+            else "Portofolio aktif berhasil diambil."
+        ),
         data=hasil,
     )
 
 
-@router.get("/my-portofolio/history", response_model=ApiResponse[list[PortfolioHistoryItem]])
+@router.get("/my-portfolio/history", response_model=ApiResponse[list[PortfolioHistoryItem]])
 def api_my_portfolio_history(
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
@@ -155,6 +166,57 @@ def api_my_portfolio_history(
     return ApiResponse(
         status="success",
         message="Histori portofolio berhasil diambil.",
+        data=hasil,
+    )
+
+
+@router.get("/my-portfolio/all", response_model=ApiResponse[list[PortfolioResponse]])
+def api_my_portfolio_all(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    backtest: bool = False,
+):
+    """
+    Ambil SEMUA portofolio milik user (identitas dari JWT) sesuai MODE yang
+    dipilih lewat query param `backtest`, pemisahannya memakai kolom
+    `status_portofolio` pada tabel portofolios:
+
+      - backtest=false (default) -> portofolio LIVE
+            status "active" (portofolio live terbaru) +
+            status "replaced" (portofolio live yang sudah digantikan)
+      - backtest=true            -> portofolio BACKTEST
+            status "active_backtest" (simulasi terbaru) +
+            status "replaced_backtest" (simulasi yang sudah digantikan)
+
+    Karena mode dibedakan dari status, portofolio live tidak akan pernah
+    tercampur dengan hasil simulasi backtest. Portofolio "replaced_*" tetap
+    tersimpan di database dan ikut tampil di sini (tidak dihapus).
+    Urutan: created_at terbaru dulu; respons memakai schema yang SAMA dengan
+    GET /my-portofolio (PortfolioResponse lengkap dengan daftar alokasi item).
+
+    Query param:
+      - backtest (bool, default false): false = portofolio live, true = portofolio backtest.
+
+    404 hanya jika user pada token tidak valid / tidak ada di database.
+    User yang belum punya portofolio pada mode tsb -> data berisi list kosong [].
+
+    Endpoint: GET /api/v1/portfolios/my-portofolio/all?backtest=false
+    """
+    try:
+        hasil = get_all_my_portfolios(
+            db,
+            user_id=current_user["sub"],
+            backtest=backtest,
+        )
+    except UserNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return ApiResponse(
+        status="success",
+        message=(
+            f"Seluruh {len(hasil)} portofolio backtest berhasil diambil."
+            if backtest
+            else f"Seluruh {len(hasil)} portofolio live berhasil diambil."
+        ),
         data=hasil,
     )
 
@@ -183,7 +245,7 @@ def price_history_endpoint(
     )
 
 
-@router.get("/portofolio_performance/{portfolio_id}", response_model=ApiResponse[dict])
+@router.get("/portfolio_performance/{portfolio_id}", response_model=ApiResponse[dict])
 def portofolio_performance_endpoint(
     portfolio_id: str,
     db: Session = Depends(get_db),
@@ -229,7 +291,7 @@ def portofolio_performance_endpoint(
     )
 
 
-@router.patch("/my-portofolio/items/{item_id}/harga-beli", response_model=ApiResponse[dict])
+@router.patch("/my-portfolio/items/{item_id}/harga-beli", response_model=ApiResponse[dict])
 def update_harga_beli_endpoint(
     item_id: str,
     body: UpdateHargaBeliRequest,
