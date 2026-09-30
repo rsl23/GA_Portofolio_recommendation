@@ -68,7 +68,7 @@ class GAConfig:
 
     # --- GA size / flow -------------------------------------------------
     population_size: int = 200
-    generations: int = 300
+    generations: int = 500
     crossover_rate: float = 0.8
     tournament_size: int = 5
     elitism_count: int = 10
@@ -84,6 +84,7 @@ class GAConfig:
     correlation_penalty: float = 0.5   # gamma
     fundamental_bonus: float = 0.8     # alpha
     death_penalty: float = 50000.0
+    
     annualization: float = math.sqrt(252.0)
 
     # --- adaptive hybrid mutation --------------------------------------
@@ -92,7 +93,7 @@ class GAConfig:
     creep_prob: float = 0.5
 
     # --- stopping / reproducibility -------------------------------------
-    early_stop_patience: int = 50
+    early_stop_patience: int = 100
     improvement_tol: float = 1e-4
     seed: Optional[int] = None
 
