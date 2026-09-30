@@ -193,14 +193,16 @@ def _parse_float_string(val_str):
 def process_single_fundamental(kode):
     """Fungsi mandiri untuk 1 saham: tarik & parse data fundamental Pluang."""
     from src.backend.services.api_pluang import fetch_api_pluang_fundamentals
-
+    
     data = fetch_api_pluang_fundamentals(kode)
     if not data:
         return None
 
     try:
-        ratios = data.get("ratios", {})
-        overview = data.get("overview", {})
+        actual_data = data.get("data", {})
+        
+        ratios = actual_data.get("ratios", {})
+        overview = actual_data.get("overview", {})
 
         # Ekstraksi string dari JSON sesuai path
         eps_str = overview.get("eps", "0")
@@ -618,7 +620,7 @@ def _provide_backtest_data(date_ref: date, lookback_days: int):
     for t in codes:
         roe = _safe_value(df_lolos["ROE"], t)
         der_pct = _safe_value(df_lolos["DER"], t)
-        der_ratio = der_pct / 100.0 if not np.isnan(der_pct) else np.nan
+        der_ratio = der_pct if not np.isnan(der_pct) else np.nan
         metrics_map[t] = [
             _safe_value(per, t),
             _safe_value(pbv, t),
@@ -649,13 +651,13 @@ def _provide_live_data():
     """
     print("[DataLoader] Mode LIVE - menarik data OHLCV & fundamental...")
     df_ohlcv = take_ohlcv_data()
-    take_fundamental_data()
+    # take_fundamental_data()
 
     if df_ohlcv is None or df_ohlcv.empty:
         return None, {}, None, pd.Series(dtype=float)
 
     # Close: forward-fill untuk hari libur bursa, lalu buang suffix '.JK'
-    df_close = df_ohlcv["Close"].ffill().fillna(0)
+    df_close = df_ohlcv["Close"].ffill()
     df_close.columns = [str(c).replace(".JK", "") for c in df_close.columns]
 
     # Likuiditas = ADTV 60 HARI BURSA TERAKHIR (ETV = Close x Volume).
@@ -760,7 +762,13 @@ def _assemble_market_data(
     prices_per_lot = np.asarray([df_close[c].iloc[-1] * 100.0 for c in candidates], dtype=float)
 
     # 4. Returns matrix (N saham x T hari)
-    df_ret = df_close[candidates].pct_change().fillna(0.0)
+    df_close_ret = df_close[candidates].ffill()
+
+    df_ret = (
+        df_close_ret
+        .pct_change(fill_method=None)
+        .fillna(0.0)
+    )
     returns = df_ret.to_numpy(dtype=float).T
 
     # 5. Correlation matrix
@@ -772,9 +780,11 @@ def _assemble_market_data(
     fundamental_scores = _normalize_metrics(fundamental_metrics)
 
     # 7. Risk-free: fallback 6.25% bila gagal diambil
-    rf = risk_free if risk_free is not None else 0.0625
+    rf = risk_free 
     if risk_free is None:
-        logger.warning("_assemble_market_data: risk_free=None -> fallback %.4f (6.25%%)", rf)
+        raise ValueError(
+            f"Historical risk-free rate tidak tersedia untuk {date_ref}"
+        )
     logger.info("_assemble_market_data: n_candidates=%d, min_price=%.0f, max_stocks=%s, "
                 "n_final=%d, rf=%s",
                 len(candidates), min_price, max_stocks, len(candidates), _fmt_rf(rf))

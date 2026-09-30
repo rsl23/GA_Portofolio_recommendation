@@ -683,9 +683,8 @@ def load_backtest_data(date_ref: date):
 
     # DER diskalakan x100 agar setara dengan 'debtToEquity' yfinance (persen),
     # karena filter yang dipakai adalah DER < 200.
-    der = (total_debt / total_equity * 100).replace([float('inf'), float('-inf')], None)
+    der = (total_debt / total_equity).replace([float('inf'), float('-inf')], None)
     
-
     # Share Outstanding: periode terpilih dulu; jika kosong, pakai periode
     # terbaru yang tersedia SEBELUM tanggal backtest (papan market cap).
     shares = piv.get('Share Outstanding')
@@ -717,14 +716,17 @@ def load_backtest_data(date_ref: date):
 
 
 def fetch_fundamental_minimal(ticker):
-    """Hanya mengambil EPS, ROE, dan DER. Market Cap & Sektor sudah di-handle API"""
+    """Hanya mengambil EPS, ROE, DER, PER, PBV, dan Dividend Yield TTM. Market Cap & Sektor sudah di-handle API"""
     try:
         info = yf.Ticker(ticker + ".JK").info
         return {
             'Kode': ticker, # Samakan key dengan master agar mudah di-join
             'EPS': info.get('trailingEps', 0) or 0,
             'ROE': info.get('returnOnEquity', 0) or 0,
-            'DER': info.get('debtToEquity', None) or 0
+            'DER': info.get('debtToEquity', None) / 100 or 0,
+            'PER': info.get('trailingPE', None) or 0,
+            'PBV': info.get('priceToBook', None) or 0,
+            'dividend_yield_ttm': info.get("trailingAnnualDividendYield")
         }
     except Exception:
         return None
@@ -980,7 +982,7 @@ def run_live_preprocessing(backtest: bool = False, date: date = None):
               
 
     # Logika Bypass DER: Nilai DER < 200 ATAU Sektornya Keuangan
-    cond_der = (df_master['DER'] < 200) | (df_master['Sektor'] == 'Keuangan') 
+    cond_der = (df_master['DER'] < 2) | (df_master['Sektor'] == 'Keuangan') 
 
     # --- LOGGING: Rincian Eliminasi Mikro ---
     print("\n--- RINCIAN ELIMINASI MIKRO (FUNDAMENTAL & LIKUIDITAS) ---")

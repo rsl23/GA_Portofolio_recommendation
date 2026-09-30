@@ -132,7 +132,10 @@ def save_filtered_stocks_to_db(data_records: list):
                 eps=float(row.get('EPS', 0.0)),
                 roe=float(row.get('ROE', 0.0)),
                 der=float(row.get('DER', 0.0)),
-                adtv_60=float(row.get('ADTV_60', 0.0))
+                adtv_60=float(row.get('ADTV_60', 0.0)),
+                per=float(row.get('PER', 0.0)),
+                pbv=float(row.get('PBV', 0.0)),
+                dividend_yield=float(row.get('dividend_yield_ttm', 0.0)),
             )
             db.add(cache_item)
             
