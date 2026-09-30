@@ -1,4 +1,5 @@
 ﻿import logging
+import os
 from datetime import date
 from uuid import UUID
 
@@ -18,6 +19,7 @@ from src.backend.models.schemas.portfolio_schema import (
     PortfolioHistoryItem,
     PortfolioItem,
 )
+from src.backend.services.gemini_llm_caller import explain_portfolio
 from src.gaengine.data_loader import build_market_data
 from src.gaengine.engine import GeneticEngine
 from src.gaengine.ga_config import GAConfig
@@ -123,13 +125,13 @@ def generate_new_portfolio(
     # 2. Konfigurasi GA mengikuti profil & modal dari payload request
     config = GAConfig(
         population_size=200,        # jumlah kromosom
-        generations=300,            # jumlah generasi evolusi
+        generations=500,            # jumlah generasi evolusi
         budget=request.budget,      # modal pengguna (IDR)
         risk_profile=request.risk_profile,
         min_stocks=3,
         max_stocks=10,
         risk_free_rate=market_data.risk_free_rate,
-        seed=42,
+        # seed=42,
         data=market_data,
     )
 
@@ -173,6 +175,9 @@ def generate_new_portfolio(
         if p_daily.size:
             expected_return = float(p_daily.mean() * 252.0)
 
+    # 4a. Narasi TEMPLATE (selalu dibuat): dipakai apa adanya bila narasi LLM
+    #     tidak tersedia / gagal, sehingga endpoint generate tidak pernah gagal
+    #     hanya karena layanan LLM bermasalah.
     narasi = (
         f"Portofolio dengan profil risiko {request.risk_profile} memilih {solution.n_active} "
         f"saham dari {market_data.n_stocks} kandidat. Total dana terpakai "
@@ -181,6 +186,31 @@ def generate_new_portfolio(
         f"Penurunan maksimum (max drawdown) tercatat {solution.max_drawdown:.2%} "
         f"dan korelasi rata-rata antar saham {solution.avg_correlation:.3f}. "
         f"Rekomendasi ini dihasilkan Algoritma Genetika."
+    )
+
+    # 4b. Narasi LLM (Gemini): menjelaskan MENGAPA & BAGAIMANA portofolio ini
+    #     terpilih oleh GA -- metrik fitness function (Sharpe, MDD, korelasi,
+    #     bonus fundamental), batasan budget/diversifikasi, serta peran tiap
+    #     emiten pemenang. Bahan/prompt dirakit src/gaengine/prompt_builder.py,
+    #     pemanggilan model ada di src/backend/services/gemini_llm_caller.py.
+    #     Bila gagal (tanpa API key, timeout, dsb) -> None, narasi template dipakai.
+    narasi_llm = explain_portfolio(
+        solution=solution,
+        market_data=market_data,
+        config=config,
+        allocations=allocations,
+        mode="backtest" if backtest else "live",
+        date_ref=date_ref,
+        budget=request.budget,
+        expected_return=expected_return,
+        generations_run=len(engine.history),
+        fallback=None,
+    )
+    if narasi_llm:
+        narasi = narasi_llm
+    logger.info(
+        "Narasi portofolio memakai %s.",
+        "penjelasan LLM (Gemini)" if narasi_llm else "template GA (fallback)",
     )
 
     if backtest:
@@ -639,6 +669,93 @@ def update_harga_beli(db: Session, user_id: str, item_id: str, harga_beli: float
     return item
 
 
+def _query_price_rows(db: Session, stock_ids: list, start_date, end_date):
+    """
+    Query baris harga (date, adj_close, close) untuk saham portofolio pada
+    rentang [start_date, end_date]; `end_date=None` berarti tanpa batas atas.
+    Dipisah dari pemanggil agar bisa diulang setelah auto-sync berjalan.
+    """
+    price_query = (
+        db.query(MarketData.stock_id, MarketData.date, MarketData.adj_close, MarketData.close)
+        .filter(
+            MarketData.stock_id.in_(stock_ids),
+            MarketData.date >= start_date,
+        )
+    )
+    if end_date is not None:
+        price_query = price_query.filter(MarketData.date <= end_date)
+    return price_query.all()
+
+
+def _latest_available_price_date(db: Session, stock_ids: list, end_date=None):
+    """
+    Tanggal harga TERAKHIR yang sudah tersimpan di `market_data` untuk saham
+    tsb (dibatasi `end_date` bila diberikan); None bila belum ada sama sekali.
+
+    Dipakai untuk MENYESUAIKAN awal rentang performa ketika `date_ref`
+    portofolio jatuh pada hari NON-BURSA (weekend / libur BEI) sehingga
+    tanggalnya lebih baru daripada tanggal perdagangan terakhir yang tersedia.
+    `sync_market_data` sengaja berhenti pada `latest_trading_date` (lihat
+    src/backend/services/price_history_service.py), jadi tanpa penyesuaian ini
+    rentang [start_date, ...] tidak pernah berisi data -> endpoint 404.
+    """
+    query = (
+        db.query(func.max(MarketData.date))
+        .filter(MarketData.stock_id.in_(stock_ids))
+    )
+    if end_date is not None:
+        query = query.filter(MarketData.date <= end_date)
+
+    latest = query.scalar()
+    if latest is None:
+        return None
+    return latest.date() if hasattr(latest, "date") else latest
+
+
+def _sync_prices_on_demand(db: Session, reason: str) -> dict | None:
+    """
+    Jalankan sync_market_data (yfinance -> tabel market_data + idx_composite)
+    SATU KALI untuk mengisi data harga yang belum ada.
+
+    Sengaja TIDAK melempar exception: kegagalan sync (mis. jaringan / yfinance
+    menolak) hanya dicatat di log, lalu pemanggil memeriksa ulang datanya dan
+    melempar PortfolioNotFoundError yang informatif bila tetap kosong.
+
+    Returns:
+        dict statistik sync ({stocks, rows_upserted, idx_rows_upserted, errors}),
+        atau None bila auto-sync dimatikan / gagal.
+    """
+
+    from src.backend.services.price_history_service import sync_market_data
+
+    try:
+        logger.info("Auto-sync harga dimulai (%s): menarik histori harian via yfinance...", reason)
+        stats = sync_market_data(db)
+        logger.info(
+            "Auto-sync harga selesai (%s): %s saham, %s baris harga, %s baris IHSG, %s error.",
+            reason, stats.get("stocks"), stats.get("rows_upserted"),
+            stats.get("idx_rows_upserted"), len(stats.get("errors") or []),
+        )
+        return stats
+    except Exception as e:  # noqa: BLE001 - kegagalan sync tidak boleh mematikan endpoint
+        logger.exception("Auto-sync harga (%s) gagal: %s", reason, e)
+        return None
+
+
+def _describe_sync(stats: dict | None) -> str:
+    """Ringkasan hasil auto-sync untuk pesan error / info pada respons."""
+    if stats is None:
+        return ("Sinkronisasi harga otomatis tidak dijalankan "
+                "(AUTO_SYNC_PRICES=false atau proses sync gagal).")
+    return (
+        "Sinkronisasi harga otomatis sudah dijalankan "
+        f"({stats.get('stocks', 0)} saham diproses, {stats.get('rows_upserted', 0)} baris "
+        f"harga & {stats.get('idx_rows_upserted', 0)} baris IHSG tersimpan, "
+        f"{len(stats.get('errors') or [])} error)."
+    )
+
+
+
 def get_portfolio_performance(
     db: Session,
     user_id: str,
@@ -654,6 +771,20 @@ def get_portfolio_performance(
       mulai  : portofolio.date_ref (kolom acuan; fallback created_at)
       akhir  : parameter `end_date` (YYYY-MM-DD) bila diberikan,
                selain itu sampai data harga terakhir yang tersedia.
+
+    Penyesuaian hari bursa (agar endpoint tetap jalan pada hari non-bursa):
+      - Bila `date_ref`/`item.start_date` jatuh pada weekend / libur BEI
+        (mis. portofolio digenerate hari Minggu) sehingga lebih baru daripada
+        tanggal perdagangan terakhir yang datanya tersedia -- sync memang
+        berhenti di `latest_trading_date` pada price_history_service.py --
+        awal rentang digeser MUNDUR ke tanggal perdagangan terakhir tersebut
+        (lihat `_latest_available_price_date`), dan item dianggap aktif sejak
+        tanggal itu. Tanggal yang diminta tetap dilaporkan pada respons
+        sebagai `requested_start_date` (+ flag `start_date_adjusted`).
+      - Item dengan `start_date` di luar cakupan data juga disesuaikan:
+        sebelum data pertama -> aktif sejak data pertama; setelah data
+        terakhir -> aktif sejak tanggal perdagangan terakhir, kecuali
+        `end_date` yang diminta memang lebih awal dari tanggal pembelian item.
 
     Metode (berbasis KEPEMILIKAN LOT per item, bukan bobot investasi):
       nilai_portofolio(t) = SUM over item(
@@ -705,6 +836,11 @@ def get_portfolio_performance(
     start_dt = portfolio.date_ref or portfolio.created_at
     start_date = start_dt.date() if hasattr(start_dt, "date") else start_dt
 
+    # Tanggal yang DIMINTA (date_ref portofolio) disimpan terpisah karena
+    # `start_date` bisa digeser ke tanggal perdagangan terakhir yang tersedia
+    # bila date_ref jatuh pada hari non-bursa (lihat langkah 3a).
+    requested_start = start_date
+
     # 2. Item kepemilikan (window start_date/end_date ikut diambil)
     holdings_rows = (
         db.query(
@@ -725,22 +861,50 @@ def get_portfolio_performance(
     stock_ids = [r.stock_id for r in holdings_rows]
     id_to_ticker = {str(r.stock_id): r.ticker for r in holdings_rows}
 
+    # Info auto-sync harga (diisi hanya bila endpoint menarik data via
+    # sync_market_data karena data harga/IHSG belum tersedia di DB).
+    sync_stats: dict | None = None
+
     if not is_backtest:
         # 3. Harga per (date, stock_id) sejak start_date (<= end_date bila ada) (LIVE)
-        price_query = (
-            db.query(MarketData.stock_id, MarketData.date, MarketData.adj_close, MarketData.close)
-            .filter(
-                MarketData.stock_id.in_(stock_ids),
-                MarketData.date >= start_date,
+        price_rows = _query_price_rows(db, stock_ids, start_date, end_date)
+        if not price_rows:
+            # Data harga belum ada di DB. Daripada langsung melempar error,
+            # tarik dulu histori harian via sync_market_data (yfinance) lalu
+            # ulangi query yang sama — sync bersifat upsert, aman diulang.
+            logger.info(
+                "Performa portofolio %s: data harga belum tersedia -> menjalankan "
+                "auto-sync harga (sync_market_data).", portfolio_id,
             )
-        )
-        if end_date is not None:
-            price_query = price_query.filter(MarketData.date <= end_date)
-        price_rows = price_query.all()
+            sync_stats = _sync_prices_on_demand(
+                db, reason=f"data harga portofolio {portfolio_id} belum ada"
+            )
+            price_rows = _query_price_rows(db, stock_ids, start_date, end_date)
+        if not price_rows:
+            # 3a. Masih kosong: kemungkinan besar date_ref portofolio jatuh pada
+            #     hari NON-BURSA (weekend/libur BEI) sehingga lebih baru daripada
+            #     latest_trading_date. sync_market_data sengaja berhenti pada
+            #     tanggal perdagangan terakhir (price_history_service.py),
+            #     sehingga awal rentang digeser mundur ke tanggal perdagangan
+            #     terakhir yang datanya benar-benar tersedia di market_data.
+            fallback_start = _latest_available_price_date(db, stock_ids, end_date)
+            if fallback_start is not None and fallback_start < start_date:
+                logger.info(
+                    "Performa portofolio %s: tidak ada harga sejak %s (hari non-bursa?) -> "
+                    "awal rentang digeser ke hari bursa terakhir yang tersedia: %s.",
+                    portfolio_id, start_date, fallback_start,
+                )
+                start_date = fallback_start
+                price_rows = _query_price_rows(db, stock_ids, start_date, end_date)
+
         if not price_rows:
             raise PortfolioNotFoundError(
                 "Belum ada data harga tersimpan untuk saham portofolio aktif. "
-                "Jalankan sync-prices terlebih dahulu."
+                + _describe_sync(sync_stats)
+                + " Bila portofolio dibuat pada hari non-bursa (weekend/libur BEI) "
+                "dan sahamnya baru pertama kali dibeli, tunggu hari bursa "
+                "berikutnya lalu sync harga kembali. Periksa koneksi/ticker "
+                "saham lalu jalankan sync-prices secara manual."
             )
 
         # 4. Pivot date x stock (adj_close; fallback close bila adj kosong)
@@ -786,12 +950,23 @@ def get_portfolio_performance(
 
         if window.empty:
             # Pesan informatif: tunjukkan rentang yang diminta vs cakupan data
-            # agar jelas apakah date_ref di luar cakupan parquet.
-            data_min, data_max = window["Date"].min().date(), window["Date"].max().date()
+            # agar jelas apakah date_ref di luar cakupan parquet. Kolom Date
+            # dibaca ulang (satu kolom saja, murah) karena `window` sudah kosong
+            # sehingga min/max-nya tidak bisa dipakai (bernilai NaT).
+            cakupan = "tidak diketahui"
+            try:
+                all_dates = pd.to_datetime(
+                    pd.read_parquet(PRICE_FILE, columns=["Date"])["Date"]
+                )
+                if not all_dates.empty:
+                    cakupan = f"{all_dates.min().date()} s/d {all_dates.max().date()}"
+            except Exception as exc:  # noqa: BLE001 - pesan error tetap dibuat
+                logger.warning("Gagal membaca cakupan tanggal parquet: %s", exc)
+
             raise PortfolioNotFoundError(
                 f"Belum ada data harga tersimpan di rentang simulasi ini "
-                f"(diminta {start_date} s/d {end_date or data_max}; "
-                f"data parquet hanya mencakup {data_min} s/d {data_max}). "
+                f"(diminta {start_date} s/d {end_date or cakupan}; "
+                f"data parquet hanya mencakup {cakupan}). "
                 f"Pilih date_ref/backtest dalam cakupan data."
             )
             
@@ -818,26 +993,55 @@ def get_portfolio_performance(
     df_price.columns = [id_to_ticker[c] for c in df_price.columns]
 
     # 5. Nilai portofolio harian = SUM(lot aktif pada t x harga(t) x 100).
-    #    Lot aktif ditentukan window [start_date, end_date] MILIK ITEM,
+    #    Lot aktif ditentukan window [item.start_date, item.end_date] MILIK ITEM,
     #    sehingga perubahan kepemilikan akibat rebalance ikut terhitung.
+    #    Penyesuaian hari bursa:
+    #      - item_start sebelum data pertama -> aktif sejak data pertama;
+    #      - item_start SETELAH data terakhir (mis. portofolio dibuat pada
+    #        weekend/libur bursa) -> dihitung aktif sejak tanggal perdagangan
+    #        terakhir, KECUALI `end_date` yang diminta memang lebih awal dari
+    #        tanggal pembelian item tersebut (item belum boleh ikut dihitung).
     LOTS_PER_SHARE = 100
-    portfolio_value = pd.Series(0.0, index=df_price.index)
+    series_start = df_price.index.min()
+    series_last = df_price.index.max()
+
+    # Rentang EFEKTIF tiap item dipakai untuk nilai harian MAUPUN snapshot
+    # holdings, agar keduanya selalu konsisten.
+    effective_items = []
+    missing_price_tickers: set[str] = set()
     for r in holdings_rows:
         ticker = r.ticker
         if ticker not in df_price.columns:
+            # Saham tanpa SATU PUN baris harga pada rentang ini (mis. baru
+            # pertama kali dibeli pada hari non-bursa sehingga sync_market_data
+            # belum pernah menarik harganya) dicatat agar nilai portofolio yang
+            # kurang lengkap tidak lolos tanpa jejak.
+            missing_price_tickers.add(ticker)
             continue
+
         item_start = (
             pd.Timestamp(r.start_date) if r.start_date is not None
             else pd.Timestamp(start_date)
         )
-        # Item lama tanpa start_date / mulai sebelum rentang data -> aktif
-        # sejak awal rentang (tidak boleh hilang dari perhitungan).
-        item_start = max(item_start, df_price.index.min())
+        if item_start < series_start:
+            item_start = series_start
+        elif item_start > series_last:
+            if end_date is not None and item_start > pd.Timestamp(end_date):
+                continue  # dibeli setelah batas akhir yang diminta -> belum aktif
+            item_start = series_last
+
+        item_end = pd.Timestamp(r.end_date) if r.end_date is not None else None
+        effective_items.append((ticker, int(r.jumlah_lot), item_start, item_end))
+
+    portfolio_value = pd.Series(0.0, index=df_price.index)
+    for ticker, lot, item_start, item_end in effective_items:
         mask = df_price.index >= item_start
-        if r.end_date is not None:
-            mask &= df_price.index <= pd.Timestamp(r.end_date)
-        contribution = float(r.jumlah_lot) * LOTS_PER_SHARE * df_price[ticker]
-        portfolio_value += contribution.where(mask, 0.0)
+        if item_end is not None:
+            mask &= df_price.index <= item_end
+        # Harga yang belum tersedia (saham belum tercatat / suspensi) dihitung 0
+        # agar tidak menghasilkan NaN yang mematikan seluruh seri nilai.
+        contribution = (lot * LOTS_PER_SHARE * df_price[ticker]).where(mask, 0.0)
+        portfolio_value += contribution.fillna(0.0)
 
     # t0 = tanggal pertama dengan nilai > 0 (fallback: tanggal pertama).
     nonzero = portfolio_value[portfolio_value > 0]
@@ -856,6 +1060,20 @@ def get_portfolio_performance(
         if end_date is not None:
             idx_query = idx_query.filter(IdxComposite.date <= pd.Timestamp(end_date))
         idx_rows = idx_query.order_by(IdxComposite.date.asc()).all()
+        if not idx_rows and sync_stats is None:
+            # Benchmark IHSG belum tersimpan -> satu panggilan sync mengisi
+            # market_data + idx_composite sekaligus, lalu query diulang.
+            logger.info(
+                "Performa portofolio %s: data IHSG belum tersedia -> menjalankan "
+                "auto-sync harga (benchmark).", portfolio_id,
+            )
+            sync_stats = _sync_prices_on_demand(db, reason="data IHSG (benchmark) belum ada")
+            idx_rows = idx_query.order_by(IdxComposite.date.asc()).all()
+        if not idx_rows:
+            logger.warning(
+                "Performa portofolio %s: data IHSG tetap kosong -> garis benchmark tidak "
+                "ditampilkan. %s", portfolio_id, _describe_sync(sync_stats),
+            )
         if idx_rows:
             idx_series = pd.Series(
                 {r.date: r.close for r in idx_rows if r.close is not None}
@@ -908,17 +1126,44 @@ def get_portfolio_performance(
 
     end = combined.index.max() if len(combined) else df_price.index.max()
 
-    # Snapshot lot aktif per ticker pada akhir rentang (untuk respons holdings)
+    # Snapshot lot aktif per ticker pada akhir rentang (untuk respons holdings).
+    # Memakai rentang EFEKTIF hasil penyesuaian hari bursa di langkah 5 agar
+    # konsisten dengan nilai portofolio yang dihitung.
     final_lots: dict[str, int] = {}
-    for r in holdings_rows:
-        if r.end_date is not None and pd.Timestamp(r.end_date) < end:
+    for ticker, lot, _item_start, item_end in effective_items:
+        if item_end is not None and item_end < end:
             continue  # sudah dijual sebelum akhir rentang
-        final_lots[r.ticker] = final_lots.get(r.ticker, 0) + int(r.jumlah_lot)
+        final_lots[ticker] = final_lots.get(ticker, 0) + lot
     final_lots = {t: l for t, l in final_lots.items() if l > 0}
 
+    if missing_price_tickers:
+        logger.warning(
+            "Performa portofolio %s: %d saham tidak punya data harga pada rentang "
+            "ini sehingga TIDAK ikut dihitung (nilai portofolio lebih rendah dari "
+            "seharusnya): %s",
+            portfolio_id, len(missing_price_tickers), sorted(missing_price_tickers),
+        )
+
+    start_iso = start_date.isoformat() if hasattr(start_date, "isoformat") else str(start_date)
+    requested_start_iso = (
+        requested_start.isoformat() if hasattr(requested_start, "isoformat")
+        else str(requested_start)
+    )
+    end_iso = end.isoformat() if hasattr(end, "isoformat") else str(end)
+
     return {
-        "start_date": start_date.isoformat() if hasattr(start_date, "isoformat") else str(start_date),
-        "end_date": end.isoformat() if hasattr(end, "isoformat") else str(end),
+        # start_date = rentang yang BENAR-BENAR dipakai (bisa tergeser mundur ke
+        # hari bursa terakhir bila date_ref portofolio jatuh pada hari non-bursa)
+        "start_date": start_iso,
+        # Tanggal yang DIMINTA (date_ref portofolio) + penanda penyesuaian, agar
+        # frontend bisa menjelaskan bila awal garis berbeda dari tanggal generate.
+        "requested_start_date": requested_start_iso,
+        "start_date_adjusted": start_iso != requested_start_iso,
+        "end_date": end_iso,
         "holdings": {t: final_lots[t] for t in sorted(final_lots)},
+        # Saham yang tidak punya data harga pada rentang ini (tidak ikut
+        # dihitung) -- biasanya baru pertama kali dibeli pada hari non-bursa
+        # sehingga belum pernah ditarik oleh sync_market_data.
+        "missing_price_tickers": sorted(missing_price_tickers),
         "series": series,
     }
