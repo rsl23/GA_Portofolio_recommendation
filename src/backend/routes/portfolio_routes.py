@@ -192,7 +192,7 @@ def api_my_portfolio_all(
     tercampur dengan hasil simulasi backtest. Portofolio "replaced_*" tetap
     tersimpan di database dan ikut tampil di sini (tidak dihapus).
     Urutan: created_at terbaru dulu; respons memakai schema yang SAMA dengan
-    GET /my-portofolio (PortfolioResponse lengkap dengan daftar alokasi item).
+    GET /my-portfolio (PortfolioResponse lengkap dengan daftar alokasi item).
 
     Query param:
       - backtest (bool, default false): false = portofolio live, true = portofolio backtest.
@@ -200,7 +200,7 @@ def api_my_portfolio_all(
     404 hanya jika user pada token tidak valid / tidak ada di database.
     User yang belum punya portofolio pada mode tsb -> data berisi list kosong [].
 
-    Endpoint: GET /api/v1/portfolios/my-portofolio/all?backtest=false
+    Endpoint: GET /api/v1/portfolios/my-portfolio/all?backtest=false
     """
     try:
         hasil = get_all_my_portfolios(

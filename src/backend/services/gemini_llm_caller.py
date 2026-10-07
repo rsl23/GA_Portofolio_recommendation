@@ -9,6 +9,9 @@ metrik fitness function serta daftar emiten saham pemenang.
 Pembagian tugas:
     src/gaengine/prompt_builder.py -> merakit KONTEKS + PROMPT (murni, tanpa I/O)
     modul ini                      -> memanggil API Gemini (+ retry & fallback)
+                                      [SEMENTARA: retry dimatikan & pesan error
+                                      dikembalikan apa adanya -- lihat
+                                      GEMINI_RETRY_ENABLED & GEMINI_RETURN_ERROR]
 
 Konfigurasi .env (semua opsional kecuali kunci API):
     GEMINI_API_KEY           : kunci API Gemini (fallback: GOOGLE_API_KEY)
@@ -29,11 +32,27 @@ Konfigurasi .env (semua opsional kecuali kunci API):
                                default "gemini-3.7-flash,gemini-3.5-flash"
     GEMINI_BACKOFF_BASE/CAP  : dasar & batas exponential backoff (detik)
 
+SAKLAR SEMENTARA (debugging) -- default saat ini: retry MATI, error DIKEMBALIKAN:
+    GEMINI_RETRY_ENABLED     : default FALSE. Bila false, percobaan ULANG
+                               (retry + exponential backoff + jitter) TIDAK
+                               dijalankan sehingga tiap model dipanggil SEKALI
+                               saja. Kode retry TIDAK dihapus -- hanya tidak
+                               dipanggil; setel true untuk mengaktifkannya lagi.
+    GEMINI_RETURN_ERROR      : default TRUE. Bila panggilan API gagal, PESAN
+                               ERROR dikembalikan apa adanya sebagai teks hasil
+                               (diawali "[LLM ERROR]") supaya penyebabnya
+                               terlihat di respons API. Setel false untuk
+                               kembali ke perilaku normal (None / fallback).
+
 Ketahanan (anti-gagal) -- mengikuti gaya :func:`src.gaengine.data_loader._call_with_retry`:
     Kegagalan (kunci hilang, timeout, server sibuk, respons kosong/diblokir)
     TIDAK melempar exception ke controller. Fungsi penjelasan mengembalikan
     ``None`` (atau ``fallback`` bila diberikan), sehingga proses generate
     portofolio tetap berjalan walau LLM sedang tidak bisa dihubungi.
+    CATATAN SEMENTARA: selama GEMINI_RETURN_ERROR=true (default saat ini),
+    kegagalan dikembalikan sebagai TEKS pesan error (bukan None/fallback) agar
+    penyebabnya mudah didiagnosis; setel GEMINI_RETURN_ERROR=false untuk
+    kembali ke perilaku normal.
 
 Contoh pemakaian:
     from src.backend.services.gemini_llm_caller import explain_portfolio
@@ -163,6 +182,23 @@ GEMINI_FALLBACK_MODELS = [
     for m in str(os.getenv("GEMINI_FALLBACK_MODELS", "gemini-3.7-flash,gemini-3.5-flash")).split(",")
     if m.strip()
 ]
+
+# ----------------------------------------------------------------------
+# SAKLAR SEMENTARA (debugging): retry dimatikan + pesan error dikembalikan
+# ----------------------------------------------------------------------
+# [SEMENTARA] GEMINI_RETRY_ENABLED=false (default) -> percobaan ULANG tidak
+# dijalankan: tiap model dipanggil SEKALI. Kode retry (loop percobaan +
+# _retry_delay() + exponential backoff) TETAP ADA di _generate_with_model(),
+# hanya tidak dipanggil. Setel GEMINI_RETRY_ENABLED=true untuk mengaktifkan
+# kembali perilaku normal (GEMINI_MAX_RETRIES).
+GEMINI_RETRY_ENABLED = _env_bool("GEMINI_RETRY_ENABLED", False)
+# [SEMENTARA] GEMINI_RETURN_ERROR=true (default) -> bila panggilan gagal,
+# PESAN ERROR dikembalikan langsung sebagai teks hasil (bukan None) supaya
+# penyebabnya terlihat di respons API. Setel false untuk kembali ke perilaku
+# normal (None -> controller memakai narasi template GA).
+GEMINI_RETURN_ERROR = _env_bool("GEMINI_RETURN_ERROR", True)
+# Awalan penanda bahwa teks hasil sebenarnya berisi pesan error.
+LLM_ERROR_PREFIX = "[LLM ERROR]"
 
 # Nilai GEMINI_THINKING_LEVEL yang berarti "tanpa thinking" (respons lebih cepat).
 _THINKING_OFF = {"", "off", "none", "false", "0", "disable", "disabled"}
@@ -354,15 +390,22 @@ def _generate_with_model(
     nama_model: str,
     prompt_teks: str,
     total: int,
-) -> Optional[str]:
+) -> tuple[Optional[str], Optional[str]]:
     """
     Jalankan SATU model dengan retry + exponential backoff + jitter.
 
+    CATATAN SEMENTARA: bila `total == 1` (retry dimatikan lewat
+    GEMINI_RETRY_ENABLED=false), loop di bawah hanya berjalan SEKALI dan blok
+    retry (`if attempt < total`) tidak pernah dieksekusi. Kode retry tetap ada
+    dan otomatis dipakai lagi begitu GEMINI_RETRY_ENABLED=true.
+
     Returns:
-        Teks jawaban (belum dibersihkan), atau None bila seluruh percobaan
-        pada model ini gagal.
+        (teks, pesan_error):
+          - ("jawaban", None) bila percobaan berhasil;
+          - (None, "penyebab kegagalan") bila seluruh percobaan gagal.
     """
     percobaan_ulang = total - 1
+    alasan = "tidak ada percobaan yang dijalankan"
     for attempt in range(1, total + 1):
         t0 = time.perf_counter()
         try:
@@ -376,7 +419,7 @@ def _generate_with_model(
                 logger.info("generate_text: SUKSES model=%s pada percobaan %d/%d dalam %.2fs "
                             "(%d karakter jawaban).",
                             nama_model, attempt, total, time.perf_counter() - t0, len(teks))
-                return teks
+                return teks, None
             alasan = "respons kosong / diblokir safety filter"
         except Exception as e:  # noqa: BLE001 - semua kegagalan API layak dicoba ulang
             alasan = f"exception: {type(e).__name__}: {e}"
@@ -389,10 +432,12 @@ def _generate_with_model(
                            nama_model, attempt, total, alasan, delay)
             time.sleep(delay)
         else:
-            print(f"   [GAGAL] gemini {nama_model}: tetap gagal setelah {total} percobaan ({alasan}).")
+            print(f"   [GAGAL] gemini {nama_model}: {alasan} "
+                  f"(setelah {total} percobaan"
+                  f"{'; retry dimatikan sementara' if total == 1 else ''}).")
             logger.error("generate_text: model=%s GAGAL setelah %d percobaan (%s).",
                          nama_model, total, alasan)
-    return None
+    return None, alasan
 
 
 def generate_text(
@@ -413,8 +458,12 @@ def generate_text(
     Ketahanan dua lapis:
       1) RETRY per model   : exponential backoff + jitter untuk gangguan sesaat
                              (timeout, server sibuk 5xx, respons kosong).
+                             [SEMENTARA] Dimatikan bila GEMINI_RETRY_ENABLED=false
+                             (default) -> tiap model dipanggil SEKALI saja.
       2) FALLBACK MODEL    : bila model utama gagal total, otomatis dicoba model
                              cadangan berikutnya (lihat GEMINI_FALLBACK_MODELS).
+                             [SEMENTARA] Tidak dicoba bila GEMINI_RETURN_ERROR=true
+                             (default) -> kegagalan langsung dikembalikan.
 
     Saklar GEMINI_ENABLED (di .env) juga dihormati di sini: bila nonaktif,
     panggilan API dibatalkan dan fungsi mengembalikan None (tanpa exception).
@@ -426,13 +475,18 @@ def generate_text(
         temperature       : kreativitas jawaban (default GEMINI_TEMPERATURE).
         max_output_tokens : batas panjang jawaban (default dari .env).
         thinking_level    : "off"/"low"/"medium"/"high" (default dari .env).
-        max_retries       : jumlah percobaan ULANG per model (default GEMINI_MAX_RETRIES).
+        max_retries       : jumlah percobaan ULANG per model. Bila None (default),
+                             ikut saklar GEMINI_RETRY_ENABLED -- [SEMENTARA] false
+                             sehingga percobaan ulang tidak dijalankan.
         fallback_models   : override daftar model cadangan.
         plain_text        : True -> buang penanda Markdown dari jawaban.
 
     Returns:
-        str jawaban (sudah di-strip), atau None bila saklar mati / SEMUA model
-        & percobaan gagal.
+        str jawaban (sudah di-strip) bila berhasil;
+        teks "[LLM ERROR] ..." berisi penyebab kegagalan bila
+        GEMINI_RETURN_ERROR=true (default sementara);
+        None bila saklar mati / SEMUA model & percobaan gagal (perilaku normal
+        saat GEMINI_RETURN_ERROR=false).
     """
     if not prompt or not str(prompt).strip():
         logger.warning("generate_text: prompt kosong -> dilewati.")
@@ -444,10 +498,27 @@ def generate_text(
 
     client = get_client()
     if client is None:
+        # [SEMENTARA] alasan kegagalan dikembalikan sebagai teks (bukan None)
+        # supaya terlihat di respons API saat GEMINI_RETURN_ERROR aktif.
+        pesan_tanpa_klien = (
+            f"{LLM_ERROR_PREFIX} klien Gemini tidak siap "
+            "(GEMINI_API_KEY kosong / library google-genai tidak tersedia)."
+        )
+        if _as_bool(GEMINI_RETURN_ERROR, default=True):
+            logger.error("generate_text: %s", pesan_tanpa_klien)
+            return pesan_tanpa_klien
         return None
     _, types = _load_sdk()
 
-    percobaan_ulang = GEMINI_MAX_RETRIES if max_retries is None else max(0, int(max_retries))
+    # Retry: parameter eksplisit (`max_retries`) selalu menang; bila None, ikut
+    # saklar GEMINI_RETRY_ENABLED. [SEMENTARA] default false -> percobaan_ulang=0
+    # sehingga tiap model hanya dipanggil SEKALI (kode retry tetap ada).
+    if max_retries is not None:
+        percobaan_ulang = max(0, int(max_retries))
+    elif _as_bool(GEMINI_RETRY_ENABLED, default=False):
+        percobaan_ulang = GEMINI_MAX_RETRIES
+    else:
+        percobaan_ulang = 0
     total = percobaan_ulang + 1
     config = _build_config(
         types,
@@ -458,8 +529,13 @@ def generate_text(
     )
     prompt_teks = str(prompt)
     rantai = _model_chain(model, fallback_models)
-    logger.info("generate_text: rantai model=%s, panjang_prompt=%d karakter, maks %d percobaan/model.",
-                rantai, len(prompt_teks), total)
+    logger.info("generate_text: rantai model=%s, panjang_prompt=%d karakter, maks %d percobaan/model "
+                "(retry %s).",
+                rantai, len(prompt_teks), total,
+                "AKTIF" if percobaan_ulang > 0 else "MATI [sementara]")
+
+    # Pesan penyebab kegagalan terakhir (dipakai bila GEMINI_RETURN_ERROR aktif).
+    pesan_error_terakhir: Optional[str] = None
 
     for urutan, nama_model in enumerate(rantai, 1):
         if urutan > 1:
@@ -467,11 +543,23 @@ def generate_text(
                   f"'{nama_model}' ({urutan}/{len(rantai)})...")
             logger.warning("generate_text: beralih ke model cadangan '%s' (%d/%d).",
                            nama_model, urutan, len(rantai))
-        teks = _generate_with_model(client, config, nama_model, prompt_teks, total)
+        teks, pesan_error = _generate_with_model(client, config, nama_model, prompt_teks, total)
         if teks:
             return _sanitize_narrative(teks) if plain_text else teks
 
+        pesan_error_terakhir = f"{nama_model}: {pesan_error}"
+        if _as_bool(GEMINI_RETURN_ERROR, default=True):
+            # [SEMENTARA] kegagalan langsung dikembalikan: model cadangan TIDAK
+            # dicoba supaya pesan error asli tidak tertutup percobaan lain.
+            break
+
     logger.error("generate_text: SEMUA model gagal (%s).", rantai)
+
+    if pesan_error_terakhir and _as_bool(GEMINI_RETURN_ERROR, default=True):
+        teks_error = f"{LLM_ERROR_PREFIX} {pesan_error_terakhir}"
+        logger.error("generate_text: pesan error dikembalikan sebagai teks hasil -> %s", teks_error)
+        return teks_error
+
     return None
 
 
@@ -515,16 +603,36 @@ def explain_portfolio(
         fallback       : teks yang dikembalikan bila LLM tidak tersedia/gagal
                          (mis. narasi template controller) -> generate portofolio
                          TIDAK PERNAH gagal karena masalah LLM.
+                         [SEMENTARA] Tidak dipakai bila GEMINI_RETURN_ERROR=true:
+                         pesan error LLM justru dikembalikan sebagai narasi agar
+                         penyebabnya terlihat di respons API.
         audience       : sasaran pembaca narasi.
         log_prompt     : True -> cetak prompt lengkap (untuk debugging kualitas prompt).
         model/temperature/max_output_tokens/thinking_level/fallback_models :
                          override konfigurasi LLM (default dari .env).
 
     Returns:
-        str narasi penjelasan, atau `fallback` (boleh None) bila LLM gagal.
+        str narasi penjelasan bila berhasil;
+        teks "[LLM ERROR] ..." berisi penyebab kegagalan bila
+        GEMINI_RETURN_ERROR=true (default sementara);
+        `fallback` (boleh None) bila LLM gagal & GEMINI_RETURN_ERROR=false.
     """
     if not is_available():
-        logger.warning("explain_portfolio: LLM tidak tersedia (kunci API / library) -> pakai fallback.")
+        # [SEMENTARA] Bila kegagalan berasal dari KONFIGURASI (kunci API / library
+        # hilang) -- bukan karena saklar GEMINI_ENABLED sengaja dimatikan --
+        # kembalikan pesan error supaya penyebabnya terlihat di respons API.
+        saklar_aktif = _as_bool(GEMINI_ENABLED, default=True)
+        alasan = (
+            "GEMINI_ENABLED nonaktif"
+            if not saklar_aktif
+            else "kunci API tidak tersedia / library google-genai tidak terpasang"
+        )
+        if saklar_aktif and _as_bool(GEMINI_RETURN_ERROR, default=True):
+            pesan = f"{LLM_ERROR_PREFIX} narasi LLM tidak dapat dijalankan: {alasan}."
+            logger.error("explain_portfolio: %s", pesan)
+            return pesan
+
+        logger.warning("explain_portfolio: LLM tidak tersedia (%s) -> pakai fallback.", alasan)
         return fallback
 
     try:
@@ -574,6 +682,14 @@ def explain_portfolio(
         logger.error("explain_portfolio: LLM gagal/ kosong -> pakai fallback.")
         return fallback
 
+    # [SEMENTARA] Bila GEMINI_RETURN_ERROR=true, generate_text() mengembalikan
+    # PESAN ERROR (diawali LLM_ERROR_PREFIX) alih-alih narasi. Pesan itu
+    # diteruskan apa adanya supaya terlihat di respons API.
+    if teks.startswith(LLM_ERROR_PREFIX):
+        logger.error("explain_portfolio: panggilan LLM gagal (tanpa retry) -> pesan error "
+                     "diteruskan sebagai narasi karena GEMINI_RETURN_ERROR aktif.")
+        return teks
+
     logger.info("explain_portfolio: narasi LLM siap (%d karakter) dalam %.2fs.",
                 len(teks), time.perf_counter() - t0)
     return teks
@@ -589,6 +705,9 @@ __all__ = [
     "GEMINI_THINKING_LEVEL",
     "GEMINI_TIMEOUT_MS",
     "GEMINI_MAX_RETRIES",
+    "GEMINI_RETRY_ENABLED",
+    "GEMINI_RETURN_ERROR",
+    "LLM_ERROR_PREFIX",
     "is_available",
     "get_client",
     "generate_text",
