@@ -1,6 +1,8 @@
 from datetime import date
+import logging
+from threading import Lock
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 from src.backend.models.database import get_db
 from src.backend.models.schemas.market_schema import MarketFilterResponse
@@ -9,11 +11,51 @@ from src.backend.controller.market_controller import (
     StockFilteringError,
     get_last_filter_update,
     run_and_cache_stock_filtering,
+    run_daily_pipeline,
 )
 from src.backend.services.price_history_service import sync_market_data
 from src.backend.core.deps import get_current_user
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+_manual_pipeline_lock = Lock()
+
+
+@router.post("/run-daily-pipeline", response_model=ApiResponse[dict])
+def run_daily_pipeline_endpoint(request: Request):
+    """Manually run the existing daily pipeline from the local machine only.
+
+    This diagnostic endpoint intentionally has no JWT dependency. It must not
+    be exposed through a public reverse proxy: the pipeline is expensive and
+    refreshes shared database caches. The scheduler remains unchanged.
+    """
+    client_host = request.client.host if request.client else None
+    if client_host not in ("127.0.0.1", "::1"):
+        raise HTTPException(status_code=403, detail="Endpoint pipeline manual hanya tersedia dari localhost.")
+    if not _manual_pipeline_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="Pipeline manual masih berjalan.")
+    try:
+        result = run_daily_pipeline()
+        market_data = result.get("market_data")
+        if market_data is None:
+            raise HTTPException(status_code=503, detail="Pipeline selesai tanpa MarketData yang valid.")
+        request.app.state.market_data_today = market_data
+        return ApiResponse(
+            status="success",
+            message="Daily pipeline berhasil dijalankan secara manual.",
+            data={
+                "filtered_stocks": result["filtered_stocks"],
+                "market_data_stocks": market_data.n_stocks,
+                "sync_stats": result["sync_stats"],
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Daily pipeline manual gagal")
+        raise HTTPException(status_code=500, detail=f"Daily pipeline gagal: {exc}") from exc
+    finally:
+        _manual_pipeline_lock.release()
 
 @router.get("/filter-stocks", response_model=ApiResponse[MarketFilterResponse])
 def filter_stocks_endpoint(
