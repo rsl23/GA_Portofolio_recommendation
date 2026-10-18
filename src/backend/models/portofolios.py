@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, Column, Float, ForeignKey, String, DateTime, Text
+from sqlalchemy import Boolean, Column, Float, ForeignKey, String, DateTime, Text, Date, JSON
 from sqlalchemy.orm import relationship
 from src.backend.models.database import Base
 from sqlalchemy.dialects.postgresql import UUID
@@ -37,7 +37,9 @@ class Portofolio(Base):
     # status dan penjelasan
     status_portofolio = Column(String, nullable=False, default="active")  # active, rebalanced, inactive, etc.
     created_at = Column(DateTime, default=datetime.utcnow)
-    date_ref = Column(DateTime, nullable=True)  # acuan simulasi backtest
+    date_ref = Column(DateTime, nullable=True)  # tanggal pembentukan/jadwal snapshot
+    execution_date = Column(Date, nullable=True)  # hari bursa saat komposisi baru mulai berlaku
+    execution_prices = Column(JSON, nullable=True)  # ticker -> raw Close per lembar, termasuk full sell
     
     # rebalance
     is_rebalance = Column(Boolean, nullable=False, default=False)  # yes or no

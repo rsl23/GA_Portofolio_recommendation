@@ -26,8 +26,8 @@ class PortofolioItem(Base):
 
     created_at = Column(DateTime, default=datetime.utcnow)
     
-    start_date = Column(DateTime, nullable=True)  # tanggal mulai kepemilikan (untuk backtest)
-    end_date = Column(DateTime, nullable=True)    # tanggal akhir kepemilikan
+    start_date = Column(DateTime, nullable=True)  # mulai snapshot pada execution_date
+    end_date = Column(DateTime, nullable=True)    # eksklusif: execution_date snapshot pengganti
 
     portofolio = relationship("Portofolio", back_populates="items")
     stock = relationship("StockUniverse")

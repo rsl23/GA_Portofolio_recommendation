@@ -10,7 +10,7 @@ from .operators import (
     tournament_select,
     two_point_crossover,
 )
-from .population import create_initial_population
+from .population import create_initial_population, create_rebalance_population
 
 
 def _fit(c):
@@ -30,7 +30,10 @@ class GeneticEngine:
         cfg = self.config
         rng = np.random.default_rng(cfg.seed)
 
-        population = create_initial_population(cfg, rng)
+        if getattr(cfg, 'is_rebalance', False) and getattr(cfg, 'old_weights', None) is not None:
+            population = create_rebalance_population(cfg, rng)
+        else:
+            population = create_initial_population(cfg, rng)
         for chrom in population:
             chrom.evaluate_fitness()
 

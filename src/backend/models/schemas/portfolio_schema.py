@@ -1,4 +1,4 @@
-﻿from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field
 from typing import List, Optional, Generic, TypeVar
 from datetime import date, datetime
 
@@ -24,6 +24,7 @@ class PortfolioGenerateRequest(BaseModel):
                     "Pydantic mengubah string ISO ini menjadi objek date, sehingga "
                     "langsung bisa dipakai oleh run_live_preprocessing/build_market_data.",
     )
+    rebalance: bool = Field(False, description="Jika True, lakukan rebalancing dari portofolio aktif saat ini")
 
 # Satu baris alokasi saham di dalam portofolio hasil GA
 class PortfolioItem(BaseModel):
@@ -58,6 +59,16 @@ class PortfolioHistoryItem(BaseModel):
 # Dipakai BERSAMA oleh generate (POST /generate), ambil aktif (GET /my-portofolio),
 # dan ambil by id. Field yang tidak tersimpan di DB (expected_return, n_active,
 # allocated_budget_ok) bersifat Optional — None saat dibaca dari database.
+# Baris detail perubahan (delta) saat rebalancing
+class RebalanceDeltaItem(BaseModel):
+    kode: str
+    action: str
+    old_lot: int
+    new_lot: int
+    delta_lot: int
+    reason: str
+
+
 class PortfolioResponse(BaseModel):
     id: str
     user_id: Optional[str] = None                 # pemilik portofolio (dari DB)
@@ -79,6 +90,46 @@ class PortfolioResponse(BaseModel):
     budget: float
     allocations: List[PortfolioItem] = []
     narasi_llm: Optional[str]
+    rebalance_deltas: Optional[List[RebalanceDeltaItem]] = None
 
     class Config:
         from_attributes = True # Mengizinkan Pydantic membaca dari SQLAlchemy Model
+
+
+# ----------------------------------------------------------------------
+# Rebalance series (banyak rebalance berantai pada rentang tanggal)
+# ----------------------------------------------------------------------
+# Request untuk POST /generate-rebalance-series: generate portofolio awal pada
+# start_date, lalu rebalance berantai tiap interval_months sampai end_date.
+# Jumlah portofolio yang dihasilkan TIDAK angka pasti -- melainkan berapa kali
+# tanggal dalam rentang [start_date, end_date] kelipatan interval (mis. tiap 2
+# bulan pada 2022-2026 -> lebih dari 10 portofolio).
+class RebalanceSeriesGenerateRequest(BaseModel):
+    budget: float = Field(..., gt=0, description="Modal awal portofolio pada start_date (IDR)")
+    risk_profile: str = Field(..., description="Konservatif, Moderat, atau Agresif")
+    start_date: date = Field(
+        ..., description="Tanggal generate portofolio awal (YYYY-MM-DD), mis. 2022-01-03"
+    )
+    end_date: date = Field(
+        ..., description="Tanggal terakhir series (YYYY-MM-DD, inklusif), mis. 2026-12-31"
+    )
+    interval_months: int = Field(
+        2, ge=1, le=12,
+        description="Jeda antar rebalance dalam bulan (2 = tiap 2 bulan).",
+    )
+
+
+class SkippedRebalanceStep(BaseModel):
+    """Satu tanggal series yang dilewati karena MarketData tidak tersedia."""
+    date: date
+    reason: str
+
+
+class RebalanceSeriesResponse(BaseModel):
+    """Hasil series rebalance berantai: SEMUA portofolio urut kronologis."""
+    start_date: date
+    end_date: date
+    interval_months: int
+    scheduled_dates: List[date]              # seluruh tanggal terjadwal
+    portfolios: List[PortfolioResponse]      # yang berhasil, urut dari start_date
+    skipped: List[SkippedRebalanceStep] = [] # tanggal yang dilewati + alasan

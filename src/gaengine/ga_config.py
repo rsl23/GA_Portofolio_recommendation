@@ -100,6 +100,12 @@ class GAConfig:
     # --- data ------------------------------------------------------------
     data: Optional["MarketData"] = None
 
+    # --- rebalancing ----------------------------------------------------
+    is_rebalance: bool = False
+    old_weights: Optional[Any] = None
+    old_lots: Optional[Any] = None
+    turnover_penalty_beta: float = 0.4
+
     @property
     def profile(self) -> RiskProfile:
         return RiskProfile.from_name(self.risk_profile)

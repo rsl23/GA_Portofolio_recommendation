@@ -10,6 +10,8 @@ from src.backend.models.schemas.portfolio_schema import (
     PortfolioGenerateRequest,
     PortfolioResponse,
     PortfolioHistoryItem,
+    RebalanceSeriesGenerateRequest,
+    RebalanceSeriesResponse,
     UpdateHargaBeliRequest,
 )
 from src.backend.controller.portfolio_controller import (
@@ -19,6 +21,7 @@ from src.backend.controller.portfolio_controller import (
     StockNotFoundError,
     UserNotFoundError,
     generate_new_portfolio,
+    generate_rebalance_series,
     get_active_portfolio,
     get_all_my_portfolios,
     list_portfolio_history,
@@ -101,6 +104,12 @@ def api_generate_portfolio(
     except StockNotFoundError as e:
         db.rollback()
         raise HTTPException(status_code=422, detail=str(e))
+    except ValueError as e:
+        # Kondisi request tidak valid (mis. rebalance tanpa portofolio aktif
+        # pada mode tsb, atau date_ref backtest rebalance lebih awal dari
+        # portofolio lama) -> 400, bukan 500.
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
     except SQLAlchemyError as e:
         db.rollback()
         raise HTTPException(
@@ -112,6 +121,89 @@ def api_generate_portfolio(
             f"Portofolio backtest per {date_ref} berhasil digenerate (status active_backtest)."
             if backtest
             else "Portofolio berhasil digenerate."
+        ),
+        data=hasil,
+    )
+
+
+@router.post("/generate-rebalance-series", response_model=ApiResponse[RebalanceSeriesResponse])
+def api_generate_rebalance_series(
+    body: RebalanceSeriesGenerateRequest,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Endpoint BACKTEST-SERIES: menjalankan generate awal + rebalance BERANTAI
+    berulang pada rentang tanggal, mis. 2022-01-01 s/d 2026-12-31 tiap 2 bulan
+    -> 30 portofolio (bukan angka pasti -- mengikuti rentang & interval).
+
+    Alur di controller (generate_rebalance_series):
+      1. start_date      -> generate portofolio AWAL (rebalance=false)
+      2. tiap +interval  -> rebalance dari portofolio aktif langkah sebelumnya
+         (rebalance=true; NAV & lots diwarisi berantai, parent_portofolio_id
+         membentuk rantai)
+    Semua langkah memakai data HISTORIS (khusus backtest) -- portofolio LIVE
+    tidak tersentuh. Portofolio terakhir = "active_backtest"; sisanya menjadi
+    "replaced_backtest" (tetap tersimpan & bisa diambil via
+    GET /my-portfolio/all?backtest=true).
+
+    Body (JSON):
+      - budget (float, wajib), risk_profile (str, wajib)
+      - start_date (YYYY-MM-DD, wajib): tanggal generate portofolio awal
+      - end_date (YYYY-MM-DD, wajib, inklusif): tanggal terakhir series
+      - interval_months (int, default 2, 1-12): jeda antar rebalance
+      Contoh: {"budget": 10000000, "risk_profile": "Moderat",
+               "start_date": "2022-01-03", "end_date": "2026-12-31",
+               "interval_months": 2}
+
+    Respons {status, message, data} dengan data = RebalanceSeriesResponse:
+      - scheduled_dates : seluruh tanggal jadwal
+      - portfolios      : SEMUA portofolio berhasil, urut kronologis
+      - skipped         : tanggal yang dilewati (data historis tak tersedia)
+                          beserta alasannya
+
+    CATATAN: series dijalankan SEKUENSIAL di satu request (bukan paralel)
+    karena tiap rebalance bergantung pada hasil langkah sebelumnya. Tiap
+    langkah = 1x GA penuh, jadi series panjang bisa memakan waktu lama --
+    gunakan timeout HTTP yang memadai di sisi klien.
+
+    Endpoint: POST /api/v1/portfolios/generate-rebalance-series
+    """
+    try:
+        hasil = generate_rebalance_series(
+            db,
+            body,
+            user_id=current_user["sub"],
+        )
+    except UserNotFoundError as e:
+        db.rollback()
+        raise HTTPException(status_code=404, detail=str(e))
+    except MarketDataUnavailableError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    except StockNotFoundError as e:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=str(e))
+    except ValueError as e:
+        # Rentang tanggal salah / jumlah langkah melebihi batas / rebalance
+        # tanpa portofolio aktif -> 400 Bad Request (bukan 500).
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=500, detail=f"Gagal menyimpan portofolio ke database: {e}"
+        )
+    return ApiResponse(
+        status="success",
+        message=(
+            f"Rebalance series selesai: {len(hasil.portfolios)} portofolio "
+            f"berhasil dari {len(hasil.scheduled_dates)} tanggal terjadwal"
+            + (
+                f" ({len(hasil.skipped)} tanggal dilewati)."
+                if hasil.skipped
+                else "."
+            )
         ),
         data=hasil,
     )
@@ -255,13 +347,14 @@ def portofolio_performance_endpoint(
 ):
     """
     Hitung performa portofolio TERTENTU (path param {portfolio_id}) milik user
-    vs IHSG dalam persentase return kumulatif harian, dari portofolio.date_ref
-    (backtest: tanggal simulasi; live: sekarang) sampai query param `end_date`
+    vs IHSG dalam persentase return kumulatif harian, dari execution_date
+    snapshot awal sampai query param `end_date`
     (YYYY-MM-DD) — atau sampai data terakhir bila `end_date` tidak diberikan.
-    Perhitungan berbasis kepemilikan lot PER ITEM (window start_date/end_date
-    milik item dihormati), sehingga perubahan kepemilikan akibat rebalance
-    ikut terhitung: nilai portofolio harian = SUM(lot aktif x 100 lembar x
-    adj_close), return = nilai_t / nilai_t0 - 1.
+    Perhitungan memakai rantai snapshot parent_portofolio_id dan selisih lot
+    BUY/SELL/HOLD. date_ref adalah tanggal pembentukan/jadwal; execution_date
+    adalah hari komposisi baru mulai berlaku. Window item [start_date, end_date)
+    membatasi masa berlaku snapshot. NAV = kas + lot aktif x 100 x raw Close.
+    Untuk seluruh rangkaian rebalance, gunakan ID snapshot terakhir.
 
     Path param:
       - portfolio_id (UUID, wajib): ID portofolio yang akan dihitung.

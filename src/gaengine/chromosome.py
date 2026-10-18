@@ -39,6 +39,7 @@ class Chromosome:
         self.max_drawdown = 0.0
         self.avg_correlation = 0.0
         self.skor_fundamental = 0.0
+        self.turnover_rate = 0.0
 
     # ------------------------------------------------------------------
     # representation helpers
@@ -194,6 +195,18 @@ class Chromosome:
         gamma = cfg.correlation_penalty
         alpha = cfg.fundamental_bonus
 
+        # --- Turnover penalty (rebalancing only) ---
+        turnover_penalty = 0.0
+        self.turnover_rate = 0.0
+        if getattr(cfg, 'is_rebalance', False) and getattr(cfg, 'old_weights', None) is not None:
+            # Reconstruct full weight array over all universe stocks
+            full_new_weights = np.zeros(data.n_stocks, dtype=float)
+            full_new_weights[indices] = aw
+            
+            delta = np.abs(full_new_weights - cfg.old_weights)
+            self.turnover_rate = float(delta.sum())
+            turnover_penalty = getattr(cfg, 'turnover_penalty_beta', 0.4) * self.turnover_rate
+
         self.fitness = float(
             sharpe
             - lam * abs(mdd)
@@ -201,6 +214,7 @@ class Chromosome:
             + alpha * fund_avg
             - budget_death
             - div_death
+            - turnover_penalty
         )
 
         # Simpan metrik lengkap agar bisa dilaporkan oleh controller
