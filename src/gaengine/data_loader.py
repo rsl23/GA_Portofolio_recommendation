@@ -10,7 +10,7 @@ skor fundamental) memakai SATU kode yang sama sehingga hasil live & backtest
 apple-to-apple.
 
     mode LIVE      -> filtered_stock_cache (DB) + yfinance 1y + ZAPI Pluang
-                      + BI rate API
+                      + BI rate API (fallback tabel resmi Bank Indonesia)
     mode BACKTEST  -> run_live_preprocessing(backtest=True, date=date_ref)
                       + Master_OHLCV_15Tahun.parquet
                       + fundamental_quarterly.parquet
@@ -27,12 +27,14 @@ from __future__ import annotations
 import logging
 import os
 import time
+from io import StringIO
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
 from dotenv import load_dotenv
 
@@ -57,6 +59,7 @@ PRICE_FILE       = DATA_DIR / "Master_OHLCV_15Tahun.parquet"
 FUND_FILE        = DATA_DIR / "fundamental_quarterly.parquet"
 DIVIDEND_FILE    = DATA_DIR / "dividend_events_20_tahun.xlsx"
 RISKFREE_FILE    = DATA_DIR / "BI-7Day-RR.xlsx"
+BI_RATE_PAGE_URL = "https://www.bi.go.id/id/statistik/indikator/bi-rate.aspx"
 
 # Window return default: 1 tahun (paritas dengan period="1y" yfinance di LIVE).
 DEFAULT_LOOKBACK_DAYS = 365
@@ -311,11 +314,40 @@ def take_bi_rate():
     """LIVE: Take the latest BI rate data (fraksi desimal, mis. 0.0575)."""
     try:
         rf = fetch_bi_rate()
-        logger.info("take_bi_rate: API BI -> risk_free=%s", _fmt_rf(rf))
-        return rf
     except Exception as e:
-        logger.warning("take_bi_rate: GAGAL mengambil BI rate (%s) -> None", e)
+        logger.warning("take_bi_rate: API ZAPI gagal (%s); mencoba situs BI", e)
+        rf = None
+    if rf is not None and np.isfinite(rf) and 0 < rf < 1:
+        logger.info("take_bi_rate: API ZAPI -> risk_free=%s", _fmt_rf(rf))
+        return float(rf)
+    logger.warning("take_bi_rate: API ZAPI tidak menyediakan BI rate valid; mencoba situs BI")
+    try:
+        response = requests.get(BI_RATE_PAGE_URL, timeout=20)
+        response.raise_for_status()
+        for table in pd.read_html(StringIO(response.text)):
+            columns = {str(column).strip(): column for column in table.columns}
+            if "BI-Rate" not in columns or "Tanggal" not in columns:
+                continue
+            dated_rates = []
+            for _, row in table.iterrows():
+                published = _parse_tanggal_id(row[columns["Tanggal"]])
+                raw = str(row[columns["BI-Rate"]]).replace("%", "").replace(",", ".").strip()
+                try:
+                    percent = float(raw)
+                except ValueError:
+                    continue
+                if published is not None and published <= date.today() and np.isfinite(percent) and 0 < percent < 100:
+                    dated_rates.append((published, percent))
+            if dated_rates:
+                published, percent = max(dated_rates)
+                rf = percent / 100.0
+                logger.info("take_bi_rate: situs BI tanggal=%s -> risk_free=%s", published, _fmt_rf(rf))
+                return rf
+        logger.warning("take_bi_rate: tabel Tanggal/BI-Rate situs BI tidak berisi nilai valid")
+    except Exception as e:
+        logger.warning("take_bi_rate: situs BI gagal (%s)", e)
         return None
+    return None
 
 
 # ======================================================================
@@ -779,12 +811,11 @@ def _assemble_market_data(
     fundamental_metrics = np.asarray([metrics_map[c] for c in candidates], dtype=float)
     fundamental_scores = _normalize_metrics(fundamental_metrics)
 
-    # 7. Risk-free: fallback 6.25% bila gagal diambil
-    rf = risk_free 
+    # 7. Risk-free: do not silently invent a rate if both live sources (or
+    # the historical backtest source) are unavailable.
+    rf = risk_free
     if risk_free is None:
-        raise ValueError(
-            f"Historical risk-free rate tidak tersedia untuk {date_ref}"
-        )
+        raise ValueError("Risk-free rate tidak tersedia dari sumber BI untuk market data ini.")
     logger.info("_assemble_market_data: n_candidates=%d, min_price=%.0f, max_stocks=%s, "
                 "n_final=%d, rf=%s",
                 len(candidates), min_price, max_stocks, len(candidates), _fmt_rf(rf))

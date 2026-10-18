@@ -576,6 +576,7 @@ def explain_portfolio(
     budget: Optional[float] = None,
     expected_return: Optional[float] = None,
     generations_run: Optional[int] = None,
+    rebalance_deltas: Optional[List[Dict[str, Any]]] = None,
     fallback: Optional[str] = None,
     audience: str = "investor ritel",
     extra_instruction: Optional[str] = None,
@@ -600,6 +601,11 @@ def explain_portfolio(
         mode, date_ref : konteks waktu ("live"/"backtest", tanggal acuan).
         budget         : modal pengguna (default config.budget).
         expected_return: estimasi return tahunan (default dihitung dari returns).
+        rebalance_deltas: daftar baris delta rebalancing (kode, action, old_lot,
+                          new_lot, delta_lot, reason) dari controller -> disertakan
+                          dalam konteks prompt sebagai TABEL 8 sehingga narasi LLM
+                          bisa menjelaskan transaksi BUY/SELL/HOLD rebalancing.
+                          None bila bukan mode rebalance.
         fallback       : teks yang dikembalikan bila LLM tidak tersedia/gagal
                          (mis. narasi template controller) -> generate portofolio
                          TIDAK PERNAH gagal karena masalah LLM.
@@ -647,6 +653,7 @@ def explain_portfolio(
             budget=budget,
             expected_return=expected_return,
             generations_run=generations_run,
+            rebalance_deltas=rebalance_deltas,
             audience=audience,
             extra_instruction=extra_instruction,
         )

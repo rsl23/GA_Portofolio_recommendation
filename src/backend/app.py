@@ -6,6 +6,7 @@ from apscheduler.triggers.cron import CronTrigger
 from src.backend.routes.api import api_router
 from src.backend.core.config import settings
 from src.backend.models.database import engine, Base, SessionLocal
+from sqlalchemy import inspect, text
 import src.backend.models.filtered_stocks_cache
 from src.backend.controller.market_controller import (
     get_last_filter_update,
@@ -57,6 +58,16 @@ async def lifespan(app: FastAPI):
     # 1. Generate tabel saat startup (lebih aman di sini daripada global scope)
     print("Mengecek dan membuat tabel database...")
     Base.metadata.create_all(bind=engine)
+    # create_all does not add columns to existing installations. Keep the
+    # additive accounting migration idempotent for deployments without Alembic.
+    existing = {column["name"] for column in inspect(engine).get_columns("portofolios")}
+    with engine.begin() as connection:
+        optional = "IF NOT EXISTS " if engine.dialect.name == "postgresql" else ""
+        if "execution_date" not in existing:
+            connection.execute(text(f"ALTER TABLE portofolios ADD COLUMN {optional}execution_date DATE"))
+        if "execution_prices" not in existing:
+            price_type = "JSONB" if engine.dialect.name == "postgresql" else "JSON"
+            connection.execute(text(f"ALTER TABLE portofolios ADD COLUMN {optional}execution_prices {price_type}"))
 
     # 2. Load data pasar ke memori untuk engine Algoritma Genetika
     print("Memuat MarketData ke RAM...")

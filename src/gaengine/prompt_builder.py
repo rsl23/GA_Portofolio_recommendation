@@ -410,6 +410,7 @@ def build_portfolio_context(
     expected_return: Optional[float] = None,
     generations_run: Optional[int] = None,
     max_pairs: int = 5,
+    rebalance_deltas: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """
     Rakit KONTEKS lengkap hasil GA menjadi dict siap-JSON untuk dijelaskan LLM.
@@ -516,6 +517,9 @@ def build_portfolio_context(
             "seed": getattr(config, "seed", None),
         },
     }
+    if rebalance_deltas is not None:
+        context["rebalance_deltas"] = rebalance_deltas
+        
     context["catatan_otomatis"] = _auto_insights(context)
     return context
 
@@ -727,6 +731,17 @@ def render_context_text(context: Dict[str, Any]) -> str:
     add("Ambang early stop (generasi stagnan): " + str(ga["early_stop_patience"]))
     add("Seed acak: " + str(ga["seed"]))
     add("")
+    
+    if "rebalance_deltas" in context:
+        add("TABEL 8 - REBALANCING (PERUBAHAN PORTOFOLIO)")
+        add("| Ticker | Aksi | Lot Lama | Lot Baru | Selisih Lot | Alasan Rebalancing |")
+        add("|---|---|---|---|---|---|")
+        for delta in context["rebalance_deltas"]:
+            add("| " + str(delta["kode"]) + " | " + str(delta["action"]) + " | " 
+                + str(delta["old_lot"]) + " | " + str(delta["new_lot"]) + " | " 
+                + str(delta["delta_lot"]) + " | " + str(delta["reason"]) + " |")
+        add("")
+
     add("CATATAN TERHITUNG (fakta dari sistem, bukan opini):")
     for i, catatan in enumerate(context.get("catatan_otomatis", []), 1):
         add("  " + str(i) + ". " + str(catatan))
@@ -820,13 +835,17 @@ TASK_INSTRUCTIONS = (
     "Gunakan istilah seperti 'berperan sebagai komponen pertumbuhan', 'memberikan kontribusi terhadap diversifikasi', atau 'memiliki karakteristik defensif secara historis' HANYA jika didukung oleh data yang tersedia.\n"
     "Jangan menyebut suatu saham sebagai 'terbaik', 'terburuk', 'paling bagus', atau 'paling jelek'.\n"
     "\n"
-    "6) RISIKO DAN KETERBATASAN\n"
+    "6) PENJELASAN REBALANCING (JIKA ADA TABEL 8)\n"
+    "Jika terdapat TABEL 8 mengenai Rebalancing, jelaskan mengapa aksi rebalancing (Buy, Sell, Hold) dilakukan.\n"
+    "Jelaskan apakah suatu saham dijual karena 'Eliminasi Kualitas' (dikeluarkan dari kandidat karena fundamental/likuiditas memburuk) atau 'Optimasi Algoritma / Take Profit' (GA menyesuaikan bobot untuk efisiensi).\n"
+    "\n"
+    "7) RISIKO DAN KETERBATASAN\n"
     "Jelaskan risiko portofolio berdasarkan Maximum Drawdown, volatilitas, korelasi, dan karakteristik saham yang tersedia.\n"
     "Jelaskan juga dana yang belum terpakai jika terdapat sisa budget.\n"
     "Jika mode yang digunakan adalah BACKTEST, tegaskan bahwa return, volatilitas, dan Maximum Drawdown merupakan hasil historis dan tidak menjamin hasil masa depan.\n"
     "Sebutkan keterbatasan data apabila terdapat metrik yang tidak tersedia.\n"
     "\n"
-    "7) KESIMPULAN\n"
+    "8) KESIMPULAN\n"
     "Simpulkan karakteristik portofolio berdasarkan data yang tersedia dan jelaskan hal-hal utama yang perlu diperhatikan investor.\n"
     "Kesimpulan harus merangkum hubungan antara fundamental, return, risiko, korelasi, dan fitness function.\n"
     "Jangan memberikan rekomendasi beli atau jual, target harga, atau prediksi harga masa depan.\n"
@@ -863,6 +882,7 @@ def build_explanation_prompt(
     audience: str = "investor ritel",
     extra_instruction: Optional[str] = None,
     system_instruction: Optional[str] = None,
+    rebalance_deltas: Optional[List[Dict[str, Any]]] = None,
 ) -> PortfolioPrompt:
     """
     Bangun prompt lengkap (system instruction + user prompt) untuk meminta LLM
@@ -903,6 +923,7 @@ def build_explanation_prompt(
             budget=budget,
             expected_return=expected_return,
             generations_run=generations_run,
+            rebalance_deltas=rebalance_deltas,
         )
 
     tugas = TASK_INSTRUCTIONS.replace("{audience}", str(audience))
