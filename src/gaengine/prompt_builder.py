@@ -734,12 +734,16 @@ def render_context_text(context: Dict[str, Any]) -> str:
     
     if "rebalance_deltas" in context:
         add("TABEL 8 - REBALANCING (PERUBAHAN PORTOFOLIO)")
-        add("| Ticker | Aksi | Lot Lama | Lot Baru | Selisih Lot | Alasan Rebalancing |")
-        add("|---|---|---|---|---|---|")
+        add("| Ticker | Aksi | Detail | Lot Lama | Lot Baru | Selisih Lot | Alasan Rebalancing | Realized P/L (Rp) |")
+        add("|---|---|---|---|---|---|---|---|")
         for delta in context["rebalance_deltas"]:
             add("| " + str(delta["kode"]) + " | " + str(delta["action"]) + " | " 
+                + str(delta.get("action_detail") or "-") + " | "
                 + str(delta["old_lot"]) + " | " + str(delta["new_lot"]) + " | " 
-                + str(delta["delta_lot"]) + " | " + str(delta["reason"]) + " |")
+                + str(delta["delta_lot"]) + " | " + str(delta["reason"]) + " | "
+                + (str(round(delta["realized_pnl"], 2))
+                   if delta.get("realized_pnl") is not None else "-") + " |")
+        add("Catatan: realized P/L adalah akibat penjualan terhadap average cost, bukan alasan otomatis untuk menjual.")
         add("")
 
     add("CATATAN TERHITUNG (fakta dari sistem, bukan opini):")
@@ -837,7 +841,7 @@ TASK_INSTRUCTIONS = (
     "\n"
     "6) PENJELASAN REBALANCING (JIKA ADA TABEL 8)\n"
     "Jika terdapat TABEL 8 mengenai Rebalancing, jelaskan mengapa aksi rebalancing (Buy, Sell, Hold) dilakukan.\n"
-    "Jelaskan apakah suatu saham dijual karena 'Eliminasi Kualitas' (dikeluarkan dari kandidat karena fundamental/likuiditas memburuk) atau 'Optimasi Algoritma / Take Profit' (GA menyesuaikan bobot untuk efisiensi).\n"
+    "Bedakan alasan optimasi GA atau keluarnya saham dari kandidat dengan hasil akuntansi penjualan. Jangan menyebut setiap SELL sebagai take profit: jika realized P/L negatif, itu realisasi rugi; jika positif, realisasi untung. Jangan mengklaim perubahan harga atau P/L saja sebagai penyebab keputusan tanpa bukti dari metrik kualitas portofolio.\n"
     "\n"
     "7) RISIKO DAN KETERBATASAN\n"
     "Jelaskan risiko portofolio berdasarkan Maximum Drawdown, volatilitas, korelasi, dan karakteristik saham yang tersedia.\n"

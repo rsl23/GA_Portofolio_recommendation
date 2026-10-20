@@ -58,6 +58,15 @@ def create_rebalance_population(config, rng=None):
             chrom.genes = mutated_genes.tolist()
             
         chrom.normalize()
+        if config.allow_cash and config.fitness_mode != "baseline":
+            if i == 0:
+                chrom.exposure = float(np.clip(
+                    sum(old_weights), config.min_exposure, config.max_exposure
+                ))
+            else:
+                chrom.exposure = (config.min_exposure
+                                  if config.min_exposure == config.max_exposure
+                                  else float(rng.uniform(config.min_exposure, config.max_exposure)))
         population.append(chrom)
         
     # Generate the rest randomly

@@ -12,7 +12,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
 
 class RiskProfile(Enum):
@@ -83,6 +83,7 @@ class GAConfig:
     risk_free_rate: float = 0.0625
     correlation_penalty: float = 0.5   # gamma
     fundamental_bonus: float = 0.8     # alpha
+    mdd_penalty_override: Optional[float] = None
     death_penalty: float = 50000.0
     
     annualization: float = math.sqrt(252.0)
@@ -96,6 +97,7 @@ class GAConfig:
     early_stop_patience: int = 100
     improvement_tol: float = 1e-4
     seed: Optional[int] = None
+    fitness_mode: str = "rebalance_aware"  # "baseline" reproduces the prior scoring for evaluation
 
     # --- data ------------------------------------------------------------
     data: Optional["MarketData"] = None
@@ -104,7 +106,23 @@ class GAConfig:
     is_rebalance: bool = False
     old_weights: Optional[Any] = None
     old_lots: Optional[Any] = None
+    old_prices_per_lot: Optional[Any] = None
+    old_cost_basis: Optional[Any] = None  # accounting context; not a fitness bonus/penalty
     turnover_penalty_beta: float = 0.4
+    rebalance_utility_weight: float = 0.0
+    allow_cash: bool = False
+    min_exposure: float = 0.4  # fraction of NAV invested when allow_cash is enabled
+    max_exposure: float = 1.0  # profile risk ceiling; residual NAV remains cash
+    cash_return_weight: float = 0.0
+    lookthrough_stock_risk: bool = False  # score invested basket risk before cash dilution
+
+    def __post_init__(self) -> None:
+        if self.fitness_mode not in ("baseline", "rebalance_aware"):
+            raise ValueError("fitness_mode harus baseline atau rebalance_aware.")
+        if not 0 < self.min_exposure <= self.max_exposure <= 1:
+            raise ValueError("Exposure harus memenuhi 0 < min_exposure <= max_exposure <= 1.")
+        if self.lookthrough_stock_risk and not self.allow_cash:
+            raise ValueError("lookthrough_stock_risk memerlukan allow_cash.")
 
     @property
     def profile(self) -> RiskProfile:
@@ -112,4 +130,5 @@ class GAConfig:
 
     @property
     def lambda_mdd(self) -> float:
-        return self.profile.lambda_mdd
+        return (self.profile.lambda_mdd if self.mdd_penalty_override is None
+                else self.mdd_penalty_override)

@@ -120,4 +120,10 @@ def adaptive_hybrid_mutation(chromosome, generation: int, max_generation: int, r
 
     chromosome.genes = genes
     chromosome.normalize()
+    if (cfg.allow_cash and cfg.fitness_mode != "baseline" and
+        cfg.min_exposure < cfg.max_exposure and rng.random() < rate):
+        chromosome.exposure = float(np.clip(
+            chromosome.exposure + rng.normal(0.0, 0.08),
+            cfg.min_exposure, cfg.max_exposure
+        ))
     chromosome.fitness = None
