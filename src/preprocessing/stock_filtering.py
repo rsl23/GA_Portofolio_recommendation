@@ -14,38 +14,31 @@ from src.backend.models.stock_universe import StockUniverse
 # ============================================================
 # THRESHOLD MARKET CAP & SKALASINYA PADA MODE BACKTEST
 # ============================================================
-# Threshold Rp 5 Triliun ditetapkan berdasarkan kondisi pasar SAAT INI,
-# sehingga tidak adil bila dipakai apa adanya untuk tahun-tahun lama
-# (total kapitalisasi pasar IDX pada 2006 jauh lebih kecil daripada 2026).
-# Pada mode backtest threshold diskalakan mengikuti total kapitalisasi
-# pasar IDX pada tanggal pengujian:
-#
-#     threshold(date) = (IDX_MktCap(date) / IDX_MktCap(tahun_acuan)) x 5T
-#
-# Contoh: IDX_MktCap(2026) = 10.923.071,54 miliar IDR (baris tahun 2026,
-# Month = NA, pada 'data/idx_activities.parquet'). Bila backtest dilakukan
-# pada 2015 dengan IDX_MktCap(2015) = 4.872.702 miliar IDR, maka threshold
-# menjadi (4.872.702 / 10.923.071,54) x Rp 5T = Rp 2,231 T.
+# Live uses Rp 5T. Historical tests use a fixed end-2015 Rp 2.25T anchor
+# scaled by the latest completed IDX market-cap period before each decision.
+# Never use a same-year annual aggregate or a future-year reference for a
+# historical candidate-universe decision.
 #
 # Sumber: 'data/idx_activities.parquet' (hasil transformasi Idx_Activities.xlsx,
 # lihat idx_activities_to_parquet.py), kolom 'Market_Cap_bIDR' (miliar IDR).
 # ============================================================
 
-MARKET_CAP_THRESHOLD_NOW = 5_000_000_000_000   # Rp 5 Triliun (basis hari ini)
-MARKET_CAP_BASE_YEAR = 2026                    # tahun acuan penetapan Rp 5T
+MARKET_CAP_THRESHOLD_NOW = 5_000_000_000_000   # Live: Rp 5 triliun
+# Backtest anchor is fixed before the earliest evaluated 2016 window.
+# Rp 2.25T / IDX market cap at end-2015 is close to the live-relative policy,
+# without reading the 2026 market to make a historical decision.
+MARKET_CAP_THRESHOLD_BACKTEST_BASE = 2_250_000_000_000
+MARKET_CAP_BASE_YEAR = 2015
 IDX_ACTIVITIES_PARQUET = 'data/idx_activities.parquet'
 
 # ============================================================
 # THRESHOLD ADTV & SKALASINYA PADA MODE BACKTEST
 # ============================================================
-# Threshold Rp 1 Miliar/hari juga ditetapkan pada kondisi likuiditas pasar
-# SAAT INI. Pada mode backtest threshold diskalakan mengikuti likuiditas IHSG
-# pada tanggal pengujian:
+# Live uses Rp 1B/day. Historical tests use an end-2015 Rp 300M/day anchor
+# scaled by trailing completed IDX trading months before each decision.
 #
-#     threshold(date) = (ADTV_IHSG(date) / ADTV_IHSG(sekarang)) x Rp 1 Miliar
-#
-# ADTV IHSG (per hari bursa) dihitung dari 3 BULAN TERAKHIR sebelum bulan
-# tanggal acuan, dengan langkah:
+# ADTV IHSG (per hari bursa) dihitung dari 3 BULAN SELESAI sebelum bulan
+# tanggal keputusan, dengan langkah:
 #   1. jumlah hari bursa bulan tsb = Total_Trading_Value_bIDR
 #                                    / Avg_Daily_Trading_Value_bIDR
 #   2. ADTV IHSG = sigma(Avg_Daily_Trading_Value_bIDR x hari bursa)
@@ -55,6 +48,8 @@ IDX_ACTIVITIES_PARQUET = 'data/idx_activities.parquet'
 # ============================================================
 
 ADTV_THRESHOLD_NOW = 1_000_000_000              # Rp 1 Miliar/hari (basis hari ini)
+ADTV_THRESHOLD_BACKTEST_BASE = 300_000_000      # Rp 300 juta/hari, pre-2016 anchor
+ADTV_BACKTEST_BASE_DATE = date(2016, 1, 1)
 IDX_ADTV_LOOKBACK_MONTHS = 3                    # jumlah bulan rata-rata ADTV IHSG
 _IDX_ACTIVITY_CACHE: dict[tuple[str, float], pd.DataFrame] = {}
 _NAMA_BULAN = ['', 'Jan', 'Feb', 'Mar', 'Apr', 'Mei', 'Jun',
@@ -119,12 +114,9 @@ def get_index_market_cap(
     """
     Ambil total kapitalisasi pasar IDX (IDR penuh) yang relevan untuk `date_ref`.
 
-    Urutan prioritas:
-    1. Baris TAHUN pada tahun `date_ref` (Month = <NA>). Ini mengikuti cara
-       basis Rp 5T ditetapkan (mis. 2026 -> 10.923.071,54 miliar IDR).
-    2. Baris BULAN terakhir pada tahun yang sama dengan Month <= bulan date_ref
-       (dipakai bila baris tahunnya belum tersedia).
-    3. Baris TAHUN terakhir sebelum tahun date_ref (data tahun tsb belum ada).
+    Hanya gunakan periode yang sudah selesai sebelum `date_ref`. Baris tahunan
+    tahun berjalan dan baris bulanan bulan berjalan belum diketahui saat
+    keputusan dibuat; memakainya akan membocorkan informasi masa depan.
 
     Returns:
         (market_cap_idr, label) atau (None, None) bila tidak tersedia.
@@ -138,13 +130,9 @@ def get_index_market_cap(
 
     year = int(date_ref.year)
 
-    annual = df[(df['Year'] == year) & (df['Month'].isna())]
-    if not annual.empty:
-        return float(annual['Market_Cap_IDR'].iloc[-1]), f"tahun {year}"
-
     monthly = df[(df['Year'] == year) &
                  (df['Month'].notna()) &
-                 (df['Month'] <= int(date_ref.month))]
+                 (df['Month'] < int(date_ref.month))]
     if not monthly.empty:
         row = monthly.iloc[-1]
         return float(row['Market_Cap_IDR']), f"bulan {int(row['Month'])} {year}"
@@ -164,7 +152,7 @@ def get_index_market_cap(
 
 def get_scaled_market_cap_threshold(
     date_ref: date,
-    base_threshold: float = MARKET_CAP_THRESHOLD_NOW,
+    base_threshold: float = MARKET_CAP_THRESHOLD_BACKTEST_BASE,
     base_year: int = MARKET_CAP_BASE_YEAR,
     path: str = IDX_ACTIVITIES_PARQUET,
 ) -> dict:
@@ -185,7 +173,7 @@ def get_scaled_market_cap_threshold(
           scaled            : True bila skalasi berhasil diterapkan
 
     Bila data parquet tidak tersedia/kosong, fungsi mengembalikan threshold
-    default (Rp 5T) dengan scaled=False agar pipeline tidak gagal berjalan.
+    anchor backtest dengan scaled=False agar pipeline tidak gagal berjalan.
     """
     info = {
         'threshold': float(base_threshold),
@@ -198,7 +186,8 @@ def get_scaled_market_cap_threshold(
         'scaled': False,
     }
 
-    base_mcap, base_label = get_index_market_cap(date(base_year, 12, 31), path)
+    # The reference-year annual value is available only after that year ends.
+    base_mcap, base_label = get_index_market_cap(date(base_year + 1, 1, 1), path)
     info['base_label'] = base_label
     info['base_market_cap'] = base_mcap
 
@@ -362,22 +351,22 @@ def get_idx_adtv(
 
 def get_scaled_adtv_threshold(
     date_ref: date,
-    base_threshold: float = ADTV_THRESHOLD_NOW,
+    base_threshold: float = ADTV_THRESHOLD_BACKTEST_BASE,
     now_date: date | None = None,
     path: str = IDX_ACTIVITIES_PARQUET,
 ) -> dict:
     """
-    Hitung threshold ADTV yang sudah diskalakan untuk tanggal backtest.
+    Hitung threshold ADTV historis dari anchor sebelum periode pengujian.
 
-        threshold(date) = (ADTV_IHSG(date) / ADTV_IHSG(sekarang)) x base_threshold
+        threshold(date) = (ADTV_IHSG(date) / ADTV_IHSG(anchor)) x base_threshold
 
-    ADTV_IHSG(sekarang) dihitung dengan rumus yang sama (3 bulan terakhir
-    sebelum bulan `now_date`, default tanggal hari ini).
+    Kedua ADTV memakai 3 bulan selesai sebelumnya. Anchor default Januari 2016;
+    `now_date` hanya override eksplisit untuk kompatibilitas/pengujian.
 
     Returns:
         dict berisi: threshold, scale, base_label, base_adtv, target_label,
         target_adtv, dan scaled (True bila skalasi berhasil).
-        Bila data tidak tersedia, threshold default (Rp 1 Miliar) dipakai
+        Bila data tidak tersedia, threshold anchor backtest dipakai
         dengan scaled=False agar pipeline tidak gagal berjalan.
     """
     info = {
@@ -393,7 +382,7 @@ def get_scaled_adtv_threshold(
     if date_ref is None:
         raise ValueError("Skalasi ADTV memerlukan parameter 'date' yang valid.")
 
-    now_ref = now_date or date.today()
+    now_ref = now_date or ADTV_BACKTEST_BASE_DATE
     base_info = get_idx_adtv(now_ref, path=path)
     target_info = get_idx_adtv(date_ref, path=path)
 
@@ -489,7 +478,7 @@ def get_active_tickers_on(date_ref: date) -> list[tuple[str, str | None]]:
     Dipakai pada mode BACKTEST, di mana data API IDX hari ini tidak relevan.
 
     Kriteria dari tabel stock_universe:
-    1. delisting_date IS NULL      -> emiten masih tercatat aktif
+    1. delisting_date kosong atau > date_ref -> emiten aktif saat keputusan
     2. date_ref > listing_date     -> emiten sudah tercatat pada tanggal tersebut
     3. Usia minimal 2 tahun        -> (date_ref - listing_date) >= 730 hari;
                                       emiten yang lebih muda dieliminasi.
@@ -506,7 +495,8 @@ def get_active_tickers_on(date_ref: date) -> list[tuple[str, str | None]]:
         rows = (
             db.query(StockUniverse.ticker, StockUniverse.sektor, StockUniverse.listing_date)
             .filter(
-                StockUniverse.delisting_date.is_(None),
+                (StockUniverse.delisting_date.is_(None) |
+                 (StockUniverse.delisting_date > date_ref)),
                 StockUniverse.listing_date < date_ref,
             )
             .all()
@@ -790,7 +780,7 @@ def run_live_preprocessing(backtest: bool = False, date: date = None):
         batas_mcap = mcap_info['threshold']
         if mcap_info['scaled']:
             print(f"   [i] Backtest: threshold Market Cap diskalakan dari "
-                  f"{_format_triliun(MARKET_CAP_THRESHOLD_NOW)} "
+                  f"{_format_triliun(MARKET_CAP_THRESHOLD_BACKTEST_BASE)} "
                   f"(basis {mcap_info['base_label']}: "
                   f"{_format_triliun(mcap_info['base_market_cap'])}) -> "
                   f"{_format_triliun(batas_mcap)} "

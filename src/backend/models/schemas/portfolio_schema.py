@@ -67,6 +67,10 @@ class RebalanceDeltaItem(BaseModel):
     new_lot: int
     delta_lot: int
     reason: str
+    action_detail: Optional[str] = None
+    unrealized_return_pct_before: Optional[float] = None
+    realized_pnl: Optional[float] = None
+    realization_type: Optional[str] = None
 
 
 class PortfolioResponse(BaseModel):

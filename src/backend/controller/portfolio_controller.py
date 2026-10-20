@@ -33,6 +33,7 @@ from src.gaengine.rebalancer import (
     compute_nav,
     align_old_weights_to_market,
     apply_no_trade_band,
+    fit_buys_to_available_cash,
     compute_rebalance_deltas,
 )
 logger = logging.getLogger(__name__)
@@ -236,6 +237,8 @@ def generate_new_portfolio(
     old_portfolio_id = None
     old_lots = {}
     old_weights_aligned = None
+    old_signal_prices_per_lot: dict[str, float] = {}
+    old_cost_basis: dict[str, float | None] = {}
     eliminated_stocks = []
     execution_day = None
     all_close_prices: dict[str, float] = {}
@@ -278,6 +281,8 @@ def generate_new_portfolio(
             old_snapshot_row = db.query(Portofolio).filter(
                 Portofolio.id == UUID(str(old_portfolio_id)), Portofolio.user_id == user_uuid
             ).first()
+            if old_snapshot_row is not None:
+                old_cost_basis = _rebalance_cost_basis(db, old_snapshot_row, user_uuid)
             previous_execution_day = (
                 old_snapshot_row.execution_date if old_snapshot_row is not None else None
             ) or old_portfolio_res.date_ref or old_portfolio_res.created_at
@@ -302,11 +307,17 @@ def generate_new_portfolio(
                 )
                 if signal_day != decision_day:
                     raise MarketDataUnavailableError("Harga sinyal tidak tersedia pada hari keputusan.")
+                old_signal_prices_per_lot = {
+                    code: price * 100.0 for code, price in signal_closes.items()
+                }
                 old_weights_aligned, ga_budget = align_old_weights_to_market(
-                    old_lots, {code: price * 100.0 for code, price in signal_closes.items()},
+                    old_lots, old_signal_prices_per_lot,
                     leftover_cash, market_data.stock_codes,
                 )
             else:
+                old_signal_prices_per_lot = {
+                    code: price * 100.0 for code, price in all_close_prices.items()
+                }
                 ga_budget = new_nav
             
             # Override budget with NAV
@@ -352,22 +363,58 @@ def generate_new_portfolio(
         is_rebalance=getattr(request, 'rebalance', False),
         old_weights=old_weights_aligned,
         old_lots=old_lots,
+        old_prices_per_lot=old_signal_prices_per_lot,
+        old_cost_basis=old_cost_basis,
     )
 
     # 3. Evolusi genetika
     logger.info("=== MEMULAI EVOLUSI GENETIKA ===")
     engine = GeneticEngine(config)
     solution = engine.run(verbose=True)
+    if not solution.diversification_ok or not solution.budget_ok:
+        raise ValueError("GA tidak menghasilkan portofolio yang memenuhi batas saham dan budget.")
     
     # --- APPLY NO TRADE BAND ---
     if getattr(request, 'rebalance', False):
-        new_genes = apply_no_trade_band(solution.genes, old_weights_aligned, threshold=0.03)
-        solution.genes = new_genes
+        if config.allow_cash:
+            full_weights = (np.asarray(solution.genes) * solution.exposure).tolist()
+            new_weights = apply_no_trade_band(
+                full_weights, old_weights_aligned, threshold=0.03,
+                min_active=config.min_stocks, max_active=config.max_stocks,
+            )
+            solution.exposure = float(np.clip(
+                sum(new_weights), config.min_exposure, config.max_exposure
+            ))
+            solution.genes = new_weights
+        else:
+            solution.genes = apply_no_trade_band(
+                solution.genes, old_weights_aligned, threshold=0.03,
+                min_active=config.min_stocks, max_active=config.max_stocks,
+            )
         solution.normalize()
-        solution.lots = np.floor((np.array(solution.genes) * ga_budget) / market_data.prices_per_lot)
-        solution.n_active = np.sum(solution.lots > 0)
         # Re-evaluate fitness to update metrics after applying no-trade band
         solution.evaluate_fitness()
+        if not solution.diversification_ok or not solution.budget_ok:
+            raise ValueError("No-trade band melanggar batas saham atau budget.")
+
+    # The GA only knows decision-day prices in backtests. A higher execution
+    # Close can make the intended BUYs unaffordable; retain every planned sale
+    # and trim lowest-priority BUY lots before the snapshot is persisted.
+    desired_lots = {code: int(qty) for code, qty in
+                    zip(market_data.stock_codes, solution.lots) if qty > 0}
+    affordable_lots, _ = fit_buys_to_available_cash(
+        old_lots, desired_lots,
+        float(old_portfolio_res.sisa_budget) if old_portfolio_id else float(request.budget),
+        all_close_prices,
+        dict(zip(market_data.stock_codes, solution.genes)), config.min_stocks,
+    )
+    if affordable_lots != desired_lots:
+        logger.info("Menyesuaikan BUY lot ke kas tersedia pada harga eksekusi %s", execution_day)
+    solution.evaluate_fitness(lots_override=np.asarray(
+        [affordable_lots.get(code, 0) for code in market_data.stock_codes], dtype=int
+    ))
+    if not solution.diversification_ok or not solution.budget_ok:
+        raise ValueError("Lot eksekusi melanggar batas saham atau budget.")
 
     # 4. Susun laporan hasil
     codes = market_data.stock_codes
@@ -407,13 +454,15 @@ def generate_new_portfolio(
             new_lots=new_lots_dict,
             old_weights=old_weights_dict,
             new_weights=new_weights_dict,
-            eliminated_stocks=eliminated_stocks
+            eliminated_stocks=eliminated_stocks,
+            old_cost_basis=old_cost_basis,
+            execution_prices=all_close_prices,
         )
 
-    # Estimasi return tahunan dari alokasi aktual (bobot = alokasi / total)
+    # Estimasi return tahunan dari alokasi terhadap modal termasuk sisa kas.
     expected_return = None
     if total > 0 and market_data.returns.shape[0] >= solution.n_active:
-        aw = alloc / total
+        aw = alloc / float(request.budget)
         p_daily = (market_data.returns * aw[:, None]).sum(axis=0)
         p_daily = p_daily[~np.isnan(p_daily) & ~np.isinf(p_daily)]
         if p_daily.size:
@@ -1704,6 +1753,50 @@ def _apply_position_snapshot(
         if current_lots == 0:
             next_basis.pop(ticker, None)
     return next_basis, realized_pnl
+
+
+def _rebalance_cost_basis(
+    db: Session, portfolio: Portofolio, user_uuid: UUID,
+) -> dict[str, float | None]:
+    """Replay recorded lot deltas to recover the held positions' average cost.
+
+    Legacy fills without execution prices stay unknown. Live PATCH corrections
+    are applied to the remaining lots, matching the performance endpoint.
+    This is advisory GA input; it never rewrites cash or historical snapshots.
+    """
+    is_backtest = portfolio.status_portofolio in (
+        STATUS_ACTIVE_BACKTEST, STATUS_REPLACED_BACKTEST
+    )
+    positions: dict[str, int] = {}
+    basis: dict[str, float | None] = {}
+    for node in _portfolio_lineage(db, portfolio, user_uuid):
+        items = _snapshot_positions(db, node.id)
+        next_positions = {code: item["lots"] for code, item in items.items()}
+        raw_prices = node.execution_prices if isinstance(node.execution_prices, dict) else {}
+        prices: dict[str, float | None] = {}
+        for code in set(positions) | set(next_positions):
+            if positions.get(code, 0) == next_positions.get(code, 0):
+                continue
+            try:
+                price = float(raw_prices[code])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                price = None
+            prices[code] = price if price is not None and math.isfinite(price) and price > 0 else None
+        basis, _ = _apply_position_snapshot(positions, basis, next_positions, prices, 0.0)
+        if not is_backtest:
+            for code, item in items.items():
+                purchase = item["purchase_price"]
+                reference = item["reference_price"]
+                item_total = item["item_total"]
+                if (purchase is None or reference is None or item_total is None or
+                    not all(math.isfinite(x) and x > 0 for x in (purchase, reference, item_total))):
+                    continue
+                shares = item["lots"] * 100
+                if (abs(item_total - shares * purchase) <= 0.01 and
+                    abs(shares * purchase - shares * reference) > 0.01):
+                    basis[code] = purchase
+        positions = next_positions
+    return basis
 
 
 def get_portfolio_performance(
