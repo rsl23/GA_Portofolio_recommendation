@@ -1,5 +1,5 @@
-from pydantic import BaseModel, Field
-from typing import List, Optional, Generic, TypeVar
+from pydantic import BaseModel, Field, field_validator
+from typing import List, Optional, Generic, TypeVar, Literal
 from datetime import date, datetime
 
 # Tipe generik untuk payload di dalam envelope ApiResponse
@@ -17,6 +17,8 @@ class ApiResponse(BaseModel, Generic[T]):
 class PortfolioGenerateRequest(BaseModel):
     budget: float = Field(..., gt=0, description="Total modal investasi dalam IDR")
     risk_profile: str = Field(..., description="Konservatif, Moderat, atau Agresif")
+    name_portofolio: Optional[str] = Field(None, max_length=80, description="Nama portofolio agar mudah dikenali")
+    description: Optional[str] = Field(None, max_length=500, description="Catatan pribadi mengenai tujuan portofolio")
     backtest: bool = Field(False, description="Jika True, lakukan backtest portofolio terhadap data historis")
     date_ref: Optional[date] = Field(
         None,
@@ -25,6 +27,27 @@ class PortfolioGenerateRequest(BaseModel):
                     "langsung bisa dipakai oleh run_live_preprocessing/build_market_data.",
     )
     rebalance: bool = Field(False, description="Jika True, lakukan rebalancing dari portofolio aktif saat ini")
+    contribution_amount: float = Field(0, ge=0, description="Setoran tambahan pada rebalance backtest (IDR)")
+    bear_management: bool = False
+    bear_choice: Optional[Literal["recommended", "full"]] = None
+    bear_preview_as_of: Optional[date] = None
+    bear_preview_fingerprint: Optional[str] = None
+
+    @field_validator("name_portofolio")
+    @classmethod
+    def validate_name(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None and not value.strip():
+            raise ValueError("Nama portofolio tidak boleh kosong.")
+        return value.strip() if value is not None else None
+
+    @field_validator("description")
+    @classmethod
+    def clean_description(cls, value: Optional[str]) -> Optional[str]:
+        return value.strip() or None if value is not None else None
+
+
+class AddCapitalRequest(BaseModel):
+    amount: float = Field(..., gt=0, description="Setoran modal live dalam IDR; tersedia pada rebalance berikutnya")
 
 # Satu baris alokasi saham di dalam portofolio hasil GA
 class PortfolioItem(BaseModel):
@@ -45,6 +68,8 @@ class UpdateHargaBeliRequest(BaseModel):
 # Baris riwayat portofolio (ringkasan, tanpa alokasi detail)
 class PortfolioHistoryItem(BaseModel):
     id: str
+    name_portofolio: Optional[str] = None
+    description: Optional[str] = None
     budget: float
     total_terpakai: Optional[float]
     sisa_budget: Optional[float]
@@ -75,6 +100,10 @@ class RebalanceDeltaItem(BaseModel):
 
 class PortfolioResponse(BaseModel):
     id: str
+    parent_portofolio_id: Optional[str] = None
+    execution_date: Optional[date] = None
+    name_portofolio: Optional[str] = None
+    description: Optional[str] = None
     user_id: Optional[str] = None                 # pemilik portofolio (dari DB)
     fitness_score: float
     sharpe_ratio: Optional[float]
@@ -92,6 +121,8 @@ class PortfolioResponse(BaseModel):
     date_ref: Optional[datetime] = None           # acuan tanggal portofolio (dari DB):
                                                   # backtest = tanggal simulasi, live = waktu generate
     budget: float
+    pending_deposit: float = 0
+    capital_contribution: float = 0
     allocations: List[PortfolioItem] = []
     narasi_llm: Optional[str]
     rebalance_deltas: Optional[List[RebalanceDeltaItem]] = None
@@ -111,6 +142,8 @@ class PortfolioResponse(BaseModel):
 class RebalanceSeriesGenerateRequest(BaseModel):
     budget: float = Field(..., gt=0, description="Modal awal portofolio pada start_date (IDR)")
     risk_profile: str = Field(..., description="Konservatif, Moderat, atau Agresif")
+    name_portofolio: Optional[str] = Field(None, max_length=80)
+    description: Optional[str] = Field(None, max_length=500)
     start_date: date = Field(
         ..., description="Tanggal generate portofolio awal (YYYY-MM-DD), mis. 2022-01-03"
     )
@@ -121,6 +154,22 @@ class RebalanceSeriesGenerateRequest(BaseModel):
         2, ge=1, le=12,
         description="Jeda antar rebalance dalam bulan (2 = tiap 2 bulan).",
     )
+    contribution_amount: float = Field(0, ge=0, description="Nominal setoran berkala (IDR)")
+    contribution_interval_months: Optional[int] = Field(None, ge=1, le=12, description="Setor tiap N bulan sejak start_date, dimulai bulan berikutnya")
+    bear_management: bool = False
+    bear_choices: Optional[dict[date, Literal["recommended", "full"]]] = None
+    bear_preview_dates: Optional[dict[date, date]] = None
+    bear_preview_fingerprints: Optional[dict[date, str]] = None
+
+    @field_validator("name_portofolio")
+    @classmethod
+    def validate_name(cls, value: Optional[str]) -> Optional[str]:
+        return PortfolioGenerateRequest.validate_name(value)
+
+    @field_validator("description")
+    @classmethod
+    def clean_description(cls, value: Optional[str]) -> Optional[str]:
+        return PortfolioGenerateRequest.clean_description(value)
 
 
 class SkippedRebalanceStep(BaseModel):
@@ -137,3 +186,4 @@ class RebalanceSeriesResponse(BaseModel):
     scheduled_dates: List[date]              # seluruh tanggal terjadwal
     portfolios: List[PortfolioResponse]      # yang berhasil, urut dari start_date
     skipped: List[SkippedRebalanceStep] = [] # tanggal yang dilewati + alasan
+    evaluation_mode: str = "legacy"  # automatic_strategy / what_if / legacy

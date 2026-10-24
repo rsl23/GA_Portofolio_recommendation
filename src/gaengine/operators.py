@@ -21,73 +21,73 @@ def tournament_select(population, k: int = 5, rng=None):
     return best
 
 #  ini menggunakan crossover yang biasa saja, tidak memperhatikan saham yg aktif
-def two_point_crossover(parent_a, parent_b, rng=None):
-    """Swap the gene segment between two random cut points; return two children."""
-    rng = _rng(rng)
-    n = len(parent_a.genes)
-    if n >= 2:
-        i, j = sorted(rng.integers(0, n, size=2).tolist())
-        if i == j:
-            j = min(n - 1, i + 1)
-    else:
-        i = j = 0
-
-    ga = list(parent_a.genes)
-    gb = list(parent_b.genes)
-    ga[i:j], gb[i:j] = gb[i:j], ga[i:j]
-
-    child_a = parent_a.clone()
-    child_b = parent_b.clone()
-    child_a.genes = ga
-    child_b.genes = gb
-    child_a.fitness = None
-    child_b.fitness = None
-    return child_a, child_b
-
-# Ini untuk crossover yang menggunakan saham" yg aktif saja letak titik potongnya
 # def two_point_crossover(parent_a, parent_b, rng=None):
-#     """
-#     Smart Two-Point Crossover: 
-#     Menjamin segmen yang ditukar mengandung gen (saham) yang aktif.
-#     """
+#     """Swap the gene segment between two random cut points; return two children."""
 #     rng = _rng(rng)
 #     n = len(parent_a.genes)
-    
-#     # 1. CARI "HOT ZONE" (Lokasi saham yang diisi uang oleh Parent A atau B)
-#     active_indices = [
-#         idx for idx in range(n) 
-#         if parent_a.genes[idx] > 1e-6 or parent_b.genes[idx] > 1e-6
-#     ]
-    
-#     # 2. PENENTUAN TITIK POTONG CERDAS
-#     if len(active_indices) >= 2:
-#         # Pilih 2 lokasi aktif secara acak sebagai titik potong
-#         pt1 = int(rng.choice(active_indices))
-#         pt2 = int(rng.choice(active_indices))
-        
-#         i, j = sorted([pt1, pt2])
-#         # Lebarkan titik j sedikit agar saham di titik j ikut tertukar
-#         j = min(n, j + 1) 
-#     else:
-#         # Fallback (Jaga-jaga) menggunakan cara acak normal
+#     if n >= 2:
 #         i, j = sorted(rng.integers(0, n, size=2).tolist())
 #         if i == j:
 #             j = min(n - 1, i + 1)
+#     else:
+#         i = j = 0
 
-#     # 3. PROSES KAWIN SILANG (Murni Two-Point Crossover)
 #     ga = list(parent_a.genes)
 #     gb = list(parent_b.genes)
 #     ga[i:j], gb[i:j] = gb[i:j], ga[i:j]
 
-#     # 4. PEMBENTUKAN ANAK KROMOSOM
 #     child_a = parent_a.clone()
 #     child_b = parent_b.clone()
 #     child_a.genes = ga
 #     child_b.genes = gb
 #     child_a.fitness = None
 #     child_b.fitness = None
-    
 #     return child_a, child_b
+
+# Ini untuk crossover yang menggunakan saham" yg aktif saja letak titik potongnya
+def two_point_crossover(parent_a, parent_b, rng=None):
+    """
+    Smart Two-Point Crossover: 
+    Menjamin segmen yang ditukar mengandung gen (saham) yang aktif.
+    """
+    rng = _rng(rng)
+    n = len(parent_a.genes)
+    
+    # 1. CARI "HOT ZONE" (Lokasi saham yang diisi uang oleh Parent A atau B)
+    active_indices = [
+        idx for idx in range(n) 
+        if parent_a.genes[idx] > 1e-6 or parent_b.genes[idx] > 1e-6
+    ]
+    
+    # 2. PENENTUAN TITIK POTONG CERDAS
+    if len(active_indices) >= 2:
+        # Pilih 2 lokasi aktif secara acak sebagai titik potong
+        pt1 = int(rng.choice(active_indices))
+        pt2 = int(rng.choice(active_indices))
+        
+        i, j = sorted([pt1, pt2])
+        # Lebarkan titik j sedikit agar saham di titik j ikut tertukar
+        j = min(n, j + 1) 
+    else:
+        # Fallback (Jaga-jaga) menggunakan cara acak normal
+        i, j = sorted(rng.integers(0, n, size=2).tolist())
+        if i == j:
+            j = min(n - 1, i + 1)
+
+    # 3. PROSES KAWIN SILANG (Murni Two-Point Crossover)
+    ga = list(parent_a.genes)
+    gb = list(parent_b.genes)
+    ga[i:j], gb[i:j] = gb[i:j], ga[i:j]
+
+    # 4. PEMBENTUKAN ANAK KROMOSOM
+    child_a = parent_a.clone()
+    child_b = parent_b.clone()
+    child_a.genes = ga
+    child_b.genes = gb
+    child_a.fitness = None
+    child_b.fitness = None
+    
+    return child_a, child_b
 
 
 def adaptive_hybrid_mutation(chromosome, generation: int, max_generation: int, rng=None):

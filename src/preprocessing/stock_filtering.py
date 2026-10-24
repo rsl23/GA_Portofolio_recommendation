@@ -576,9 +576,16 @@ def load_backtest_data(date_ref: date):
     df_ohlcv['Ticker'] = df_ohlcv['Ticker'].astype(str).str.replace('.JK', '', regex=False)
 
     ts_ref = pd.Timestamp(date_ref)
+    traded_days = set(df_ohlcv.loc[
+        (df_ohlcv['Date'] <= ts_ref) &
+        (df_ohlcv['Date'] > ts_ref - timedelta(days=120)) &
+        (pd.to_numeric(df_ohlcv['Volume'], errors='coerce') > 0),
+        'Date',
+    ])
     window = df_ohlcv[
         (df_ohlcv['Date'] <= ts_ref) &
-        (df_ohlcv['Date'] > ts_ref - timedelta(days=120))
+        (df_ohlcv['Date'] > ts_ref - timedelta(days=120)) &
+        (df_ohlcv['Date'].isin(traded_days))
     ]
     window = window[window['Ticker'].isin(tickers_valid)]
 

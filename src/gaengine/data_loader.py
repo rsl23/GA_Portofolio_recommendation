@@ -25,10 +25,13 @@ Penggunaan:
 from __future__ import annotations
 
 import logging
+import csv
+import io
 import os
 import time
+import zipfile
 from io import StringIO
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -60,6 +63,7 @@ FUND_FILE        = DATA_DIR / "fundamental_quarterly.parquet"
 DIVIDEND_FILE    = DATA_DIR / "dividend_events_20_tahun.xlsx"
 RISKFREE_FILE    = DATA_DIR / "BI-7Day-RR.xlsx"
 BI_RATE_PAGE_URL = "https://www.bi.go.id/id/statistik/indikator/bi-rate.aspx"
+BIS_CBPOL_URL = "https://data.bis.org/static/bulk/WS_CBPOL_csv_flat.zip"
 
 # Window return default: 1 tahun (paritas dengan period="1y" yfinance di LIVE).
 DEFAULT_LOOKBACK_DAYS = 365
@@ -247,7 +251,12 @@ def take_ohlcv_data():
         print(f"Mempersiapkan unduhan OHLCV 1 tahun untuk {len(daftar_kode)} saham dari yfinance...")
 
         yf_tickers = [f"{kode}.JK" for kode in daftar_kode]
-        df_ohlcv = yf.download(yf_tickers, period="1y", interval="1d")
+        # Execution and valuation use raw Close, not a dividend/split-adjusted
+        # series whose price cannot represent a simulated trade.
+        df_ohlcv = yf.download(
+            yf_tickers, period="1y", interval="1d",
+            auto_adjust=False, progress=False,
+        )
 
         print("Data OHLCV berhasil diunduh!")
         return df_ohlcv
@@ -322,31 +331,40 @@ def take_bi_rate():
         return float(rf)
     logger.warning("take_bi_rate: API ZAPI tidak menyediakan BI rate valid; mencoba situs BI")
     try:
-        response = requests.get(BI_RATE_PAGE_URL, timeout=20)
+        response = requests.get(BIS_CBPOL_URL, timeout=120)
         response.raise_for_status()
-        for table in pd.read_html(StringIO(response.text)):
-            columns = {str(column).strip(): column for column in table.columns}
-            if "BI-Rate" not in columns or "Tanggal" not in columns:
-                continue
-            dated_rates = []
-            for _, row in table.iterrows():
-                published = _parse_tanggal_id(row[columns["Tanggal"]])
-                raw = str(row[columns["BI-Rate"]]).replace("%", "").replace(",", ".").strip()
-                try:
-                    percent = float(raw)
-                except ValueError:
+        latest = None
+        with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+            for name in archive.namelist():
+                if not name.lower().endswith(".csv"):
                     continue
-                if published is not None and published <= date.today() and np.isfinite(percent) and 0 < percent < 100:
-                    dated_rates.append((published, percent))
-            if dated_rates:
-                published, percent = max(dated_rates)
-                rf = percent / 100.0
-                logger.info("take_bi_rate: situs BI tanggal=%s -> risk_free=%s", published, _fmt_rf(rf))
-                return rf
-        logger.warning("take_bi_rate: tabel Tanggal/BI-Rate situs BI tidak berisi nilai valid")
+                with archive.open(name) as raw_file:
+                    reader = csv.DictReader(io.TextIOWrapper(raw_file, encoding="utf-8-sig"))
+                    columns = {column.split(":", 1)[0].strip(): column
+                               for column in (reader.fieldnames or [])}
+                    if not {"FREQ", "REF_AREA", "TIME_PERIOD", "OBS_VALUE"}.issubset(columns):
+                        continue
+                    for row in reader:
+                        if (row[columns["FREQ"]] or "").split(":", 1)[0].strip() != "D":
+                            continue
+                        if (row[columns["REF_AREA"]] or "").split(":", 1)[0].strip() != "ID":
+                            continue
+                        try:
+                            published = date.fromisoformat((row[columns["TIME_PERIOD"]] or "").strip())
+                            percent = float((row[columns["OBS_VALUE"]] or "").strip())
+                        except ValueError:
+                            continue
+                        if published <= date.today() and np.isfinite(percent) and 0 < percent < 100:
+                            if latest is None or published > latest[0]:
+                                latest = (published, percent)
+        if latest is not None:
+            published, percent = latest
+            rf = percent / 100.0
+            logger.info("take_bi_rate: BIS tanggal=%s -> risk_free=%s", published, _fmt_rf(rf))
+            return rf
+        logger.warning("take_bi_rate: BIS tidak menyediakan BI rate harian Indonesia yang valid")
     except Exception as e:
-        logger.warning("take_bi_rate: situs BI gagal (%s)", e)
-        return None
+        logger.warning("take_bi_rate: BIS gagal (%s)", e)
     return None
 
 
@@ -585,9 +603,33 @@ def _provide_backtest_data(date_ref: date, lookback_days: int):
     df_price["Ticker"] = df_price["Ticker"].astype(str).str.replace(".JK", "", regex=False)
 
     ts_ref = pd.Timestamp(date_ref)
+    # Some source files include carried-forward OHLCV bars on exchange holidays.
+    # A session exists only if at least one stock actually traded that day.
+    volume = pd.to_numeric(df_price["Volume"], errors="coerce")
+    traded_days = set(df_price.loc[
+        (df_price["Date"] <= ts_ref) &
+        (df_price["Date"] > ts_ref - pd.Timedelta(days=lookback_days)) &
+        (volume > 0),
+        "Date",
+    ])
+    if not traded_days:
+        raise ValueError(f"Tidak ada hari dengan volume perdagangan hingga {date_ref}.")
+    last_session = max(traded_days)
+    traded_codes = set(df_price.loc[
+        (df_price["Date"] == last_session) & (volume > 0), "Ticker",
+    ])
+    unavailable = sorted(set(codes) - traded_codes)
+    if unavailable:
+        logger.info("[BACKTEST] %d kandidat tidak berdagang pada hari keputusan %s; "
+                    "dikeluarkan sebelum GA: %s", len(unavailable), last_session.date(),
+                    unavailable[:TRACE_SAMPLE])
+    codes = [code for code in codes if code in traded_codes]
+    if not codes:
+        raise ValueError(f"Tidak ada kandidat yang berdagang pada {last_session.date()}.")
     window = df_price[
         (df_price["Date"] <= ts_ref) &
         (df_price["Date"] > ts_ref - pd.Timedelta(days=lookback_days)) &
+        (df_price["Date"].isin(traded_days)) &
         (df_price["Ticker"].isin(codes))
     ]
     if window.empty:
@@ -688,8 +730,17 @@ def _provide_live_data():
     if df_ohlcv is None or df_ohlcv.empty:
         return None, {}, None, pd.Series(dtype=float)
 
-    # Close: forward-fill untuk hari libur bursa, lalu buang suffix '.JK'
-    df_close = df_ohlcv["Close"].ffill()
+    # Yahoo may expose an incomplete current-day bar before the IDX session
+    # and its data feed have settled. Execute only from a completed WIB session.
+    now_wib = datetime.now(timezone(timedelta(hours=7)))
+    last_completed = now_wib.date() if now_wib.hour >= 17 else now_wib.date() - timedelta(days=1)
+    df_ohlcv = df_ohlcv.loc[pd.to_datetime(df_ohlcv.index).date <= last_completed]
+    if df_ohlcv.empty:
+        return None, {}, None, pd.Series(dtype=float)
+
+    # Keep the final Close raw. A ticker missing on the execution session must
+    # not become a tradable candidate via forward-fill; returns are filled later.
+    df_close = df_ohlcv["Close"]
     df_close.columns = [str(c).replace(".JK", "") for c in df_close.columns]
 
     # Likuiditas = ADTV 60 HARI BURSA TERAKHIR (ETV = Close x Volume).
@@ -772,6 +823,7 @@ def _assemble_market_data(
     if df_close is None or df_close.empty or not metrics_map:
         print("Error: Data OHLCV / fundamental kosong. Perakitan dibatalkan.")
         return None
+    df_close = df_close.sort_index()
 
     # 1. Kandidat: ada di OHLCV & fundamental, harga terakhir >= min_price
     candidates = [
@@ -829,6 +881,7 @@ def _assemble_market_data(
         fundamental_scores=fundamental_scores,
         fundamental_metrics=fundamental_metrics,
         risk_free_rate=rf,
+        price_date=pd.Timestamp(df_close.index[-1]).date(),
     )
 
 

@@ -12,6 +12,7 @@ class User(Base):
     username = Column(String(50), unique=True, nullable=False)
     email = Column(String(100), unique=True, nullable=False)
     password_hash = Column(String(128), nullable=False)
+    bear_allocation_policy = Column(String(20), nullable=False, default="manual")
     created_at = Column(DateTime, default=datetime.utcnow)
 
     portofolios = relationship("Portofolio", back_populates="user")

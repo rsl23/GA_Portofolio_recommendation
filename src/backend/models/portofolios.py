@@ -15,6 +15,9 @@ class Portofolio(Base):
     budget = Column(Float, nullable=False)
     total_terpakai = Column(Float, nullable=False)
     sisa_budget = Column(Float, nullable=False)
+    # Setoran live menunggu rebalance; setoran yang sudah dipakai dicatat di snapshot baru.
+    pending_deposit = Column(Float, nullable=False, default=0.0)
+    capital_contribution = Column(Float, nullable=False, default=0.0)
     
     # metrik fitness
     fitness_score = Column(Float, nullable=False)
@@ -25,6 +28,8 @@ class Portofolio(Base):
 
     # profil risiko saat portofolio digenerate (Conservative, Moderate, Aggressive)
     risk_profile = Column(String(50), nullable=False, default="Moderate")
+    name_portofolio = Column(String(80), nullable=True)
+    description = Column(Text, nullable=True)
     
     # bobot pengali fitness
     mdd_lambda = Column(Float, nullable=False, default=1.0)
