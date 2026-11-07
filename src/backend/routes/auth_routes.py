@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
+from uuid import UUID
 
 from src.backend.core.deps import get_current_user, get_refresh_payload
 from src.backend.models.database import get_db
@@ -8,7 +9,9 @@ from src.backend.models.schemas.auth_schema import (
     MessageResponse,
     SignupRequest,
     TokenResponse,
+    UserProfileResponse,
 )
+from src.backend.models.users import User
 from src.backend.models.schemas.portfolio_schema import ApiResponse
 from src.backend.controller.auth_controller import (
     InvalidCredentialsError,
@@ -61,12 +64,22 @@ def api_refresh_token(
         raise HTTPException(status_code=401, detail=str(e))
     return ApiResponse(status="success", message="Access token berhasil diperbarui.", data=token)
 
-@router.get("/me", response_model=ApiResponse[MessageResponse])
-def api_me(current_user: dict = Depends(get_current_user)):
+@router.get("/me", response_model=ApiResponse[UserProfileResponse])
+def api_me(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     """
-    Contoh endpoint terproteksi: hanya menerima ACCESS token.
-    Mengembalikan identitas user dari payload JWT.
+    Ambil profil akun berdasarkan ID di access token yang telah divalidasi.
     """
-    data = MessageResponse(detail=f"user_id={current_user['sub']}, email={current_user['email']}")
+    user = db.query(User).filter(User.id == UUID(current_user["sub"])).first()
+    if user is None:
+        raise HTTPException(status_code=404, detail="Pengguna tidak ditemukan.")
+    data = UserProfileResponse(
+        id=user.id,
+        name=user.username,
+        email=user.email,
+        detail=f"user_id={user.id}, email={user.email}",
+    )
     return ApiResponse(status="success", message="Token valid.", data=data)
 
