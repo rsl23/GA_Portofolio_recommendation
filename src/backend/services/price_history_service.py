@@ -113,10 +113,13 @@ def _get_holdings_since(db: Session) -> list[tuple]:
             PortofolioItem.stock_id,
             StockUniverse.ticker,
             func.min(
-                func.coalesce(
+                func.date(func.coalesce(
+                    Portofolio.execution_date,
+                    PortofolioItem.start_date,
+                    Portofolio.date_ref,
                     Portofolio.created_at,
                     func.now(),
-                )
+                ))
             ).label("first_buy"),
         )
         .join(
@@ -135,23 +138,27 @@ def _get_holdings_since(db: Session) -> list[tuple]:
     )
 
     return [
-        (r.stock_id, r.ticker, r.first_buy)
+        (r.stock_id, r.ticker, _calendar_date(r.first_buy))
         for r in rows
     ]
 
 
+def _calendar_date(value):
+    if value is None or isinstance(value, date) and not hasattr(value, 'date'):
+        return value
+    return value.date() if hasattr(value, 'date') else date.fromisoformat(str(value)[:10])
+
+
 def _get_earliest_portfolio_date(db: Session):
     """
-    Tanggal pembentukan portofolio TERAWAL dari semua user
+    Tanggal eksekusi efektif TERAWAL, fallback jadwal/pembuatan, dari semua user
     (batas awal data IHSG).
     """
-    dt = db.query(func.min(Portofolio.created_at)).scalar()
+    dt = db.query(func.min(func.date(func.coalesce(
+        Portofolio.execution_date, Portofolio.date_ref, Portofolio.created_at,
+    )))).scalar()
 
-    return (
-        dt.date()
-        if dt is not None and hasattr(dt, "date")
-        else dt
-    )
+    return _calendar_date(dt)
 
 
 def _sync_idx_composite(
@@ -289,10 +296,11 @@ def _sync_idx_composite(
         return 0
 
 
-def sync_market_data(db: Session) -> dict:
+def sync_market_data(db: Session, stock_ids: list | None = None) -> dict:
     """
     Sinkronisasi histori harga harian (OHLCV) via yfinance untuk semua saham
     yang pernah dibeli user.
+    Bila stock_ids diberikan, hanya saham tersebut yang dilengkapi.
 
     Rentang:
         - dari tanggal pembelian TERAWAL portofolio yang memuat saham tsb
@@ -316,7 +324,13 @@ def sync_market_data(db: Session) -> dict:
         }
     """
 
-    earliest_portfolio_date = _get_earliest_portfolio_date(db)
+    holdings = _get_holdings_since(db)
+    if stock_ids is not None:
+        selected = {str(value) for value in stock_ids}
+        holdings = [row for row in holdings if str(row[0]) in selected]
+        earliest_portfolio_date = min((row[2] for row in holdings), default=None)
+    else:
+        earliest_portfolio_date = _get_earliest_portfolio_date(db)
 
     if earliest_portfolio_date is None:
         logger.info(
@@ -372,8 +386,6 @@ def sync_market_data(db: Session) -> dict:
     # ============================================================
     # 3. Ambil semua saham yang pernah dimiliki
     # ============================================================
-    holdings = _get_holdings_since(db)
-
     for stock_id, ticker, first_buy in holdings:
         start_date = (
             first_buy.date()
