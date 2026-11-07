@@ -54,14 +54,18 @@ FUNDAMENTAL_LABELS: Tuple[str, ...] = (
 
 # Penjelasan rumus fitness yang benar-benar dipakai Chromosome.evaluate_fitness.
 FITNESS_FORMULA_TEXT = (
-    "Fitness = Sharpe - lambda*|MDD| - gamma*RataKorelasi + alpha*SkorFundamental "
-    "- DeathPenalty_Budget - DeathPenalty_Diversifikasi"
+    "Fitness = SharpePenilaian - lambda*KomponenRisiko - PenaltiBuktiHilang "
+    "- gamma*RataKorelasi + alpha*SkorFundamental - PenaltiTurnover "
+    "+ BonusDividen + BonusMomentum + UtilityRebalance + RewardReturnNAV "
+    "- DeathPenalty_Budget - DeathPenalty_Diversifikasi. "
+    "KomponenRisiko menggunakan campuran MDD residual dan risiko beberapa event IHSG "
+    "bila tersedia; tanpa bukti event, memakai MDD penuh."
 )
 
 # Peran tiap koefisien, supaya LLM menjelaskan bobot penalti dengan tepat.
 COEFFICIENT_NOTES = {
-    "lambda_mdd": "lambda = bobot penalti maximum drawdown (makin besar = makin "
-                  "menghindari risiko turun dalam; ditentukan profil risiko).",
+    "lambda_mdd": "lambda = bobot penalti risiko historis (MDD residual dan stress jika "
+                  "model market_stress aktif; ditentukan profil risiko).",
     "gamma_korelasi": "gamma = bobot penalti korelasi rata-rata antar saham "
                       "(makin besar = makin menekan risiko portofolio bergerak seragam).",
     "alpha_fundamental": "alpha = bobot bonus skor fundamental (PER/PBV/ROE/DER/DivYield "
@@ -258,8 +262,9 @@ def _fitness_breakdown(solution, config, indices: Sequence[int]) -> Dict[str, An
     alpha = float(getattr(config, "fundamental_bonus", 0.0) or 0.0)
     death = float(getattr(config, "death_penalty", 0.0) or 0.0)
 
-    sharpe = _num(getattr(solution, "sharpe_ratio", None)) or 0.0
-    mdd = abs(_num(getattr(solution, "max_drawdown", None)) or 0.0)
+    sharpe = float(getattr(solution, "score_sharpe", getattr(solution, "sharpe_ratio", 0)) or 0)
+    risk_component = getattr(solution, "risk_component", None)
+    mdd = float(risk_component if risk_component is not None else (getattr(solution, "max_drawdown", 0) or 0))
     avg_corr = _num(getattr(solution, "avg_correlation", None)) or 0.0
     funda = _num(getattr(solution, "skor_fundamental", None)) or 0.0
 
@@ -276,8 +281,15 @@ def _fitness_breakdown(solution, config, indices: Sequence[int]) -> Dict[str, An
         "penalti_max_drawdown": _num(penalti_mdd),
         "penalti_korelasi": _num(penalti_korelasi),
         "bonus_fundamental": _num(bonus_fundamental),
+        "bonus_dividen": _num(getattr(solution, "dividend_bonus", 0.0)),
         "penalti_budget": _num(penalti_budget),
         "penalti_diversifikasi": _num(penalti_div),
+        "penalti_bukti_hilang": _num(-getattr(solution, "market_stress_missing_penalty", 0.0)),
+        "penalti_turnover": _num(-getattr(config, "turnover_penalty_beta", 0.0) * getattr(solution, "turnover_rate", 0.0)),
+        "bonus_momentum": _num(getattr(config, "momentum_bonus", 0.0) * getattr(solution, "momentum_score", 0.0)),
+        "utility_rebalance": _num(getattr(config, "rebalance_utility_weight", 0.0) * getattr(solution, "rebalance_utility", 0.0)),
+        "reward_return_nav": _num(getattr(config, "cash_return_weight", 0.0) * getattr(solution, "roi_annual", 0.0)
+                                 if getattr(config, "allow_cash", False) and config.fitness_mode != "baseline" else 0.0),
     }
     total = _num(getattr(solution, "fitness", None))
     jumlah_komponen = _num(sum(v for v in komponen.values() if v is not None))
@@ -293,6 +305,8 @@ def _fitness_breakdown(solution, config, indices: Sequence[int]) -> Dict[str, An
             "lambda_mdd": _num(lam),
             "gamma_korelasi": _num(gamma),
             "alpha_fundamental": _num(alpha),
+            "bobot_dividen": _num(getattr(config, "dividend_bonus_weight", 0.0)),
+            "batas_yield_dividen": _num(getattr(config, "dividend_yield_cap", 0.10)),
             "death_penalty": _num(death, 2),
         },
         "komponen": komponen,
@@ -519,6 +533,20 @@ def build_portfolio_context(
     }
     if rebalance_deltas is not None:
         context["rebalance_deltas"] = rebalance_deltas
+    evidence = getattr(market_data, "market_stress", None)
+    if evidence is not None:
+        context["uji_stress"] = {
+            "as_of": evidence.as_of.isoformat(), "history_end": str(evidence.history_end),
+            "lookback_years": evidence.lookback_years,
+            "window_start": evidence.window_start.isoformat(),
+            "window_end": evidence.as_of.isoformat(),
+            "status": evidence.status, "reason": evidence.reason, "events": evidence.events,
+            "risk_model": config.risk_model,
+            "mdd_residual_weight": config.mdd_residual_weight,
+            "stress_risk": getattr(solution, "market_stress_risk", None),
+            "coverage": getattr(solution, "market_stress_coverage", None),
+            "uncertainty_penalty": getattr(solution, "market_stress_missing_penalty", 0.0),
+        }
         
     context["catatan_otomatis"] = _auto_insights(context)
     return context
@@ -543,11 +571,13 @@ def _auto_insights(context: Dict[str, Any]) -> List[str]:
     else:
         catatan.append(
             "Fitness " + _num_str(kin["fitness"]) + " = Sharpe " + _num_str(komp["sharpe_ratio"])
-            + " + penalti MDD " + _num_str(komp["penalti_max_drawdown"])
+            + " + penalti risiko historis " + _num_str(komp["penalti_max_drawdown"])
             + " + penalti korelasi " + _num_str(komp["penalti_korelasi"])
             + " + bonus fundamental " + _num_str(komp["bonus_fundamental"])
             + " + penalti budget " + _num_str(komp["penalti_budget"])
             + " + penalti diversifikasi " + _num_str(komp["penalti_diversifikasi"])
+            + " + penalti bukti hilang " + _num_str(komp["penalti_bukti_hilang"])
+            + " + penalti turnover " + _num_str(komp["penalti_turnover"])
             + "."
         )
     if dek.get("komponen_paling_menentukan"):
@@ -678,7 +708,9 @@ def render_context_text(context: Dict[str, Any]) -> str:
     add("")
     add("TABEL 3 - DEKOMPOSISI FITNESS (jumlah komponen = nilai fitness)")
     add("Sharpe ratio (positif): " + _num_str(komp["sharpe_ratio"]))
-    add("Penalti MDD (lambda x |MDD|): " + _num_str(komp["penalti_max_drawdown"]))
+    add("Penalti risiko historis (lambda x KomponenRisiko; kunci legacy penalti_max_drawdown): " + _num_str(komp["penalti_max_drawdown"]))
+    for key in ("penalti_bukti_hilang", "penalti_turnover", "bonus_dividen", "bonus_momentum", "utility_rebalance", "reward_return_nav"):
+        add(key + ": " + _num_str(komp[key]))
     add("Penalti korelasi (gamma x rata2 korelasi): " + _num_str(komp["penalti_korelasi"]))
     add("Bonus fundamental (alpha x skor): " + _num_str(komp["bonus_fundamental"]))
     add("Penalti budget: " + _num_str(komp["penalti_budget"]))
@@ -746,6 +778,11 @@ def render_context_text(context: Dict[str, Any]) -> str:
         add("Catatan: realized P/L adalah akibat penjualan terhadap average cost, bukan alasan otomatis untuk menjual.")
         add("")
 
+    if "uji_stress" in context:
+        import json
+        add("BUKTI STRESS HISTORIS (return hipotetis untuk scoring; bukan transaksi/realized P/L):")
+        add(json.dumps(context["uji_stress"], ensure_ascii=False))
+        add("Data yang tidak tersedia berarti belum terbukti, bukan aman. Jangan mengarang penyebab berita suatu penurunan.")
     add("CATATAN TERHITUNG (fakta dari sistem, bukan opini):")
     for i, catatan in enumerate(context.get("catatan_otomatis", []), 1):
         add("  " + str(i) + ". " + str(catatan))
@@ -790,7 +827,7 @@ TASK_INSTRUCTIONS = (
     "\n"
     "1) GAMBARAN UMUM PORTOFOLIO\n"
     "Jelaskan secara singkat profil risiko, modal, jumlah saham terpilih, dan tujuan optimasi.\n"
-    "Jelaskan komponen utama fitness function secara singkat, yaitu Sharpe Ratio, penalti Maximum Drawdown, penalti korelasi, dan bonus fundamental.\n"
+    "Jelaskan komponen utama fitness sesuai dekomposisi: Sharpe, risiko MDD residual/stress historis, penalti bukti yang hilang, turnover, korelasi, dan fundamental. Gunakan BUKTI STRESS HISTORIS bila tersedia; data kurang tidak boleh disebut aman.\n"
     "Jangan menghabiskan sebagian besar narasi untuk menjelaskan mekanisme Algoritma Genetika seperti populasi, crossover, mutation, atau seleksi. Fokuskan penjelasan pada hasil pemilihan saham dan alasan finansial di baliknya.\n"
     "\n"
     "2) ANALISIS FINANSIAL SETIAP SAHAM TERPILIH\n"
@@ -826,7 +863,7 @@ TASK_INSTRUCTIONS = (
     "Setelah analisis setiap saham selesai, jelaskan bagaimana karakteristik saham-saham tersebut secara bersama-sama menghasilkan solusi portofolio yang dipilih.\n"
     "Hubungkan karakteristik saham dengan komponen fitness secara eksplisit:\n"
     "a. Sharpe Ratio menunjukkan hubungan antara excess return dan risiko portofolio.\n"
-    "b. Penalti Maximum Drawdown mengurangi fitness ketika risiko penurunan maksimum semakin besar.\n"
+    "b. Penalti risiko mengurangi fitness berdasarkan model aktif: MDD residual dan beberapa periode tekanan IHSG jika ada bukti, atau MDD penuh jika bukti tidak tersedia; penalti ketidakpastian dihitung terpisah.\n"
     "c. Penalti korelasi mengurangi fitness ketika saham-saham dalam portofolio memiliki korelasi yang semakin tinggi.\n"
     "d. Bonus fundamental meningkatkan fitness berdasarkan skor fundamental portofolio.\n"
     "e. Constraint budget dan diversifikasi memastikan solusi memenuhi batasan yang ditentukan.\n"

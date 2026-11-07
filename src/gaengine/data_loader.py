@@ -45,6 +45,7 @@ from src.backend.models.database import SessionLocal
 from src.backend.models.filtered_stocks_cache import FilteredStockCache
 from src.backend.services.api_bi import fetch_bi_rate
 from src.gaengine.market_data import MarketData
+from src.gaengine.market_stress import load_market_stress
 from src.preprocessing.stock_filtering import get_fiscal_period, run_live_preprocessing
 
 env_path = Path('.') / '.env'
@@ -882,6 +883,7 @@ def _assemble_market_data(
         fundamental_metrics=fundamental_metrics,
         risk_free_rate=rf,
         price_date=pd.Timestamp(df_close.index[-1]).date(),
+        return_dates=list(df_close.index),
     )
 
 
@@ -894,6 +896,8 @@ def build_market_data(
     backtest: bool = False,
     date_ref: Optional[date] = None,
     lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+    include_market_stress: bool = True,
+    include_profile_features: bool = False,
 ) -> Optional[MarketData]:
     """
     Rakit MarketData untuk GA engine.
@@ -904,6 +908,10 @@ def build_market_data(
         backtest      : False = data LIVE, True = data historis lokal.
         date_ref      : WAJIB untuk backtest; tanggal acuan backtest.
         lookback_days : panjang window return (default 365 hari = 1 tahun).
+        include_market_stress : tambahkan bukti beberapa krisis dari arsip lokal,
+                               selalu dipotong sampai sesi keputusan.
+        include_profile_features : bukti as-of untuk mode composition_v1;
+                                   saham inti adalah proxy, bukan daftar blue chip.
 
     Returns:
         MarketData, atau None bila data live tidak tersedia (mis. cache DB
@@ -928,6 +936,41 @@ def build_market_data(
     )
 
     if market_data is not None:
+        if include_profile_features:
+            from .profile_features import build_profile_features
+            from src.backend.models.stock_universe import StockUniverse
+            with SessionLocal() as session:
+                sector_map = {ticker: sector for ticker, sector in session.query(
+                    StockUniverse.ticker, StockUniverse.sektor).all()}
+            market_data.profile_features = build_profile_features(
+                market_data, df_close, liquidity, DATA_DIR, sector_map,
+            )
+        # Explicit dividend reward uses the same as-of archive in live/backtest;
+        # live cache dividend_yield has mixed provider units, so do not use it.
+        dividend_date = market_data.price_date
+        if backtest and date_ref is not None:
+            dividend_date = min(dividend_date, pd.Timestamp(date_ref).date())
+        try:
+            div_yields = _load_dividend_yields(
+                market_data.stock_codes, dividend_date,
+                pd.Series(market_data.prices_per_lot / 100, index=market_data.stock_codes),
+            )
+            market_data.dividend_yields = np.array([div_yields.get(c, np.nan) for c in market_data.stock_codes])
+        except (OSError, ValueError, ImportError, KeyError) as exc:
+            logger.warning("Bonus dividen tidak tersedia; tidak diberi reward: %s", exc)
+            market_data.dividend_yields = np.full(market_data.n_stocks, np.nan)
+        if include_market_stress:
+            decision_date = market_data.price_date
+            if backtest and date_ref is not None:
+                decision_date = min(decision_date, pd.Timestamp(date_ref).date())
+            market_data.market_stress = load_market_stress(
+                market_data.stock_codes, decision_date, DATA_DIR,
+            )
+            evidence = market_data.market_stress
+            logger.info("[STRESS] as_of=%s lookback=%dy window_start=%s archive_end=%s events=%d status=%s | %s",
+                        evidence.as_of, evidence.lookback_years,
+                        evidence.window_start, evidence.history_end, len(evidence.events),
+                        evidence.status, evidence.reason or "historical evidence ready")
         mode = f"BACKTEST {date_ref}" if backtest else "LIVE"
         print(f"[DataLoader] MarketData {mode} siap: {market_data.n_stocks} saham, "
               f"returns {market_data.returns.shape[0]}x{market_data.returns.shape[1]}, "
