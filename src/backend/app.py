@@ -53,6 +53,48 @@ def scheduled_daily_refresh() -> None:
         traceback.print_exc()
 
 
+def _ensure_portfolio_columns(database_engine) -> None:
+    """Tambahkan kolom snapshot baru pada instalasi dengan tabel portofolios lama."""
+    existing = {column["name"] for column in inspect(database_engine).get_columns("portofolios")}
+    with database_engine.begin() as connection:
+        optional = "IF NOT EXISTS " if database_engine.dialect.name == "postgresql" else ""
+        if "execution_date" not in existing:
+            connection.execute(text(f"ALTER TABLE portofolios ADD COLUMN {optional}execution_date DATE"))
+        if "execution_prices" not in existing:
+            price_type = "JSONB" if database_engine.dialect.name == "postgresql" else "JSON"
+            connection.execute(text(f"ALTER TABLE portofolios ADD COLUMN {optional}execution_prices {price_type}"))
+        if "pending_deposit" not in existing:
+            connection.execute(text(
+                f"ALTER TABLE portofolios ADD COLUMN {optional}pending_deposit "
+                "DOUBLE PRECISION NOT NULL DEFAULT 0"
+            ))
+        if "capital_contribution" not in existing:
+            connection.execute(text(
+                f"ALTER TABLE portofolios ADD COLUMN {optional}capital_contribution "
+                "DOUBLE PRECISION NOT NULL DEFAULT 0"
+            ))
+        if "name_portofolio" not in existing:
+            connection.execute(text(f"ALTER TABLE portofolios ADD COLUMN {optional}name_portofolio VARCHAR(80)"))
+        if "description" not in existing:
+            connection.execute(text(f"ALTER TABLE portofolios ADD COLUMN {optional}description TEXT"))
+        if "transaction_costs" not in existing:
+            connection.execute(text(f"ALTER TABLE portofolios ADD COLUMN {optional}transaction_costs DOUBLE PRECISION NOT NULL DEFAULT 0"))
+        if "rebalance_metadata" not in existing:
+            data_type="JSONB" if database_engine.dialect.name=="postgresql" else "JSON"
+            connection.execute(text(f"ALTER TABLE portofolios ADD COLUMN {optional}rebalance_metadata {data_type}"))
+
+
+def _ensure_user_columns(database_engine) -> None:
+    existing = {column["name"] for column in inspect(database_engine).get_columns("users")}
+    if "bear_allocation_policy" not in existing:
+        optional = "IF NOT EXISTS " if database_engine.dialect.name == "postgresql" else ""
+        with database_engine.begin() as connection:
+            connection.execute(text(
+                f"ALTER TABLE users ADD COLUMN {optional}bear_allocation_policy VARCHAR(20) "
+                "NOT NULL DEFAULT 'manual'"
+            ))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 1. Generate tabel saat startup (lebih aman di sini daripada global scope)
@@ -60,14 +102,8 @@ async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
     # create_all does not add columns to existing installations. Keep the
     # additive accounting migration idempotent for deployments without Alembic.
-    existing = {column["name"] for column in inspect(engine).get_columns("portofolios")}
-    with engine.begin() as connection:
-        optional = "IF NOT EXISTS " if engine.dialect.name == "postgresql" else ""
-        if "execution_date" not in existing:
-            connection.execute(text(f"ALTER TABLE portofolios ADD COLUMN {optional}execution_date DATE"))
-        if "execution_prices" not in existing:
-            price_type = "JSONB" if engine.dialect.name == "postgresql" else "JSON"
-            connection.execute(text(f"ALTER TABLE portofolios ADD COLUMN {optional}execution_prices {price_type}"))
+    _ensure_portfolio_columns(engine)
+    _ensure_user_columns(engine)
 
     # 2. Load data pasar ke memori untuk engine Algoritma Genetika
     print("Memuat MarketData ke RAM...")
