@@ -1,145 +1,220 @@
-from pathlib import Path
-import pandas as pd
-import yfinance as yf
+"""Causal IHSG regime detection; allocation policy lives in another module.
+
+The Hanna turning-point method is ex-post and is not used as a trading signal.
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
 from datetime import date, timedelta
+from functools import lru_cache
+from pathlib import Path
 
-ROOT      = Path(__file__).resolve().parent.parent.parent
-DATA_DIR  = ROOT / "data"
+import pandas as pd
+import numpy as np
+import yfinance as yf
 
-STOCKS_FILE   = DATA_DIR / "Daftar Saham - 20260401.xlsx"
-PRICE_FILE    = DATA_DIR / "Master_OHLCV_15Tahun.parquet"
+DATA_DIR = Path(__file__).resolve().parents[2] / "data"
+CONTEXT_FILE = DATA_DIR / "Master_Market_Context_15Tahun.parquet"
+STOCK_FILE = DATA_DIR / "Master_OHLCV_15Tahun.parquet"
 
-MARKET_CONTEXT_FILE   = DATA_DIR / "Master_Market_Context_15Tahun.parquet"
 
-def _check_death_cross(date: date = None) -> bool:
-    """Check if the market is in a bear condition using the Death Cross method.
+@dataclass(frozen=True)
+class RegimeConfig:
+    version: str = "bear-v1"
+    peak_sessions: int = 252
+    fast_ma: int = 50
+    slow_ma: int = 200
+    entry_drawdown: float = 0.10
+    crash_drawdown: float = 0.20
+    exit_drawdown: float = 0.08
+    entry_confirmation_days: int = 5
+    exit_confirmation_days: int = 10
+    slow_ma_slope_days: int = 20
+    max_stale_days: int = 10
+    depth_scale: float = 0.20
+    ma_gap_scale: float = 0.08
+    breadth_start: float = 0.50
+    breadth_scale: float = 0.30
+    vix_start: float = 20.0
+    vix_scale: float = 20.0
+    fx_scale: float = 0.10
+    breadth_min_stocks: int = 50
+    weights: dict[str, float] = field(default_factory=lambda: {
+        "drawdown": 0.50, "ma_gap": 0.25, "breadth": 0.15, "stress": 0.10,
+    })
 
-        Returns:
-            bool: True if the market is in a bear condition, False otherwise.
-    """
-    today = date
-    two_years_ago = today.replace(year=today.year - 2)
+    def __post_init__(self) -> None:
+        if not (0 <= self.exit_drawdown < self.entry_drawdown <
+                self.crash_drawdown < 1):
+            raise ValueError("Ambang drawdown/hysteresis tidak valid.")
+        if min(self.peak_sessions, self.fast_ma, self.slow_ma,
+               self.entry_confirmation_days, self.exit_confirmation_days,
+               self.slow_ma_slope_days) <= 0:
+            raise ValueError("Periode indikator harus positif.")
+        if (min(self.depth_scale, self.ma_gap_scale, self.breadth_scale,
+                self.vix_scale, self.fx_scale) <= 0 or
+            any(weight < 0 for weight in self.weights.values()) or
+            sum(self.weights.values()) <= 0):
+            raise ValueError("Skala/bobot severity tidak valid.")
 
-    start_date = two_years_ago.strftime("%Y-%m-%d")
-    end_date = today.strftime("%Y-%m-%d")
-    
-    df = yf.download("^JKSE", start=start_date, end=end_date, interval="1d")
-    
-    if(df.empty):
-        raise ValueError("Failed to fetch data from Yahoo Finance. Please check your internet connection or the ticker symbol.")
-    
-    # 1. Menghitung MA-50
-    df['MA_50'] = df['Close'].rolling(window=50).mean()
 
-    # 2. Menghitung MA-200
-    df['MA_200'] = df['Close'].rolling(window=200).mean()
+CONFIG = RegimeConfig()
 
-    # Tampilkan 5 baris terakhir untuk mengecek hasilnya
-    print(df[['Close', 'MA_50', 'MA_200']].tail())
-    
-    is_death_cross = False
-    for i in range(5):
-        current_day = df.iloc[-(i+1)]
-        if(current_day['MA_50'] > current_day['MA_200']):
-            is_death_cross = False
-            break
-        else:
-            is_death_cross = True
 
-    if is_death_cross:
-        print("ALERT: IHSG sedang mengalami Death Cross (Bear Market)!")
-        # Di sini kamu bisa memicu perubahan 'market_trend_flag' menjadi 'Bearish'
+def _clip(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def _unknown(as_of: date, reason: str, cfg: RegimeConfig) -> dict:
+    return {"status": "unknown", "severity": None, "as_of": None,
+            "requested_date": as_of.isoformat(), "reason": reason,
+            "config_version": cfg.version, "components": {}, "effective_weights": {},
+            "missing_indicators": [], "formula": None, "parameters": asdict(cfg)}
+
+
+def _clean(values: pd.Series | None, as_of: date, *, allow_zero: bool = False) -> pd.Series:
+    if values is None or values.empty:
+        return pd.Series(dtype=float)
+    series = pd.to_numeric(values, errors="coerce").copy()
+    series.index = pd.to_datetime(series.index).normalize()
+    series = series[series.index <= pd.Timestamp(as_of)]
+    series = series[np.isfinite(series)]
+    series = series[series >= 0 if allow_zero else series > 0].dropna().sort_index()
+    return series[~series.index.duplicated(keep="last")]
+
+
+def detect_market_regime(
+    ihsg: pd.Series, as_of: date, *, breadth: pd.Series | None = None,
+    vix: pd.Series | None = None, usd_idr: pd.Series | None = None,
+    config: RegimeConfig = CONFIG,
+) -> dict:
+    """Replay hysteresis chronologically using observations no later than as_of."""
+    price = _clean(ihsg, as_of)
+    required = max(config.peak_sessions, config.slow_ma + config.slow_ma_slope_days)
+    if len(price) < required:
+        return _unknown(as_of, f"Histori IHSG kurang dari {required} sesi.", config)
+    if (as_of - price.index[-1].date()).days > config.max_stale_days:
+        return _unknown(as_of, "Harga IHSG terakhir terlalu lama.", config)
+    peak = price.rolling(config.peak_sessions, min_periods=config.peak_sessions).max()
+    drawdown = (1 - price / peak).clip(lower=0)
+    fast = price.rolling(config.fast_ma, min_periods=config.fast_ma).mean()
+    slow = price.rolling(config.slow_ma, min_periods=config.slow_ma).mean()
+    below = fast < slow
+    above = fast > slow
+    enter = below.rolling(config.entry_confirmation_days).sum().eq(config.entry_confirmation_days)
+    leave = above.rolling(config.exit_confirmation_days).sum().eq(config.exit_confirmation_days)
+    falling = slow < slow.shift(config.slow_ma_slope_days)
+    state = "normal"
+    for day in price.index[required - 1:]:
+        dd = float(drawdown.loc[day])
+        if state == "normal" and (dd >= config.crash_drawdown or
+            (dd >= config.entry_drawdown and bool(enter.loc[day]) and bool(falling.loc[day]))):
+            state = "bear"
+        elif state == "bear" and dd < config.exit_drawdown and bool(leave.loc[day]):
+            state = "normal"
+
+    last = price.index[-1]
+    dd = float(drawdown.loc[last])
+    components = {
+        "drawdown": _clip((dd - config.entry_drawdown) / config.depth_scale),
+        "ma_gap": _clip(((float(slow.loc[last]) - float(fast.loc[last])) /
+                          float(slow.loc[last])) / config.ma_gap_scale),
+    }
+    missing = []
+    breadth_data = _clean(breadth, as_of, allow_zero=True)
+    if last in breadth_data.index:
+        components["breadth"] = _clip((float(breadth_data.loc[last]) -
+                                       config.breadth_start) / config.breadth_scale)
     else:
-        print("IHSG Aman (Bullish / Normal).")
-    
-    return is_death_cross
+        missing.append("breadth")
+    stress = []
+    vix_data = _clean(vix, as_of)
+    if not vix_data.empty and vix_data.index[-1] >= last - pd.Timedelta(days=7):
+        stress.append(_clip((float(vix_data.iloc[-1]) - config.vix_start) / config.vix_scale))
+    else:
+        missing.append("vix")
+    fx_data = _clean(usd_idr, as_of)
+    if len(fx_data) >= 30 and fx_data.index[-1] >= last - pd.Timedelta(days=7):
+        recent = fx_data.tail(30)
+        stress.append(_clip((float(recent.iloc[-1] / recent.min()) - 1) / config.fx_scale))
+    else:
+        missing.append("usd_idr")
+    if stress:
+        components["stress"] = sum(stress) / len(stress)
+    weights = {key: config.weights[key] for key in components}
+    if "stress" in weights:
+        weights["stress"] *= len(stress) / 2
+    total_weight = sum(weights.values())
+    if total_weight <= 0:
+        return _unknown(as_of, "Bobot severity tidak valid.", config)
+    effective = {key: weights[key] / total_weight for key in components}
+    severity = sum(components[key] * effective[key] for key in components)
+    return {
+        "status": state, "severity": round(severity, 6),
+        "as_of": last.date().isoformat(), "requested_date": as_of.isoformat(),
+        "reason": (f"IHSG turun {dd:.1%} dari puncak {config.peak_sessions} sesi; "
+                   f"MA50 {'di bawah' if below.loc[last] else 'di atas'} MA200."),
+        "config_version": config.version, "components": components,
+        "effective_weights": effective, "missing_indicators": missing,
+        "formula": ("drawdown=clip((DD-entry_drawdown)/depth_scale); "
+                    "ma_gap=clip(((MA200-MA50)/MA200)/ma_gap_scale); "
+                    "breadth=clip((below_MA200-breadth_start)/breadth_scale); "
+                    "stress=mean(clip((VIX-vix_start)/vix_scale), "
+                    "clip(USDIDR_30d_change/fx_scale)); "
+                    "severity=sum(component*effective_weight)"),
+        "parameters": asdict(config),
+    }
 
 
-def _check_majority_stock(daftar_ticker: list, target_date: date = None) -> bool:
-    """Check if majority (60% or more) of the indonesian stocks are below MA-200."""
-    if target_date is None:
-        target_date = date.today()
-        
-    start_date = target_date - timedelta(days=300)
-    # yfinance butuh end_date + 1 hari agar data target_date ikut terambil
-    end_date = target_date + timedelta(days=1)
-    
-    # PERHATIAN: Hapus argumen group_by='ticker' agar struktur DataFramenya 
-    # terkelompok berdasarkan atribut (Close, Open) BUKAN berdasarkan Ticker. 
-    # Ini syarat utama agar Vectorization berjalan mulus.
-    df = yf.download(daftar_ticker, start=start_date.strftime("%Y-%m-%d"), end=end_date.strftime("%Y-%m-%d"), interval="1d")
-    
-    if df.empty:
-        return False
-        
-    # 1. Ekstrak HANYA matriks 'Close' (Harga Penutupan) untuk SEMUA saham sekaligus
-    # Bentuknya jadi Dataframe: Baris = Tanggal, Kolom = BBCA, TLKM, dst.
-    df_close = df['Close']
-    
-    # --- MULAI VECTORIZATION ---
-    
-    # 2. Hitung MA-200 untuk SEMUA SAHAM secara serentak (1 baris kode!)
-    df_ma200 = df_close.rolling(window=200).mean()
-    
-    # 3. Ambil data hari terakhir (paling ujung) dari harga dan MA-200
-    latest_close = df_close.iloc[-1]
-    latest_ma200 = df_ma200.iloc[-1]
-    
-    # Saham yang usianya belum 200 hari bursa, nilai MA-200-nya akan kosong (NaN).
-    # Kita buat mask untuk membuang saham-saham NaN ini dari perhitungan 
-    # agar persentasenya tidak bocor.
-    valid_mask = latest_ma200.notna()
-    
-    # 4. Bandingkan secara Vektoral (Array vs Array)
-    is_below_ma200 = latest_close[valid_mask] < latest_ma200[valid_mask]
-    
-    # 5. Hitung Persentase
-    percentage_below = float(is_below_ma200.mean())
-    
-    print(f"[Bear Market] Saham di bawah MA-200: {percentage_below * 100:.2f}%")
-    
-    # Return True jika > 60% (0.60)
-    return percentage_below > 0.60
-    
-    
-def _check_macro_economy(target_date: date = None) -> bool:
-    """Check if USD/IDR depreciate > 5% in the last 30 trading days OR VIX > 30."""
-    
-    # Jika tidak ada parameter, gunakan hari ini (Live Mode)
-    if target_date is None:
-        target_date = date.today()
-        
-    # Mundur 45 hari kalender pakai timedelta (anti-crash) untuk dapat ~30 hari bursa
-    start_date = target_date - timedelta(days=45)
-    
-    # yfinance butuh end_date + 1 hari agar data target_date ikut terambil
-    end_date = target_date + timedelta(days=1) 
-    
-    # HAPUS 'period', gunakan start dan end untuk kompatibilitas backtesting
-    df = yf.download(["^VIX", "IDR=X"], start=start_date.strftime("%Y-%m-%d"), end=end_date.strftime("%Y-%m-%d"), interval="1d")
-    
-    if df.empty:
-        raise ValueError("Failed to fetch data from Yahoo Finance.")
-        
-    # 1. Ekstraksi Data (Mengatasi format MultiIndex yfinance)
-    df_close = df['Close']
-    df_idr_30d = df_close['IDR=X'].dropna().tail(30)
-    df_vix = df_close['^VIX'].dropna()
-    
-    if df_idr_30d.empty or df_vix.empty:
-         return False
-    
-    # 2. Pengecekan VIX (Kondisi ATAU pertama)
-    current_vix = float(df_vix.iloc[-1])
-    if current_vix > 30:
-        print(f"ALERT: VIX index is {current_vix:.2f} (Above 30).")
-        return True
-    
-    # 3. Pengecekan Depresiasi Rupiah (Kondisi ATAU kedua)
-    current_idr = float(df_idr_30d.iloc[-1])
-    lowest_idr_30d = float(df_idr_30d.min())
-    
-    persentase_depresiasi = (current_idr - lowest_idr_30d) / lowest_idr_30d
-    print(f"Depresiasi IDR 30 Hari: {persentase_depresiasi * 100:.2f}%")
-    
-    return bool(persentase_depresiasi > 0.05)
+@lru_cache(maxsize=1)
+def _historical_context() -> pd.DataFrame:
+    return pd.read_parquet(CONTEXT_FILE, columns=["Date", "Ticker", "Close"])
+
+
+def _series(frame: pd.DataFrame, ticker: str) -> pd.Series:
+    rows = frame[frame["Ticker"] == ticker]
+    return pd.Series(rows["Close"].to_numpy(), index=pd.to_datetime(rows["Date"]))
+
+
+def load_regime_data(as_of: date, backtest: bool) -> dict[str, pd.Series]:
+    if backtest:
+        frame = _historical_context()
+        # Replay hysteresis from the beginning of available IHSG history.
+        # A sliding 850-day window can forget a still-active bear regime.
+        selected = frame[frame["Date"] <= pd.Timestamp(as_of)]
+        result = {"ihsg": _series(selected, "^JKSE"),
+                  "vix": _series(selected, "^VIX"),
+                  "usd_idr": _series(selected, "USDIDR=X")}
+        stocks = pd.read_parquet(
+            STOCK_FILE, columns=["Date", "Ticker", "Close"],
+            filters=[("Date", ">=", pd.Timestamp(as_of - timedelta(days=420))),
+                     ("Date", "<=", pd.Timestamp(as_of))],
+        )
+        closes = stocks.pivot_table(index="Date", columns="Ticker", values="Close", aggfunc="last")
+        ma = closes.rolling(CONFIG.slow_ma, min_periods=CONFIG.slow_ma).mean()
+        eligible = ma.notna() & closes.notna()
+        count = eligible.sum(axis=1)
+        result["breadth"] = ((closes < ma) & eligible).sum(axis=1).div(
+            count.where(count >= CONFIG.breadth_min_stocks))
+        return result
+    end = as_of + timedelta(days=1)  # yfinance end is exclusive
+    result = {}
+    for key, ticker in (("ihsg", "^JKSE"), ("vix", "^VIX"), ("usd_idr", "USDIDR=X")):
+        try:
+            start = "1990-01-01" if key == "ihsg" else (as_of - timedelta(days=850)).isoformat()
+            frame = yf.download(ticker, start=start,
+                                end=end.isoformat(), auto_adjust=False, progress=False)
+            close = frame["Close"]
+            result[key] = close.iloc[:, 0] if isinstance(close, pd.DataFrame) else close
+        except Exception:
+            result[key] = pd.Series(dtype=float)
+    result["breadth"] = pd.Series(dtype=float)
+    return result
+
+
+def assess_market(as_of: date, backtest: bool) -> dict:
+    try:
+        return detect_market_regime(**load_regime_data(as_of, backtest), as_of=as_of)
+    except Exception as exc:
+        return _unknown(as_of, f"Data pasar tidak tersedia: {exc}", CONFIG)

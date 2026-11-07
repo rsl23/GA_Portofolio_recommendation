@@ -1,7 +1,9 @@
-﻿import calendar
+import calendar
 import logging
 import os
-from datetime import date, timedelta
+import hashlib
+import json
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 import math
 from uuid import UUID
@@ -26,15 +28,23 @@ from src.backend.models.schemas.portfolio_schema import (
     SkippedRebalanceStep,
 )
 from src.backend.services.gemini_llm_caller import explain_portfolio
+from src.backend.services.portfolio_dividends import (
+    DividendDataUnavailableError, dividend_entitlements, load_dividend_history,
+)
 from src.gaengine.data_loader import build_market_data
 from src.gaengine.engine import GeneticEngine
-from src.gaengine.ga_config import GAConfig
+from src.gaengine.ga_config import GAConfig, REBALANCE_FITNESS_PARAMETERS
 from src.gaengine.rebalancer import (
     compute_nav,
     align_old_weights_to_market,
     apply_no_trade_band,
     fit_buys_to_available_cash,
     compute_rebalance_deltas,
+)
+from src.preprocessing.bear_market_detection import assess_market
+from src.preprocessing.capital_allocation_policy import (
+    CONFIG as ALLOCATION_CONFIG,
+    effective_fraction, recommend_fraction,
 )
 logger = logging.getLogger(__name__)
 
@@ -44,8 +54,8 @@ logger = logging.getLogger(__name__)
 # Setiap user bisa memiliki DUA jenis portofolio terpisah:
 #   LIVE     : "active"             -> sedang dipakai; digantikan -> "replaced"
 #   BACKTEST : "active_backtest"    -> simulasi terbaru; digantikan -> "replaced_backtest"
-# Keduanya TIDAK saling menimpa. Portofolio juga TIDAK PERNAH dihapus —
-# generate ulang hanya mengubah STATUS portofolio lama.
+# Keduanya TIDAK saling menimpa. Generate ulang hanya mengubah STATUS;
+# penghapusan eksplisit oleh pemilik tersedia melalui endpoint terpisah.
 STATUS_ACTIVE = "active"                          # portofolio live terbaru
 STATUS_REPLACED = "replaced"                      # portofolio live yang digantikan
 STATUS_ACTIVE_BACKTEST = "active_backtest"        # hasil simulasi backtest terbaru
@@ -62,6 +72,10 @@ class UserNotFoundError(Exception):
 
 class PortfolioNotFoundError(Exception):
     """Exception domain: user belum memiliki portofolio aktif."""
+
+
+class PortfolioLineageConflictError(Exception):
+    """Rantai rebalance tidak aman untuk dihapus sebagai satu milik user."""
 
 
 class StockNotFoundError(Exception):
@@ -83,8 +97,9 @@ def _as_date(value) -> date:
     raise ValueError(f"Tanggal snapshot tidak valid: {value!r}")
 
 
-def _execution_close_prices(db: Session, tickers: set[str], requested: date, backtest: bool) -> tuple[date, dict[str, float]]:
-    """Return one common trading day and actual (not forward-filled) raw closes."""
+def _execution_close_prices(db: Session, tickers: set[str], requested: date, backtest: bool,
+                            require_volume: bool = False) -> tuple[date, dict[str, float]]:
+    """Return raw closes on one market session; require traded volume for fills."""
     import pandas as pd
     if not tickers:
         raise MarketDataUnavailableError("Tidak ada ticker untuk dieksekusi.")
@@ -94,7 +109,7 @@ def _execution_close_prices(db: Session, tickers: set[str], requested: date, bac
         try:
             frame = pd.read_parquet(
                 root / "data" / "Master_OHLCV_15Tahun.parquet",
-                columns=["Date", "Ticker", "Close"],
+                columns=["Date", "Ticker", "Close", "Volume"],
                 filters=[("Date", ">=", pd.Timestamp(requested - timedelta(days=14))),
                          ("Date", "<=", pd.Timestamp(requested)),
                          ("Ticker", "in", [f"{ticker}.JK" for ticker in tickers])],
@@ -104,10 +119,21 @@ def _execution_close_prices(db: Session, tickers: set[str], requested: date, bac
         if frame.empty:
             raise MarketDataUnavailableError(f"Tidak ada harga Close hingga {requested}.")
         frame["Date"] = pd.to_datetime(frame["Date"]).dt.date
-        effective = frame["Date"].max()
+        effective = _backtest_trading_day(requested)
         day_rows = frame[frame["Date"] == effective]
         prices = {str(row.Ticker).removesuffix(".JK"): float(row.Close)
-                  for row in day_rows.itertuples() if pd.notna(row.Close)}
+                  for row in day_rows.itertuples()
+                  if str(row.Ticker).removesuffix(".JK") in tickers and pd.notna(row.Close)}
+        if require_volume:
+            traded = {str(row.Ticker).removesuffix(".JK") for row in day_rows.itertuples()
+                      if str(row.Ticker).removesuffix(".JK") in tickers
+                      and pd.notna(row.Volume) and row.Volume > 0}
+            not_traded = sorted(tickers - traded)
+            if not_traded:
+                raise MarketDataUnavailableError(
+                    f"Tidak ada volume perdagangan aktual pada {effective} untuk: "
+                    f"{', '.join(not_traded)}. Transaksi backtest dibatalkan."
+                )
     else:
         stocks = db.query(StockUniverse).filter(StockUniverse.ticker.in_(tickers)).all()
         ids = {stock.id_stock: stock.ticker for stock in stocks}
@@ -130,8 +156,42 @@ def _execution_close_prices(db: Session, tickers: set[str], requested: date, bac
     return effective, prices
 
 
+def _live_execution_prices(db: Session, ga_data, old_lots: dict[str, int]) -> tuple[date, dict[str, float]]:
+    """Use the GA's raw, completed-session Close for live candidates.
+
+    A pre-existing holding outside the current universe still needs an actual
+    Close on that same date; a stale DB mark is never treated as a trade.
+    """
+    execution_day = getattr(ga_data, "price_date", None)
+    if execution_day is None:
+        raise MarketDataUnavailableError("Tanggal harga Close live dari GA tidak tersedia.")
+    execution_day = _as_date(execution_day)
+    today_wib = datetime.now(timezone(timedelta(hours=7))).date()
+    if execution_day > today_wib or (today_wib - execution_day).days > 7:
+        raise MarketDataUnavailableError(
+            f"Harga Close live per {execution_day} terlalu lama atau berada di masa depan."
+        )
+    if len(ga_data.stock_codes) != len(ga_data.prices_per_lot):
+        raise MarketDataUnavailableError("Jumlah harga kandidat GA tidak cocok dengan jumlah ticker.")
+    prices = {
+        code: float(price) / 100.0
+        for code, price in zip(ga_data.stock_codes, ga_data.prices_per_lot)
+    }
+    if any(not math.isfinite(price) or price <= 0 for price in prices.values()):
+        raise MarketDataUnavailableError("Harga Close live kandidat GA tidak valid.")
+    outside = set(old_lots) - set(prices)
+    if outside:
+        old_day, old_prices = _execution_close_prices(db, outside, execution_day, False)
+        if old_day != execution_day:
+            raise MarketDataUnavailableError(
+                f"Harga aktual posisi lama di luar kandidat GA tidak tersedia pada {execution_day}."
+            )
+        prices.update(old_prices)
+    return execution_day, prices
+
+
 def _backtest_trading_day(requested: date) -> date:
-    """Resolve the EOD decision/close-fill date before loading any GA inputs."""
+    """Resolve an actual market session, skipping synthetic zero-volume holidays."""
     import pandas as pd
     from pathlib import Path
 
@@ -139,15 +199,97 @@ def _backtest_trading_day(requested: date) -> date:
     try:
         days = pd.read_parquet(
             root / "data" / "Master_OHLCV_15Tahun.parquet",
-            columns=["Date"],
+            columns=["Date", "Volume"],
             filters=[("Date", ">=", pd.Timestamp(requested - timedelta(days=14))),
                      ("Date", "<=", pd.Timestamp(requested))],
         )
     except Exception as exc:
         raise MarketDataUnavailableError(f"Kalender perdagangan backtest tidak dapat dibaca: {exc}") from exc
+    days = days[pd.to_numeric(days["Volume"], errors="coerce") > 0]
     if days.empty:
         raise MarketDataUnavailableError(f"Tidak ada hari bursa hingga {requested}.")
     return pd.to_datetime(days["Date"]).dt.date.max()
+
+
+def preview_bear_market(risk_profile: str, backtest: bool = False,
+                        date_ref: date | None = None) -> dict:
+    """Read-only, as-of regime and allocation preview for one execution date."""
+    if backtest:
+        if date_ref is None:
+            raise ValueError("date_ref wajib untuk pratinjau backtest.")
+        execution_day = _backtest_trading_day(date_ref)
+        decision_day = _backtest_trading_day(execution_day - timedelta(days=1))
+    else:
+        execution_day = None
+        decision_day = date.today() - timedelta(days=1)
+    assessment = assess_market(decision_day, backtest)
+    result = {
+        **assessment,
+        "execution_date": execution_day.isoformat() if execution_day else None,
+        "decision_date": decision_day.isoformat(),
+        "recommended_fraction": recommend_fraction(
+            assessment["status"], assessment["severity"], risk_profile
+        ),
+        "risk_profile": risk_profile,
+        "allocation_config_version": ALLOCATION_CONFIG.version,
+        "allocation_formula": "base - severity * (base - minimum); normal = 1.0; unknown = null",
+    }
+    fingerprint_payload = {key: result[key] for key in (
+        "status", "severity", "as_of", "decision_date", "execution_date",
+        "config_version", "components", "effective_weights", "recommended_fraction",
+        "risk_profile",
+        "allocation_config_version",
+    )}
+    result["fingerprint"] = hashlib.sha256(
+        json.dumps(fingerprint_payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return result
+
+
+def preview_bear_series(start_date: date, end_date: date,
+                        interval_months: int, risk_profile: str) -> dict:
+    schedule = build_rebalance_schedule(start_date, end_date, interval_months)
+    if len(schedule) > MAX_SERIES_STEPS:
+        raise ValueError(f"Jumlah langkah melebihi {MAX_SERIES_STEPS}.")
+    return {"scheduled_dates": [day.isoformat() for day in schedule],
+            "assessments": [
+                {"scheduled_date": day.isoformat(),
+                 **preview_bear_market(risk_profile, True, day)}
+                for day in schedule
+            ]}
+
+
+def _limit_lots_to_exposure(old_lots: dict[str, int], desired: dict[str, int],
+                            cash_before: float, prices: dict[str, float],
+                            fraction: float, min_stocks: int,
+                            priority: dict[str, float]) -> dict[str, int]:
+    """Trim existing or new holdings against execution NAV, never only BUY value."""
+    nav = _money(cash_before) + sum(
+        _money(qty) * 100 * _money(prices[code]) for code, qty in old_lots.items()
+    )
+    cap = nav * _money(fraction)
+    result = dict(desired)
+    def holdings_value() -> Decimal:
+        return sum((_money(qty) * 100 * _money(prices[code])
+                    for code, qty in result.items()), Decimal("0"))
+    while holdings_value() > cap + Decimal("0.01"):
+        candidates = [
+            code for code, qty in result.items()
+            if qty > 1 or sum(x > 0 for x in result.values()) > min_stocks
+        ]
+        if not candidates:
+            raise ValueError(
+                "Batas porsi saham tidak dapat dipenuhi dengan minimum saham dan lot."
+            )
+        code = min(candidates, key=lambda ticker: (priority.get(ticker, 0.0), ticker))
+        excess = holdings_value() - cap
+        lot_value = _money(prices[code]) * 100
+        required_sale = int((excess / lot_value).to_integral_value(rounding="ROUND_CEILING"))
+        max_sale = result[code] if sum(x > 0 for x in result.values()) > min_stocks else result[code] - 1
+        result[code] -= min(required_sale, max_sale)
+        if result[code] == 0:
+            del result[code]
+    return result
 
 
 def _close_previous_items(db: Session, items: list[tuple[PortofolioItem, str]], execution_day: date) -> None:
@@ -190,6 +332,13 @@ def generate_new_portfolio(
         "Menjalankan GA untuk user %s dengan profil %s dan modal Rp%.2f (backtest=%s, date=%s)",
         user_id, request.risk_profile, request.budget, backtest, date_ref,
     )
+    guarded = (getattr(request, "rebalance_model", "legacy") == "guarded_v1"
+               and getattr(request, "rebalance", False))
+    benchmark_fitness = getattr(request, "fitness_policy", "legacy") == "net_cvar_ihsg_v1"
+    if benchmark_fitness and not backtest:
+        raise ValueError("net_cvar_ihsg_v1 tersedia sebagai eksperimen backtest terlebih dahulu.")
+    if getattr(request, "rebalance_model", "legacy") == "guarded_v1" and not backtest:
+        raise ValueError("guarded_v1 tersedia sebagai eksperimen backtest terlebih dahulu.")
 
     # 0. Validasi user dari payload JWT (sub). Lempar error jika sudah terhapus.
     try:
@@ -199,6 +348,17 @@ def generate_new_portfolio(
     user = db.query(User).filter(User.id == user_uuid).first()
     if user is None:
         raise UserNotFoundError("User pada token tidak ditemukan di database.")
+    exposure_limit = None
+    if getattr(request, "bear_management", False):
+        preview = preview_bear_market(request.risk_profile, backtest, date_ref)
+        if (preview["as_of"] is not None and
+            str(request.bear_preview_as_of) != preview["as_of"]):
+            raise ValueError("Pratinjau bear market sudah berubah; muat ulang sebelum generate.")
+        if request.bear_preview_fingerprint != preview["fingerprint"]:
+            raise ValueError("Indikator pasar berubah sejak pratinjau; muat ulang sebelum generate.")
+        choice = ("recommended" if user.bear_allocation_policy == "always_follow"
+                  and preview["status"] != "unknown" else request.bear_choice)
+        exposure_limit = effective_fraction(preview, request.risk_profile, choice)
 
     # 1. Siapkan MarketData.
     #    - Mode BACKTEST: SELALU rakit ulang dari data historis lokal pada
@@ -216,8 +376,10 @@ def generate_new_portfolio(
         decision_day = _backtest_trading_day(execution_target - timedelta(days=1))
         logger.info("Membentuk MarketData BACKTEST per hari bursa %s...", decision_day)
         try:
+            profile_options = ({"include_profile_features": True}
+                               if getattr(request, "profile_policy", "legacy") != "legacy" else {})
             market_data = build_market_data(
-                min_price=1.0, backtest=True, date_ref=decision_day
+                min_price=1.0, backtest=True, date_ref=decision_day, **profile_options
             )
         except Exception as e:
             raise MarketDataUnavailableError(
@@ -225,13 +387,22 @@ def generate_new_portfolio(
             ) from e
     elif market_data is None:
         logger.info("Membentuk MarketData menggunakan data LIVE...")
-        market_data = build_market_data(min_price=1.0)
+        market_data = build_market_data(min_price=1.0, **(
+            {"include_profile_features": True} if getattr(request, "profile_policy", "legacy") != "legacy" else {}))
 
     if market_data is None or market_data.n_stocks == 0:
         raise MarketDataUnavailableError(
             "Gagal membentuk MarketData. Pastikan tabel filtered_stock_cache sudah terisi "
             "(live) atau tanggal backtest memiliki data (backtest)."
         )
+
+    if getattr(request, "profile_policy", "legacy") != "legacy" and market_data.profile_features is None:
+        # Startup's live cache is deliberately legacy. Reload a local object;
+        # never mutate the shared cache while another request is using it.
+        if not backtest:
+            market_data = build_market_data(min_price=1.0, include_profile_features=True)
+        if market_data is None or market_data.profile_features is None:
+            raise ValueError("Bukti komposisi profil tidak tersedia.")
 
     # --- REBALANCING LOGIC ---
     old_portfolio_id = None
@@ -243,11 +414,30 @@ def generate_new_portfolio(
     execution_day = None
     all_close_prices: dict[str, float] = {}
     ga_budget = request.budget
+    requested_contribution = getattr(request, "contribution_amount", 0)
+    if not math.isfinite(requested_contribution) or requested_contribution < 0:
+        raise ValueError("Setoran modal harus berupa angka tidak negatif dan terbatas.")
+    if requested_contribution and (not backtest or not request.rebalance):
+        raise ValueError("Setoran langsung hanya berlaku pada rebalance backtest; gunakan endpoint tambah modal untuk live.")
+    applied_contribution = Decimal("0")
+    name_portofolio = (getattr(request, "name_portofolio", None) or "").strip()
+    description = (getattr(request, "description", None) or "").strip() or None
     
     if getattr(request, 'rebalance', False):
         try:
             old_portfolio_res = get_active_portfolio(db, str(user_uuid), backtest=backtest)
             old_portfolio_id = old_portfolio_res.id
+            old_snapshot_row = db.query(Portofolio).filter(
+                Portofolio.id == UUID(str(old_portfolio_id)), Portofolio.user_id == user_uuid
+            ).with_for_update().first()
+            if old_snapshot_row is None:
+                raise PortfolioNotFoundError("Portofolio aktif tidak ditemukan.")
+            # Snapshot hasil rebalance tetap memakai identitas portofolio lama.
+            name_portofolio = name_portofolio or getattr(old_snapshot_row, "name_portofolio", None) or ""
+            description = description if description is not None else getattr(old_snapshot_row, "description", None)
+            applied_contribution = _money(requested_contribution) + _money(old_snapshot_row.pending_deposit or 0)
+            if not applied_contribution.is_finite() or applied_contribution < 0:
+                raise ValueError("Total setoran untuk rebalance tidak valid.")
             for alloc in old_portfolio_res.allocations:
                 old_lots[alloc.ticker] = alloc.lots
             
@@ -271,18 +461,19 @@ def generate_new_portfolio(
                 not math.isfinite(old_portfolio_res.sisa_budget) or
                 old_portfolio_res.sisa_budget < -0.01):
                 raise ValueError("Kas portofolio lama tidak valid untuk rebalance.")
-            leftover_cash = float(old_portfolio_res.sisa_budget)
-            execution_day, all_close_prices = _execution_close_prices(
-                db, set(old_lots) | set(market_data.stock_codes),
-                execution_target if backtest else date.today(), backtest,
-            )
+            leftover_cash = float(_money(old_portfolio_res.sisa_budget) + applied_contribution)
+            if backtest:
+                execution_day, all_close_prices = _execution_close_prices(
+                    db, set(old_lots) | set(market_data.stock_codes), execution_target, True,
+                )
+            else:
+                execution_day, all_close_prices = _live_execution_prices(db, market_data, old_lots)
             if backtest and execution_day != execution_target:
                 raise MarketDataUnavailableError("Hari harga eksekusi berbeda dari jadwal bursa efektif.")
-            old_snapshot_row = db.query(Portofolio).filter(
-                Portofolio.id == UUID(str(old_portfolio_id)), Portofolio.user_id == user_uuid
-            ).first()
             if old_snapshot_row is not None:
-                old_cost_basis = _rebalance_cost_basis(db, old_snapshot_row, user_uuid)
+                old_cost_basis = _rebalance_cost_basis(
+                    db, old_snapshot_row, user_uuid, allow_legacy_reference=True,
+                )
             previous_execution_day = (
                 old_snapshot_row.execution_date if old_snapshot_row is not None else None
             ) or old_portfolio_res.date_ref or old_portfolio_res.created_at
@@ -334,12 +525,32 @@ def generate_new_portfolio(
             )
 
     if execution_day is None:
-        execution_day, all_close_prices = _execution_close_prices(
-            db, set(market_data.stock_codes),
-            execution_target if backtest else date.today(), backtest,
-        )
+        if backtest:
+            execution_day, all_close_prices = _execution_close_prices(
+                db, set(market_data.stock_codes), execution_target, True,
+            )
+        else:
+            execution_day, all_close_prices = _live_execution_prices(db, market_data, {})
         if backtest and execution_day != execution_target:
             raise MarketDataUnavailableError("Hari harga eksekusi berbeda dari jadwal bursa efektif.")
+    if not name_portofolio:
+        name_portofolio = f"Portofolio {request.risk_profile} {execution_day.isoformat()}"
+    if guarded:
+        from src.gaengine.held_universe import load_held_universe
+        from src.gaengine.data_loader import DATA_DIR
+        sector_map = None
+        if market_data.profile_features is not None:
+            sector_map = {ticker: sector for ticker, sector in db.query(
+                StockUniverse.ticker, StockUniverse.sektor).all()}
+        market_data = load_held_universe(market_data, old_lots, DATA_DIR, sector_map)
+        old_weights_aligned = [old_lots.get(c, 0)*p/ga_budget for c,p in
+                               zip(market_data.stock_codes,market_data.prices_per_lot)]
+        # A failed BUY screen no longer makes an old holding a forced sell.
+        eliminated_stocks = []
+    if benchmark_fitness:
+        from src.gaengine.benchmark_fitness import load_benchmark_data
+        from src.gaengine.data_loader import DATA_DIR
+        market_data = load_benchmark_data(market_data, DATA_DIR)
     # Backtest GA sizes positions with the prior session's prices, while the
     # simulated order and post-trade allocation use the execution-day Close.
     ga_prices = ({code: _money(all_close_prices[code]) for code in market_data.stock_codes}
@@ -356,26 +567,55 @@ def generate_new_portfolio(
         budget=ga_budget,            # NAV known when the GA decision is made
         risk_profile=request.risk_profile,
         min_stocks=3,
+        profile_policy=getattr(request, "profile_policy", "legacy"),
         max_stocks=10,
         risk_free_rate=market_data.risk_free_rate,
         # seed=42,
         data=market_data,
+        fitness_policy=getattr(request, "fitness_policy", "legacy"),
+        forecast_horizon_days=getattr(request, "fitness_horizon_days", 63),
+        cvar_tail_fraction=getattr(request, "fitness_cvar_tail_fraction", .1),
+        lambda_cvar=getattr(request, "fitness_lambda_cvar", .5),
+        lambda_benchmark_downside=getattr(request, "fitness_lambda_benchmark_downside", .5),
         is_rebalance=getattr(request, 'rebalance', False),
+        rebalance_model="guarded_v1" if guarded else "legacy",
+        buy_fee_rate=getattr(request, "rebalance_buy_fee_rate", .0015) if (guarded or benchmark_fitness or getattr(request, "charge_transaction_fees", False)) else 0.,
+        sell_fee_rate=getattr(request, "rebalance_sell_fee_rate", .0025) if (guarded or benchmark_fitness or getattr(request, "charge_transaction_fees", False)) else 0.,
         old_weights=old_weights_aligned,
         old_lots=old_lots,
         old_prices_per_lot=old_signal_prices_per_lot,
         old_cost_basis=old_cost_basis,
+        old_cash=leftover_cash if old_portfolio_id else None,
+        allow_cash=exposure_limit is not None and exposure_limit < 1.0,
+        min_exposure=exposure_limit if exposure_limit is not None and exposure_limit < 1.0 else 0.4,
+        max_exposure=exposure_limit if exposure_limit is not None and exposure_limit < 1.0 else 1.0,
+        **(REBALANCE_FITNESS_PARAMETERS if getattr(request, 'rebalance', False) else {}),
     )
+
+    if config.is_rebalance:
+        logger.info(
+            "Bobot fitness rebalance: turnover=%.2f, momentum=%.2f, utility=%.2f, return-NAV=%.2f (cash aktif=%s)",
+            config.turnover_penalty_beta, config.momentum_bonus, config.rebalance_utility_weight,
+            config.cash_return_weight, config.allow_cash,
+        )
 
     # 3. Evolusi genetika
     logger.info("=== MEMULAI EVOLUSI GENETIKA ===")
-    engine = GeneticEngine(config)
-    solution = engine.run(verbose=True)
+    rebalance_diagnostics = None
+    if guarded:
+        from src.gaengine.guarded_rebalance import GuardedRebalance
+        engine = GuardedRebalance(config)
+        solution, rebalance_diagnostics = engine.run()
+    else:
+        engine = GeneticEngine(config)
+        solution = engine.run(verbose=True)
     if not solution.diversification_ok or not solution.budget_ok:
         raise ValueError("GA tidak menghasilkan portofolio yang memenuhi batas saham dan budget.")
     
     # --- APPLY NO TRADE BAND ---
-    if getattr(request, 'rebalance', False):
+    if getattr(request, 'rebalance', False) and not guarded and not benchmark_fitness and not (
+        exposure_limit is not None and exposure_limit < 1.0
+    ):
         if config.allow_cash:
             full_weights = (np.asarray(solution.genes) * solution.exposure).tolist()
             new_weights = apply_no_trade_band(
@@ -402,21 +642,69 @@ def generate_new_portfolio(
     # and trim lowest-priority BUY lots before the snapshot is persisted.
     desired_lots = {code: int(qty) for code, qty in
                     zip(market_data.stock_codes, solution.lots) if qty > 0}
+    # The live candidate fill follows MarketData/GA prices, while a full sell
+    # outside that universe follows its observed Close. Use exactly those same
+    # prices for affordability, exposure, and the persisted cash delta.
+    execution_price_map = {**all_close_prices,
+                           **{code: float(price) for code, price in ga_prices.items()}}
     affordable_lots, _ = fit_buys_to_available_cash(
         old_lots, desired_lots,
-        float(old_portfolio_res.sisa_budget) if old_portfolio_id else float(request.budget),
-        all_close_prices,
+        leftover_cash if old_portfolio_id else float(request.budget),
+        execution_price_map,
         dict(zip(market_data.stock_codes, solution.genes)), config.min_stocks,
+        config.buy_fee_rate, config.sell_fee_rate,
     )
+    if exposure_limit is not None and exposure_limit < 1.0:
+        affordable_lots = _limit_lots_to_exposure(
+            old_lots, affordable_lots,
+            leftover_cash if old_portfolio_id else float(request.budget),
+            execution_price_map, exposure_limit, config.min_stocks,
+            dict(zip(market_data.stock_codes, solution.genes)),
+        )
     if affordable_lots != desired_lots:
         logger.info("Menyesuaikan BUY lot ke kas tersedia pada harga eksekusi %s", execution_day)
     solution.evaluate_fitness(lots_override=np.asarray(
         [affordable_lots.get(code, 0) for code in market_data.stock_codes], dtype=int
     ))
+    if guarded:
+        candidate = engine.evaluate(solution.lots)
+        # Cash trimming is an execution contingency, not a reason to rotate
+        # into a different stock using execution-day information.
+        if candidate is None or (engine.hold is not None and
+                candidate.utility <= engine.hold.utility + config.min_utility_gain):
+            if engine.hold is None:
+                raise ValueError("Penyesuaian eksekusi gagal memulihkan batas risiko guarded_v1.")
+            candidate = engine.hold
+            solution.evaluate_fitness(lots_override=candidate.lots)
+            rebalance_diagnostics['reason'] = 'hold'
+        solution.fitness = candidate.utility
+        rebalance_diagnostics['selected_utility'] = candidate.utility
+        rebalance_diagnostics['signal_transaction_costs'] = candidate.fees
+        rebalance_diagnostics['signal_cash_after'] = candidate.cash
+        rebalance_diagnostics['execution_adjusted'] = (
+            {c:int(q) for c,q in zip(market_data.stock_codes,candidate.lots) if q>0} != desired_lots)
     if not solution.diversification_ok or not solution.budget_ok:
         raise ValueError("Lot eksekusi melanggar batas saham atau budget.")
+    if benchmark_fitness:
+        rebalance_diagnostics = rebalance_diagnostics or {}
+        rebalance_diagnostics.update(fitness_policy=config.fitness_policy,
+            fitness_diagnostics=solution.fitness_diagnostics,
+            score_basis='decision_prices_with_execution_fitted_lots')
+    from src.gaengine.profile_policy import validate_execution
+    profile_composition = validate_execution(
+        config, solution.lots,
+        np.asarray([execution_price_map[c] * 100 for c in market_data.stock_codes]),
+    )
 
     # 4. Susun laporan hasil
+    if getattr(market_data, "market_stress", None) is not None:
+        evidence = market_data.market_stress
+        logger.info(
+            "GA risk model=%s | events=%d archive_end=%s | stress_risk=%s coverage=%s uncertainty_penalty=%.6f",
+            config.risk_model, len(evidence.events), evidence.history_end,
+            solution.market_stress_risk, solution.market_stress_coverage,
+            solution.market_stress_missing_penalty,
+        )
     codes = market_data.stock_codes
     prices = (np.asarray([float(ga_prices[code] * 100) for code in codes], dtype=float)
               if backtest else market_data.prices_per_lot)
@@ -456,7 +744,7 @@ def generate_new_portfolio(
             new_weights=new_weights_dict,
             eliminated_stocks=eliminated_stocks,
             old_cost_basis=old_cost_basis,
-            execution_prices=all_close_prices,
+            execution_prices=execution_price_map,
         )
 
     # Estimasi return tahunan dari alokasi terhadap modal termasuk sisa kas.
@@ -487,7 +775,7 @@ def generate_new_portfolio(
     #     emiten pemenang. Bahan/prompt dirakit src/gaengine/prompt_builder.py,
     #     pemanggilan model ada di src/backend/services/gemini_llm_caller.py.
     #     Bila gagal (tanpa API key, timeout, dsb) -> None, narasi template dipakai.
-    narasi_llm = explain_portfolio(
+    narasi_llm = None if (guarded or benchmark_fitness) else explain_portfolio(
         solution=solution,
         market_data=market_data,
         config=config,
@@ -502,6 +790,35 @@ def generate_new_portfolio(
     )
     if narasi_llm:
         narasi = narasi_llm
+    if benchmark_fitness:
+        d = solution.fitness_diagnostics
+        narasi = (
+            f"Portofolio {request.risk_profile}: {solution.n_active} saham, "
+            f"fitness eksperimen net_cvar_ihsg_v1 {solution.fitness:.6f}. "
+            f"Pada horizon {config.forecast_horizon_days} sesi, rata-rata return skenario "
+            f"bersih biaya {d['mean_net_return']:.2%}, CVaR kerugian {d['downside_cvar']:.2%}, "
+            f"dan downside terhadap IHSG {d['benchmark_downside']:.2%}. "
+            f"Tersedia {d['scenario_count']} blok historis tanpa overlap; "
+            "angka ini merupakan penilaian historis, bukan prediksi atau hasil return aktual. "
+            "Sharpe dan MDD yang ditampilkan merupakan metrik historis pendamping."
+        )
+    if guarded:
+        narasi += (
+            f" Mode guarded_v1: keputusan {rebalance_diagnostics['reason']}. "
+            f"Utility skenario bersih {solution.fitness:.6f}; HOLD persis dibandingkan "
+            "dengan perubahan posisi setelah biaya. Skenario historis "
+            "belum merupakan prediksi return tervalidasi."
+        )
+    if not benchmark_fitness and config.risk_model == "market_stress" and getattr(market_data, "market_stress", None) is not None:
+        evidence = market_data.market_stress
+        narasi += (
+            f" Penilaian risiko memakai {len(evidence.events)} periode tekanan IHSG historis "
+            f"dalam {evidence.lookback_years} tahun sebelum {evidence.as_of}; "
+            f"arsip tersedia hingga {evidence.history_end or 'tanggal tidak tersedia'}. "
+            f"Cakupan bukti historis posisi saham "
+            f"{(solution.market_stress_coverage or 0):.1%}; data yang belum terbukti "
+            f"diberi penalti ketidakpastian, bukan dinyatakan aman."
+        )
     logger.info(
         "Narasi portofolio memakai %s.",
         "penjelasan LLM (Gemini)" if narasi_llm else "template GA (fallback)",
@@ -527,17 +844,42 @@ def generate_new_portfolio(
     new_lots_for_accounting = {code: int(lot) for code, lot, _ in rows if lot > 0}
     changed_tickers = {code for code in set(old_lots) | set(new_lots_for_accounting)
                        if old_lots.get(code, 0) != new_lots_for_accounting.get(code, 0)}
+    average_buy_prices, _ = _apply_position_snapshot(
+        old_lots, old_cost_basis, new_lots_for_accounting, execution_price_map, 0.0,
+    )
+    if backtest and changed_tickers:
+        traded_day, _ = _execution_close_prices(
+            db, changed_tickers, execution_day, True, require_volume=True,
+        )
+        if traded_day != execution_day:
+            raise MarketDataUnavailableError("Tanggal perdagangan saham berbeda dari hari eksekusi.")
     execution_prices = {
         code: str(ga_prices.get(code, _money(all_close_prices[code])))
         for code in sorted(changed_tickers)
     }
-    cash_before = _money(old_portfolio_res.sisa_budget if old_portfolio_id else request.budget)
+    cash_before = _money(old_portfolio_res.sisa_budget if old_portfolio_id else request.budget) + applied_contribution
     cash_after = cash_before + sum(
         (_money(old_lots.get(code, 0)) - _money(new_lots_for_accounting.get(code, 0)))
         * 100 * _money(execution_prices[code]) for code in changed_tickers
     )
+    from src.gaengine.guarded_rebalance import transaction_account
+    _, transaction_costs = transaction_account(
+        old_lots, new_lots_for_accounting,
+        {c: float(execution_price_map[c]) for c in changed_tickers}, float(cash_before),
+        config.buy_fee_rate, config.sell_fee_rate,
+    )
+    cash_after -= _money(transaction_costs)
+    if rebalance_diagnostics is not None:
+        rebalance_diagnostics.update(execution_transaction_costs=transaction_costs,
+            buy_fee_rate=config.buy_fee_rate, sell_fee_rate=config.sell_fee_rate,
+            execution_delta_lots={c:new_lots_for_accounting.get(c,0)-old_lots.get(c,0)
+                                  for c in sorted(changed_tickers)})
     holdings_after = sum(_money(lot) * 100 * ga_prices[code]
                          for code, lot in new_lots_for_accounting.items())
+    if exposure_limit is not None and exposure_limit < 1.0:
+        execution_nav = cash_after + holdings_after
+        if execution_nav <= 0 or holdings_after > execution_nav * _money(exposure_limit) + Decimal("0.01"):
+            raise ValueError("Exposure portofolio melebihi batas modal terpilih pada harga eksekusi.")
     if cash_after < Decimal("-0.01"):
         raise ValueError("Rebalance menghasilkan kas negatif; snapshot dibatalkan.")
     # budget is the pre-trade NAV at the valuation mark. If an actual/simulated
@@ -570,13 +912,18 @@ def generate_new_portfolio(
             "Supersede (%s): %d portofolio '%s' -> '%s'.",
             "backtest" if backtest else "live", replaced, status_lama, status_digantikan,
         )
+    if old_portfolio_id:
+        old_snapshot_row.pending_deposit = 0.0
 
     # 6. Simpan hasil ke database: portofolios + portofolio_items
     portofolio = Portofolio(
         user_id=user_uuid,
+        name_portofolio=name_portofolio,
+        description=description,
         budget=request.budget,
         total_terpakai=float(holdings_after),
         sisa_budget=float(cash_after),
+        capital_contribution=float(applied_contribution),
         fitness_score=float(solution.fitness),
         sharpe_ratio=float(solution.sharpe_ratio),
         max_drawdown=float(solution.max_drawdown),
@@ -591,13 +938,15 @@ def generate_new_portfolio(
         # "active" untuk mode live, "active_backtest" untuk mode simulasi
         status_portofolio=status_baru,
         is_rebalance=getattr(request, 'rebalance', False),
-        parent_portofolio_id=old_portfolio_id if getattr(request, 'rebalance', False) else None,
+        parent_portofolio_id=UUID(str(old_portfolio_id)) if old_portfolio_id and getattr(request, 'rebalance', False) else None,
         turnover_rate=float(solution.turnover_rate) if getattr(request, 'rebalance', False) else None,
         turnover_penalty_beta=float(config.turnover_penalty_beta) if getattr(request, 'rebalance', False) else None,
         # acuan tanggal portofolio: tanggal simulasi (backtest) / sekarang (live)
         date_ref=date_ref_dt,
         execution_date=execution_day,
         execution_prices=execution_prices,
+        transaction_costs=transaction_costs,
+        rebalance_metadata=rebalance_diagnostics,
     )
     db.add(portofolio)
     db.flush()  # dapatkan portofolio.id sebelum commit (id di-generate default-nya)
@@ -623,28 +972,19 @@ def generate_new_portfolio(
     # Close every item in the previous position snapshot on the effective
     # execution day, including HOLD and partial SELL. The new snapshot starts
     # on that same day; windows are interpreted as [start_date, end_date).
-    old_item_map = {}
     if getattr(request, 'rebalance', False) and old_portfolio_id:
-        old_items_with_ticker = _query_items_with_ticker(db, old_portfolio_id)
+        old_items_with_ticker = _query_items_with_ticker(db, UUID(str(old_portfolio_id)))
         _close_previous_items(db, old_items_with_ticker, execution_day)
-        for old_item, tick in old_items_with_ticker:
-            old_item_map[tick] = old_item
 
     items = []
     for ticker, lot, price in rows:
         if lot > 0:
             action = "buy"
             start_dt = _dt.combine(execution_day, _dt.min.time())
-            harga_beli = price / 100.0
+            harga_beli = average_buy_prices[ticker]
             
             if getattr(request, 'rebalance', False) and ticker in delta_map:
                 action = delta_map[ticker]["action"].lower()
-                if ticker in old_item_map:
-                    # A held position gets a new snapshot window too; only its
-                    # purchase basis may carry over from the old item.
-                    old_item = old_item_map[ticker]
-                    if action == "hold" or action == "sell":
-                        harga_beli = old_item.harga_beli
             
             items.append(
                 PortofolioItem(
@@ -682,6 +1022,15 @@ def generate_new_portfolio(
 
     return PortfolioResponse(
         id=str(portofolio.id),
+        fitness_policy=config.fitness_policy,
+        fitness_diagnostics=getattr(solution, "fitness_diagnostics", None),
+        profile_composition=profile_composition,
+        transaction_costs=transaction_costs,
+        rebalance_diagnostics=rebalance_diagnostics,
+        parent_portofolio_id=str(old_portfolio_id) if old_portfolio_id else None,
+        execution_date=execution_day,
+        name_portofolio=name_portofolio,
+        description=description,
         user_id=str(user_uuid),
         fitness_score=float(solution.fitness),
         sharpe_ratio=float(solution.sharpe_ratio),
@@ -701,6 +1050,7 @@ def generate_new_portfolio(
         allocations=allocations,
         narasi_llm=narasi,
         rebalance_deltas=rebalance_deltas,
+        capital_contribution=float(applied_contribution),
     )
 
 
@@ -795,6 +1145,37 @@ def generate_rebalance_series(
             f"Jumlah langkah series ({len(schedule)}) melebihi batas "
             f"{MAX_SERIES_STEPS}. Perbesar interval_months atau perpendek rentang."
         )
+    policy = "legacy"
+    if request.bear_management:
+        user = db.query(User).filter(User.id == UUID(user_id)).first()
+        if user is None:
+            raise UserNotFoundError("User tidak ditemukan.")
+        policy = user.bear_allocation_policy
+        if policy == "manual":
+            if request.bear_choices is None or set(request.bear_choices) != set(schedule):
+                raise ValueError("Mode manual memerlukan pilihan modal untuk setiap tanggal series.")
+        for day in schedule:
+            preview = preview_bear_market(request.risk_profile, True, day)
+            if (preview["as_of"] is not None and
+                str((request.bear_preview_dates or {}).get(day)) != preview["as_of"]):
+                raise ValueError(f"Pratinjau tanggal {day} sudah berubah; muat ulang.")
+            if (request.bear_preview_fingerprints or {}).get(day) != preview["fingerprint"]:
+                raise ValueError(f"Indikator tanggal {day} berubah sejak pratinjau; muat ulang.")
+            effective_fraction(
+                preview, request.risk_profile,
+                ("recommended" if policy == "always_follow" and
+                 preview["status"] != "unknown" else
+                 (request.bear_choices or {}).get(day)),
+            )
+    if not math.isfinite(request.contribution_amount) or request.contribution_amount < 0:
+        raise ValueError("Nominal setoran berkala tidak valid.")
+    if request.contribution_amount > 0 and request.contribution_interval_months is None:
+        raise ValueError("Isi contribution_interval_months saat setoran berkala diaktifkan.")
+    contribution_dates = (
+        build_rebalance_schedule(request.start_date, request.end_date,
+                                 request.contribution_interval_months)[1:]
+        if request.contribution_amount > 0 else []
+    )
 
     logger.info(
         "=== REBALANCE SERIES (backtest): %d tanggal, %s s/d %s, interval %d bulan ===",
@@ -803,17 +1184,37 @@ def generate_rebalance_series(
 
     portfolios: list[PortfolioResponse] = []
     skipped: list[SkippedRebalanceStep] = []
+    last_applied_date = request.start_date
 
     for index, tanggal in enumerate(schedule):
         is_initial = index == 0
+        due_count = sum(last_applied_date < due <= tanggal for due in contribution_dates)
         # Request BARU tiap langkah: generate_new_portfolio memutasi budget
         # (override NAV) pada objek request, jadi tidak boleh dipakai ulang.
         step_request = PortfolioGenerateRequest(
             budget=request.budget,
+            fitness_policy=request.fitness_policy,
+            fitness_horizon_days=request.fitness_horizon_days,
+            fitness_cvar_tail_fraction=request.fitness_cvar_tail_fraction,
+            fitness_lambda_cvar=request.fitness_lambda_cvar,
+            fitness_lambda_benchmark_downside=request.fitness_lambda_benchmark_downside,
+            charge_transaction_fees=request.charge_transaction_fees,
+            rebalance_model=getattr(request, "rebalance_model", "legacy"),
+            rebalance_buy_fee_rate=getattr(request, "rebalance_buy_fee_rate", .0015),
+            rebalance_sell_fee_rate=getattr(request, "rebalance_sell_fee_rate", .0025),
+            profile_policy=getattr(request, "profile_policy", "legacy"),
             risk_profile=request.risk_profile,
+            name_portofolio=request.name_portofolio,
+            description=request.description,
             backtest=True,
             date_ref=tanggal,
             rebalance=not is_initial,  # langkah 1 = generate awal, sisanya rebalance
+            contribution_amount=due_count * request.contribution_amount,
+            bear_management=request.bear_management,
+            bear_choice=((request.bear_choices or {}).get(tanggal)
+                         if request.bear_management else None),
+            bear_preview_as_of=(request.bear_preview_dates or {}).get(tanggal),
+            bear_preview_fingerprint=(request.bear_preview_fingerprints or {}).get(tanggal),
         )
         try:
             hasil = generate_new_portfolio(
@@ -834,8 +1235,13 @@ def generate_rebalance_series(
             )
             skipped.append(SkippedRebalanceStep(date=tanggal, reason=str(e)))
             continue
+        except ValueError as e:
+            logger.error("Rebalance series gagal pada %s (fitness=%s, model=%s): %s",
+                         tanggal, request.fitness_policy, request.rebalance_model, e)
+            raise ValueError(f"Rebalance series gagal pada {tanggal}: {e}") from e
 
         portfolios.append(hasil)
+        last_applied_date = tanggal
         logger.info(
             "Rebalance series: langkah %d/%d selesai (%s, rebalance=%s, id=%s).",
             index + 1, len(schedule), tanggal, not is_initial, hasil.id,
@@ -852,6 +1258,8 @@ def generate_rebalance_series(
         scheduled_dates=schedule,
         portfolios=portfolios,
         skipped=skipped,
+        evaluation_mode=("legacy" if not request.bear_management else
+                         "automatic_strategy" if policy == "always_follow" else "what_if"),
     )
 
 
@@ -893,19 +1301,43 @@ def _query_items_with_ticker(db: Session, portofolio_id) -> list[tuple[Portofoli
     )
 
 
-def _to_portfolio_response(db: Session, portofolio: Portofolio) -> PortfolioResponse:
+def _to_portfolio_response(
+    db: Session, portofolio: Portofolio,
+    replay_cache: dict | None = None,
+    known_portfolios: dict | None = None,
+) -> PortfolioResponse:
     """Bangun PortfolioResponse dari satu baris Portofolio + item-itemnya.
 
     Dipakai BERSAMA oleh get_active_portfolio & get_all_my_portfolios agar bentuk
     respons selalu identik. Kas dan alokasi snapshot harus berasal dari kolom
     Portofolio yang disimpan saat eksekusi; perubahan harga_beli milik user
-    tidak merupakan BUY/SELL atau perubahan kas.
+    tidak merupakan BUY/SELL atau perubahan kas. Average beli snapshot
+    rebalance dihitung ulang dari rantai transaksi agar data lama juga akurat.
     """
     item_pairs = _query_items_with_ticker(db, portofolio.id)
     items = [pair[0] for pair in item_pairs]
+    average_buy_prices = (
+        _rebalance_cost_basis(db, portofolio, portofolio.user_id,
+                              replay_cache=replay_cache,
+                              known_portfolios=known_portfolios,
+                              allow_legacy_reference=True)
+        if getattr(portofolio, "is_rebalance", False) else None
+    )
+    allocations = [_to_item_response(item, ticker) for item, ticker in item_pairs]
+    if average_buy_prices is not None:
+        for allocation in allocations:
+            allocation.harga_beli = average_buy_prices.get(allocation.ticker)
 
+    metadata = getattr(portofolio, "rebalance_metadata", None) or {}
     return PortfolioResponse(
         id=str(portofolio.id),
+        fitness_policy=metadata.get("fitness_policy", "legacy"),
+        fitness_diagnostics=metadata.get("fitness_diagnostics"),
+        parent_portofolio_id=(str(portofolio.parent_portofolio_id)
+                             if getattr(portofolio, "parent_portofolio_id", None) else None),
+        execution_date=getattr(portofolio, "execution_date", None),
+        name_portofolio=getattr(portofolio, "name_portofolio", None),
+        description=getattr(portofolio, "description", None),
         user_id=str(portofolio.user_id),
         fitness_score=portofolio.fitness_score,
         sharpe_ratio=portofolio.sharpe_ratio,
@@ -922,8 +1354,12 @@ def _to_portfolio_response(db: Session, portofolio: Portofolio) -> PortfolioResp
         created_at=portofolio.created_at,
         date_ref=portofolio.date_ref,
         budget=portofolio.budget,
-        allocations=[_to_item_response(item, ticker) for item, ticker in item_pairs],
+        allocations=allocations,
         narasi_llm=portofolio.narasi_llm,
+        pending_deposit=getattr(portofolio, "pending_deposit", 0) or 0.0,
+        capital_contribution=getattr(portofolio, "capital_contribution", 0) or 0.0,
+        transaction_costs=getattr(portofolio, "transaction_costs", 0) or 0.0,
+        rebalance_diagnostics=getattr(portofolio, "rebalance_metadata", None),
     )
 
 
@@ -1011,7 +1447,138 @@ def get_all_my_portfolios(
         ", ".join(status_targets),
     )
 
-    return [_to_portfolio_response(db, portofolio) for portofolio in rows]
+    known_portfolios = {portofolio.id: portofolio for portofolio in rows}
+    replay_cache: dict = {}
+    return [
+        _to_portfolio_response(db, portofolio, replay_cache, known_portfolios)
+        for portofolio in rows
+    ]
+
+
+def delete_portfolio_lineage(db: Session, user_id: str, portfolio_id: str) -> dict:
+    """Hapus snapshot terpilih dan seluruh descendant rebalance secara atomik.
+
+    Ancestor tetap ada. Bila snapshot aktif termasuk yang dihapus, ancestor
+    terdekat atau snapshot tersisa terbaru pada mode yang sama menjadi aktif.
+    Item ancestor yang tidak lagi memiliki child dibuka kembali masa berlakunya.
+    """
+    user_uuid = _parse_user_uuid(user_id, db)
+    try:
+        target_id = UUID(str(portfolio_id))
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise PortfolioNotFoundError("Portofolio tidak ditemukan.") from exc
+
+    target = (
+        db.query(Portofolio)
+        .filter(Portofolio.id == target_id, Portofolio.user_id == user_uuid)
+        .with_for_update()
+        .first()
+    )
+    if target is None:
+        raise PortfolioNotFoundError("Portofolio tidak ditemukan.")
+
+    backtest = target.status_portofolio.endswith("_backtest")
+    active_status = STATUS_ACTIVE_BACKTEST if backtest else STATUS_ACTIVE
+    replaced_status = STATUS_REPLACED_BACKTEST if backtest else STATUS_REPLACED
+    if target.parent_portofolio_id is not None:
+        parent = (
+            db.query(Portofolio)
+            .filter(Portofolio.id == target.parent_portofolio_id)
+            .with_for_update()
+            .first()
+        )
+        if parent is not None and (
+            parent.user_id != user_uuid or
+            parent.status_portofolio.endswith("_backtest") != backtest
+        ):
+            raise PortfolioLineageConflictError(
+                "Rantai rebalance tidak konsisten; portofolio tidak dihapus."
+            )
+    levels: list[list[Portofolio]] = [[target]]
+    seen = {target.id}
+    while levels[-1]:
+        children = (
+            db.query(Portofolio)
+            .filter(Portofolio.parent_portofolio_id.in_([row.id for row in levels[-1]]))
+            .with_for_update()
+            .all()
+        )
+        if not children:
+            break
+        for child in children:
+            if child.id in seen or child.user_id != user_uuid or (
+                child.status_portofolio.endswith("_backtest") != backtest
+            ):
+                raise PortfolioLineageConflictError(
+                    "Rantai rebalance tidak konsisten; portofolio tidak dihapus."
+                )
+            seen.add(child.id)
+        levels.append(children)
+
+    snapshots = [row for level in levels for row in level]
+    deleted_ids = [row.id for row in snapshots]
+    deleted_set = set(deleted_ids)
+    deleted_active = any(row.status_portofolio == active_status for row in snapshots)
+    retained_parents = {
+        row.parent_portofolio_id for row in snapshots
+        if row.parent_portofolio_id is not None and row.parent_portofolio_id not in deleted_set
+    }
+
+    item_count = (
+        db.query(PortofolioItem)
+        .filter(PortofolioItem.portofolio_id.in_(deleted_ids))
+        .delete(synchronize_session=False)
+    )
+    # Hapus dari daun ke parent agar tetap aman pada database yang FK parent-nya
+    # belum memakai ON DELETE SET NULL.
+    for level in reversed(levels):
+        for row in level:
+            db.query(Portofolio).filter(Portofolio.id == row.id).delete(
+                synchronize_session=False
+            )
+
+    for parent_id in retained_parents:
+        retained_parent = db.query(Portofolio.id).filter(
+            Portofolio.id == parent_id, Portofolio.user_id == user_uuid,
+        ).first()
+        has_child = db.query(Portofolio.id).filter(
+            Portofolio.parent_portofolio_id == parent_id
+        ).first() is not None
+        if retained_parent is not None and not has_child:
+            db.query(PortofolioItem).filter(
+                PortofolioItem.portofolio_id == parent_id
+            ).update({PortofolioItem.end_date: None}, synchronize_session=False)
+
+    remaining = (
+        db.query(Portofolio)
+        .filter(
+            Portofolio.user_id == user_uuid,
+            Portofolio.status_portofolio.in_((active_status, replaced_status)),
+        )
+        .order_by(Portofolio.created_at.desc(), Portofolio.id.desc())
+        .all()
+    )
+    active = next((row for row in remaining if row.status_portofolio == active_status), None)
+    if deleted_active and active is None and remaining:
+        parent_ids = {row.parent_portofolio_id for row in remaining}
+        leaves = [row for row in remaining if row.id not in parent_ids]
+        active = next(
+            (row for row in leaves if row.id == target.parent_portofolio_id),
+            leaves[0] if leaves else None,
+        )
+        if active is not None:
+            active.status_portofolio = active_status
+            db.query(PortofolioItem).filter(
+                PortofolioItem.portofolio_id == active.id
+            ).update({PortofolioItem.end_date: None}, synchronize_session=False)
+
+    db.commit()
+    return {
+        "deleted_portfolio_ids": [str(row_id) for row_id in deleted_ids],
+        "deleted_portfolios": len(deleted_ids),
+        "deleted_items": item_count,
+        "active_portfolio_id": str(active.id) if active is not None else None,
+    }
 
 
 def list_portfolio_history(db: Session, user_id: str) -> list[PortfolioHistoryItem]:
@@ -1029,6 +1596,8 @@ def list_portfolio_history(db: Session, user_id: str) -> list[PortfolioHistoryIt
     return [
         PortfolioHistoryItem(
             id=str(p.id),
+            name_portofolio=getattr(p, "name_portofolio", None),
+            description=getattr(p, "description", None),
             budget=p.budget,
             total_terpakai=p.total_terpakai,
             sisa_budget=p.sisa_budget,
@@ -1055,48 +1624,38 @@ def get_portfolio_by_id(db: Session, portfolio_id: str) -> PortfolioResponse:
     portfolio = db.query(Portofolio).filter(Portofolio.id == portfolio_uuid).first()
     if not portfolio:
         raise ValueError(f"Portofolio dengan ID {portfolio_id} tidak ditemukan.")
-
-    item_pairs = _query_items_with_ticker(db, portfolio_uuid)
-    items = [pair[0] for pair in item_pairs]
-
-    allocations = [
-        {
-            "item_id": str(item.id),
-            "ticker": ticker,
-            "lots": item.jumlah_lot,
-            "price_per_lot": (item.harga_acuan or 0.0) * 100.0,  # DB per lembar -> response per lot
-            "harga_beli": item.harga_beli,
-            "allocation": (item.jumlah_lot or 0) * 100.0 * (item.harga_acuan or 0.0),
-            "weight": item.bobot_persentase / 100.0,
-        }
-        for item, ticker in item_pairs
-    ]
-
-    return PortfolioResponse(
-        id=str(portfolio.id),
-        user_id=str(portfolio.user_id),
-        fitness_score=portfolio.fitness_score,
-        sharpe_ratio=portfolio.sharpe_ratio,
-        expected_return=None,  # Tidak disimpan di DB, bisa dihitung ulang jika perlu
-        max_drawdown=portfolio.max_drawdown,
-        avg_correlation=portfolio.avg_correlation,
-        skor_fundamental=portfolio.skor_fundamental,
-        total_terpakai=portfolio.total_terpakai,
-        sisa_budget=portfolio.sisa_budget,
-        n_active=len(items),
-        allocated_budget_ok=portfolio.sisa_budget >= -0.01,
-        risk_profile=portfolio.risk_profile,
-        status_portofolio=portfolio.status_portofolio,
-        created_at=portfolio.created_at,
-        date_ref=portfolio.date_ref,  # acuan tanggal: tanggal simulasi (backtest) / waktu generate (live)
-        budget=portfolio.budget,
-        allocations=allocations,
-        narasi_llm=portfolio.narasi_llm,
-    )
+    return _to_portfolio_response(db, portfolio)
 
 
 class ItemNotFoundError(Exception):
     """Exception domain: item portofolio tidak ditemukan / bukan milik user."""
+
+
+def add_live_capital(db: Session, user_id: str, amount: float) -> PortfolioResponse:
+    """Catat setoran sebagai kas tertunda, tanpa mengubah snapshot historis/NAV.
+
+    Dana baru masuk ke kas eksekusi dan NAV pada rebalance live berikutnya.
+    """
+    if not math.isfinite(amount) or amount <= 0:
+        raise ValueError("Nominal setoran harus lebih dari nol dan berupa angka terbatas.")
+    try:
+        user_uuid = UUID(user_id)
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise UserNotFoundError("User ID pada token tidak valid.") from exc
+    portfolio = (db.query(Portofolio)
+                 .filter(Portofolio.user_id == user_uuid,
+                         Portofolio.status_portofolio == STATUS_ACTIVE)
+                 .order_by(Portofolio.created_at.desc(), Portofolio.id.desc())
+                 .with_for_update().first())
+    if portfolio is None:
+        raise PortfolioNotFoundError("Belum ada portofolio live aktif untuk ditambah modal.")
+    pending = _money(portfolio.pending_deposit or 0) + _money(amount)
+    if not pending.is_finite():
+        raise ValueError("Total setoran tidak valid.")
+    portfolio.pending_deposit = float(pending)
+    db.commit()
+    db.refresh(portfolio)
+    return _to_portfolio_response(db, portfolio)
 
 
 def update_harga_beli(db: Session, user_id: str, item_id: str, harga_beli: float) -> PortofolioItem:
@@ -1108,6 +1667,9 @@ def update_harga_beli(db: Session, user_id: str, item_id: str, harga_beli: float
     Raises: ItemNotFoundError.
     """
     from uuid import UUID
+
+    if not math.isfinite(harga_beli) or harga_beli <= 0:
+        raise ValueError("Harga beli per lembar harus berupa angka positif yang terbatas.")
 
     try:
         user_uuid = UUID(user_id)
@@ -1131,9 +1693,13 @@ def update_harga_beli(db: Session, user_id: str, item_id: str, harga_beli: float
             "Item portofolio tidak ditemukan, bukan milik Anda, atau portofolionya sudah tidak aktif."
         )
 
+    total_investasi = float(item.jumlah_lot) * 100.0 * float(harga_beli)
+    if not math.isfinite(total_investasi) or total_investasi * 100 > 2**53 - 1:
+        raise ValueError("Total harga beli terlalu besar untuk dicatat dengan akurat.")
+
     item.harga_beli = float(harga_beli)
     # total_investasi dihitung ulang berdasar harga beli user (per lembar x 100)
-    item.total_investasi = float(item.jumlah_lot) * 100.0 * float(harga_beli)
+    item.total_investasi = total_investasi
     db.flush()
 
     db.commit()
@@ -1188,7 +1754,7 @@ def _latest_available_price_date(db: Session, stock_ids: list, end_date=None):
     return latest.date() if hasattr(latest, "date") else latest
 
 
-def _sync_prices_on_demand(db: Session, reason: str) -> dict | None:
+def _sync_prices_on_demand(db: Session, reason: str, stock_ids: list | None = None) -> dict | None:
     """
     Jalankan sync_market_data (yfinance -> tabel market_data + idx_composite)
     SATU KALI untuk mengisi data harga yang belum ada.
@@ -1206,7 +1772,8 @@ def _sync_prices_on_demand(db: Session, reason: str) -> dict | None:
 
     try:
         logger.info("Auto-sync harga dimulai (%s): menarik histori harian via yfinance...", reason)
-        stats = sync_market_data(db)
+        stats = (sync_market_data(db, stock_ids=stock_ids) if stock_ids is not None
+                 else sync_market_data(db))
         logger.info(
             "Auto-sync harga selesai (%s): %s saham, %s baris harga, %s baris IHSG, %s error.",
             reason, stats.get("stocks"), stats.get("rows_upserted"),
@@ -1652,7 +2219,10 @@ def _get_portfolio_performance_legacy(
 # ----------------------------------------------------------------------
 # NAV accounting performance (portfolio snapshots / rebalance chain)
 # ----------------------------------------------------------------------
-def _portfolio_lineage(db: Session, portfolio: Portofolio, user_uuid: UUID) -> list[Portofolio]:
+def _portfolio_lineage(
+    db: Session, portfolio: Portofolio, user_uuid: UUID,
+    known_portfolios: dict | None = None,
+) -> list[Portofolio]:
     """Return the root-to-leaf snapshot chain for ``portfolio``.
 
     A rebalance creates a new ``Portofolio`` whose ``parent_portofolio_id``
@@ -1675,7 +2245,8 @@ def _portfolio_lineage(db: Session, portfolio: Portofolio, user_uuid: UUID) -> l
         chain.append(current)
         if current.parent_portofolio_id is None:
             break
-        current = (
+        parent = (known_portfolios or {}).get(current.parent_portofolio_id)
+        current = parent if parent is not None else (
             db.query(Portofolio)
             .filter(
                 Portofolio.id == current.parent_portofolio_id,
@@ -1757,19 +2328,30 @@ def _apply_position_snapshot(
 
 def _rebalance_cost_basis(
     db: Session, portfolio: Portofolio, user_uuid: UUID,
+    replay_cache: dict | None = None,
+    known_portfolios: dict | None = None,
+    allow_legacy_reference: bool = False,
 ) -> dict[str, float | None]:
     """Replay recorded lot deltas to recover the held positions' average cost.
 
-    Legacy fills without execution prices stay unknown. Live PATCH corrections
+    Display/GA callers may reconstruct legacy buys from the saved acquisition
+    reference price. Strict accounting callers still require execution prices.
+    Live PATCH corrections
     are applied to the remaining lots, matching the performance endpoint.
-    This is advisory GA input; it never rewrites cash or historical snapshots.
+    Used for GA input and read-time average buy prices; it does not rewrite
+    cash or historical snapshots.
     """
     is_backtest = portfolio.status_portofolio in (
         STATUS_ACTIVE_BACKTEST, STATUS_REPLACED_BACKTEST
     )
     positions: dict[str, int] = {}
     basis: dict[str, float | None] = {}
-    for node in _portfolio_lineage(db, portfolio, user_uuid):
+    for node in _portfolio_lineage(db, portfolio, user_uuid, known_portfolios):
+        cache_key = (node.id, allow_legacy_reference)
+        if replay_cache is not None and cache_key in replay_cache:
+            cached_positions, cached_basis = replay_cache[cache_key]
+            positions, basis = dict(cached_positions), dict(cached_basis)
+            continue
         items = _snapshot_positions(db, node.id)
         next_positions = {code: item["lots"] for code, item in items.items()}
         raw_prices = node.execution_prices if isinstance(node.execution_prices, dict) else {}
@@ -1781,6 +2363,15 @@ def _rebalance_cost_basis(
                 price = float(raw_prices[code])
             except (KeyError, TypeError, ValueError, OverflowError):
                 price = None
+            # Older simulations stored their purchase mark on the item,
+            # before execution_prices existed. Use that mark only for added
+            # lots; never reset the remaining position to today's mark.
+            if (price is None and allow_legacy_reference and node.execution_prices is None
+                    and next_positions.get(code, 0) > positions.get(code, 0)):
+                try:
+                    price = float(items[code].get("reference_price"))
+                except (TypeError, ValueError, OverflowError):
+                    price = None
             prices[code] = price if price is not None and math.isfinite(price) and price > 0 else None
         basis, _ = _apply_position_snapshot(positions, basis, next_positions, prices, 0.0)
         if not is_backtest:
@@ -1796,6 +2387,8 @@ def _rebalance_cost_basis(
                     abs(shares * purchase - shares * reference) > 0.01):
                     basis[code] = purchase
         positions = next_positions
+        if replay_cache is not None:
+            replay_cache[cache_key] = (dict(positions), dict(basis))
     return basis
 
 
@@ -1814,9 +2407,11 @@ def get_portfolio_performance(
     may correct the remaining position's basis without moving cash. Persisted
     cash is a reconciliation check. Raw Close is a daily valuation mark.
 
-    Fees, taxes, dividends, deposits/withdrawals, and explicit corporate-action
-    events are not represented by current models. New simulations explicitly
-    assume zero transaction costs; other untracked components stay unknown.
+    Setoran tercatat sebagai arus dana eksternal pada snapshot rebalance.
+    Dividen bruto diakui sebagai pendapatan/piutang sejak ex-date berdasarkan
+    posisi sebelum ex-date. File sumber tidak memiliki tanggal pembayaran;
+    piutang tidak menjadi kas transaksi dan tidak direinvestasikan otomatis.
+    Biaya, pajak, penarikan dan corporate action lain belum dimodelkan.
     """
     import pandas as pd
 
@@ -1850,8 +2445,10 @@ def get_portfolio_performance(
             "budget": float(node.budget),
             "total_terpakai": float(node.total_terpakai),
             "cash": float(node.sisa_budget) if node.sisa_budget is not None else None,
+            "capital_contribution": float(getattr(node, "capital_contribution", 0) or 0),
             "positions": _snapshot_positions(db, node.id),
             "execution_prices": node.execution_prices,
+            "transaction_costs": float(getattr(node, "transaction_costs", 0) or 0),
         }
         for node in lineage
     ]
@@ -1887,8 +2484,14 @@ def get_portfolio_performance(
     sync_stats = None
     if not is_backtest:
         price_rows = _query_price_rows(db, stock_ids, price_query_start, valuation_end)
-        if not price_rows:
-            sync_stats = _sync_prices_on_demand(db, reason=f"data performa {portfolio_id}")
+        available_ids = {str(row.stock_id) for row in price_rows
+                         if row.close is not None and math.isfinite(row.close) and row.close > 0}
+        missing_ids = [stock_id for stock_id in stock_ids if str(stock_id) not in available_ids]
+        if missing_ids:
+            sync_stats = _sync_prices_on_demand(
+                db, reason=f"histori saham belum lengkap untuk performa {portfolio_id}",
+                stock_ids=missing_ids,
+            )
             price_rows = _query_price_rows(db, stock_ids, price_query_start, valuation_end)
         if not price_rows:
             fallback = _latest_available_price_date(db, stock_ids, valuation_end)
@@ -1903,8 +2506,12 @@ def get_portfolio_performance(
             {"date": row.date, "ticker": stock_id_to_ticker[str(row.stock_id)],
              "price": row.close}
             for row in price_rows
-            if row.close is not None
+            if row.close is not None and math.isfinite(row.close) and row.close > 0
         ]
+        if not records:
+            raise PortfolioNotFoundError(
+                "Belum ada harga Close valid untuk rentang performa. " + _describe_sync(sync_stats)
+            )
         df_price = pd.DataFrame(records).pivot_table(
             index="date", columns="ticker", values="price", aggfunc="last"
         ).sort_index()
@@ -1975,7 +2582,33 @@ def get_portfolio_performance(
     events: list[dict] = []
     reasons: list[str] = []
     accounting_status = "verified"
+    dividend_events: list[dict] = []
+    dividend_data = {"source": "data/dividend_events_20_tahun.xlsx", "status": "available",
+                     "coverage": "recorded_events_only", "reasons": []}
+    try:
+        dividend_history = load_dividend_history()
+        dividend_schedule = dividend_entitlements(dividend_history, snapshots, df_price.index.max().date())
+        dividend_income: Decimal | None = Decimal("0")
+        dividend_data.update({
+            "first_event_date": str(dividend_history.first_event_date),
+            "last_event_date": str(dividend_history.last_event_date),
+        })
+        if dividend_history.last_event_date is not None and df_price.index.max().date() > dividend_history.last_event_date:
+            dividend_data["status"] = "partial"
+            dividend_data["reasons"].append(
+                f"Akhir valuasi melewati event terakhir dalam arsip dividen ({dividend_history.last_event_date}); dividen setelahnya belum dapat dipastikan lengkap."
+            )
+    except DividendDataUnavailableError as exc:
+        dividend_schedule = []
+        dividend_income = None
+        dividend_data["status"] = "unavailable"
+        dividend_data["reasons"].append(str(exc))
+        logger.warning("Dividen performa %s tidak tersedia: %s", portfolio_id, exc)
+    dividend_index = 0
     prior_nav: Decimal | None = None
+    total_contributions = Decimal("0")
+    cumulative_growth: Decimal | None = Decimal("1")
+    cumulative_transaction_costs = Decimal("0")
     tolerance = Decimal("0.05")
 
     def mark_problem(message: str, legacy: bool = False) -> None:
@@ -1985,10 +2618,40 @@ def get_portfolio_performance(
         if accounting_status != "invalid":
             accounting_status = "legacy_unverified" if legacy else "invalid"
 
+    for reason in dividend_data["reasons"]:
+        mark_problem(reason, legacy=True)
+
     for timestamp in df_price.index:
         day = timestamp.date()
+        day_contributions = Decimal("0")
+        day_dividends = Decimal("0") if dividend_income is not None else None
+        while dividend_index < len(dividend_schedule) and dividend_schedule[dividend_index]["ex_date"] <= day:
+            entitlement = dividend_schedule[dividend_index]
+            dividend_income += entitlement["amount"]
+            day_dividends += entitlement["amount"]
+            dividend_events.append({
+                **{key: value for key, value in entitlement.items()
+                   if key not in ("ex_date", "dividend_per_share", "amount")},
+                "ex_date": entitlement["ex_date"].isoformat(),
+                "recognition_date": day.isoformat(),
+                "dividend_per_share": float(entitlement["dividend_per_share"]),
+                "amount": float(entitlement["amount"]),
+            })
+            dividend_index += 1
         while active_snapshot_index < len(snapshots) and snapshots[active_snapshot_index]["date"] <= day:
             snapshot = snapshots[active_snapshot_index]
+            fee = _money(snapshot['transaction_costs'])
+            if not fee.is_finite() or fee < 0:
+                mark_problem(f"Biaya snapshot {snapshot['id']} tidak valid.")
+                cash_balance = None
+                fee = Decimal('0')
+            cumulative_transaction_costs += fee
+            contribution = _money(snapshot["capital_contribution"])
+            if not contribution.is_finite() or contribution < 0 or (active_snapshot_index == 0 and contribution):
+                mark_problem(f"Setoran snapshot {snapshot['id']} tidak valid.")
+                contribution = Decimal("0")
+            day_contributions += contribution
+            total_contributions += contribution
             next_positions = {ticker: int(data["lots"]) for ticker, data in snapshot["positions"].items()}
             invalid_window = False
             for ticker, data in snapshot["positions"].items():
@@ -2034,7 +2697,8 @@ def get_portfolio_performance(
                     missing_price_tickers.append(ticker)
                 else:
                     before_holdings += lots * 100 * _money(df_price.at[timestamp, ticker])
-            nav_before = cash_before + before_holdings if cash_before is not None and before_known else None
+            nav_before = (cash_before + before_holdings + dividend_income
+                          if cash_before is not None and before_known and dividend_income is not None else None)
             prices = snapshot["execution_prices"]
             event_realized: Decimal | None = Decimal("0")
             if prices is None:
@@ -2071,7 +2735,7 @@ def get_portfolio_performance(
                     cost_basis = {ticker: None for ticker in next_positions}
                     event_realized = None
                 else:
-                    next_cash = cash_before
+                    next_cash = cash_before + contribution - fee
                     for ticker, lots_delta in delta.items():
                         price = changed_prices[ticker]
                         next_cash -= lots_delta * 100 * price
@@ -2125,10 +2789,10 @@ def get_portfolio_performance(
                         cost_basis[ticker] = _money(purchase)
             positions = next_positions
             after_nav = None
-            if cash_balance is not None and all(
+            if cash_balance is not None and dividend_income is not None and all(
                 ticker in valid_tickers and pd.notna(df_price.at[timestamp, ticker]) for ticker in positions
             ):
-                after_nav = cash_balance + sum(
+                after_nav = cash_balance + dividend_income + sum(
                     lots * 100 * _money(df_price.at[timestamp, ticker]) for ticker, lots in positions.items()
                 )
             if active_snapshot_index > 0:
@@ -2136,10 +2800,13 @@ def get_portfolio_performance(
                     "portfolio_id": snapshot["id"], "execution_date": day.isoformat(),
                     "delta_lots": dict(sorted(delta.items())),
                     "cash_before": float(cash_before) if cash_before is not None else None,
+                    "capital_contribution": float(contribution),
+                    "transaction_costs": float(fee),
                     "cash_after": float(cash_balance) if cash_balance is not None else None,
                     "nav_before": float(nav_before) if nav_before is not None else None,
                     "nav_after": float(after_nav) if after_nav is not None else None,
                     "realized_pnl_delta": float(event_realized) if event_realized is not None else None,
+                    "dividend_receivable": float(dividend_income) if dividend_income is not None else None,
                 })
             active_snapshot_index += 1
 
@@ -2164,13 +2831,26 @@ def get_portfolio_performance(
                 unrealized_pnl += market_value - lots * 100 * basis
         if not holdings_known:
             mark_problem(f"Harga valuasi tidak tersedia pada {day}; NAV hari itu tidak dapat dihitung.")
-        nav = cash_balance + holdings_value if cash_balance is not None and holdings_known else None
-        daily_return = nav / prior_nav - 1 if nav is not None and prior_nav not in (None, 0) else None
-        cumulative_return = nav / initial_capital - 1 if nav is not None and initial_capital else None
+        nav_excluding_dividends = cash_balance + holdings_value if cash_balance is not None and holdings_known else None
+        nav = (nav_excluding_dividends + dividend_income
+               if nav_excluding_dividends is not None and dividend_income is not None else None)
+        daily_return = ((nav - day_contributions) / prior_nav - 1
+                        if nav is not None and prior_nav not in (None, 0) else
+                        (nav / initial_capital - 1 if nav is not None and prior_nav is None and not rows else None))
+        if cumulative_growth is not None and daily_return is not None:
+            cumulative_growth *= 1 + daily_return
+        elif nav is None:
+            cumulative_growth = None
+        cumulative_return = cumulative_growth - 1 if nav is not None and cumulative_growth is not None else None
         rows.append({
             "date": timestamp, "portfolio_value": nav, "cash_balance": cash_balance,
             "holdings_market_value": holdings_value if holdings_known else None,
+            "portfolio_value_excluding_dividends": nav_excluding_dividends,
+            "dividend_income": day_dividends, "dividend_income_cumulative": dividend_income,
+            "dividend_receivable": dividend_income,
             "daily_return": daily_return, "portfolio_return": cumulative_return,
+            "capital_contribution": day_contributions,
+            "total_contributions": total_contributions,
             "realized_pnl_cumulative": realized_pnl, "unrealized_pnl": unrealized_pnl,
             "stale_price_tickers": sorted(stale_tickers),
         })
@@ -2223,8 +2903,14 @@ def get_portfolio_performance(
             "portfolio_value": float(row["portfolio_value"]) if pd.notna(row["portfolio_value"]) else None,
             "cash_balance": float(row["cash_balance"]) if pd.notna(row["cash_balance"]) else None,
             "holdings_market_value": float(row["holdings_market_value"]) if pd.notna(row["holdings_market_value"]) else None,
+            "portfolio_value_excluding_dividends": float(row["portfolio_value_excluding_dividends"]) if pd.notna(row["portfolio_value_excluding_dividends"]) else None,
+            "dividend_income": float(row["dividend_income"]) if pd.notna(row["dividend_income"]) else None,
+            "dividend_income_cumulative": float(row["dividend_income_cumulative"]) if pd.notna(row["dividend_income_cumulative"]) else None,
+            "dividend_receivable": float(row["dividend_receivable"]) if pd.notna(row["dividend_receivable"]) else None,
             "daily_return": float(row["daily_return"]) if pd.notna(row["daily_return"]) else None,
             "portfolio_return": float(row["portfolio_return"]) if pd.notna(row["portfolio_return"]) else None,
+            "capital_contribution": float(row["capital_contribution"]),
+            "total_contributions": float(row["total_contributions"]),
             "realized_pnl_cumulative": float(row["realized_pnl_cumulative"]) if pd.notna(row["realized_pnl_cumulative"]) else None,
             "unrealized_pnl": float(row["unrealized_pnl"]) if pd.notna(row["unrealized_pnl"]) else None,
             "stale_price_tickers": row["stale_price_tickers"],
@@ -2246,7 +2932,11 @@ def get_portfolio_performance(
         "accounting_status": accounting_status,
         "accounting_reasons": reasons,
         "initial_capital": float(initial_capital),
+        "total_contributions": float(total_contributions),
         "final_nav": final_row["portfolio_value"] if final_row else None,
+        "final_nav_excluding_dividends": final_row["portfolio_value_excluding_dividends"] if final_row else None,
+        "net_investment_gain": (final_row["portfolio_value"] - float(initial_capital + total_contributions)
+                                if final_row and final_row["portfolio_value"] is not None else None),
         # Portfolio_return remains a decimal for chart compatibility; this
         # summary field is an actual percentage as its name states.
         "total_return_pct": (
@@ -2256,10 +2946,17 @@ def get_portfolio_performance(
         ),
         "realized_pnl": final_row["realized_pnl_cumulative"] if final_row else None,
         "unrealized_pnl": final_row["unrealized_pnl"] if final_row else None,
-        "dividend_income": None,
-        "transaction_costs": 0.0 if accounting_status == "verified" else None,
+        "dividend_income": final_row["dividend_income_cumulative"] if final_row else None,
+        "dividend_receivable": final_row["dividend_receivable"] if final_row else None,
+        "dividend_events": dividend_events,
+        "dividend_data": dividend_data,
+        "dividend_policy": {"recognition": "ex_date_accrual", "payment_dates_available": False,
+                            "cash_payments_modeled": False, "reinvested": False, "tax_modeled": False},
+        "transaction_costs": float(cumulative_transaction_costs) if accounting_status == "verified" else None,
         "accounting_limitations": [
-            "Simulasi baru mengasumsikan biaya transaksi nol; pajak, dividen, setoran/penarikan eksternal dan corporate action belum dimodelkan.",
+            "Setoran pada snapshot rebalance tercatat sebagai arus dana eksternal dan dikeluarkan dari return; setoran live yang masih menunggu rebalance belum masuk NAV. Penarikan belum dimodelkan.",
+            "Biaya transaksi memakai nilai tersimpan pada setiap snapshot (default nol untuk snapshot lama); pajak dan corporate action selain dividen tunai belum dimodelkan.",
+            "Dividen bruto memakai event dalam arsip lokal dan kepemilikan sebelum ex-date. Tanggal pembayaran tidak tersedia: pendapatan ditahan sebagai piutang dalam NAV, tidak menambah kas transaksi dan tidak direinvestasikan. Kelengkapan arsip dan penyesuaian nominal akibat stock split perlu diperiksa terhadap sumber.",
             "Valuasi memakai raw Close; cost basis backtest dihitung weighted-average dari harga eksekusi, sedangkan harga_beli yang diubah pengguna menjadi koreksi basis live tanpa mengubah kas.",
             "Backtest mengambil keputusan dari data sampai sesi sebelumnya lalu mensimulasikan eksekusi pada Close sesi efektif; event dengan kas tidak cukup ditolak.",
             "Harga valuasi terakhir dapat diteruskan maksimum tujuh hari kalender; setelah itu NAV tidak dilaporkan tanpa harga baru.",

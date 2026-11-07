@@ -1,9 +1,13 @@
 from datetime import date
+from typing import Literal
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from src.backend.models.database import get_db
+from src.backend.models.users import User
 from src.backend.core.deps import get_current_user
 from src.backend.models.schemas.portfolio_schema import (
     ApiResponse,
@@ -13,10 +17,12 @@ from src.backend.models.schemas.portfolio_schema import (
     RebalanceSeriesGenerateRequest,
     RebalanceSeriesResponse,
     UpdateHargaBeliRequest,
+    AddCapitalRequest,
 )
 from src.backend.controller.portfolio_controller import (
     ItemNotFoundError,
     MarketDataUnavailableError,
+    PortfolioLineageConflictError,
     PortfolioNotFoundError,
     StockNotFoundError,
     UserNotFoundError,
@@ -24,9 +30,13 @@ from src.backend.controller.portfolio_controller import (
     generate_rebalance_series,
     get_active_portfolio,
     get_all_my_portfolios,
+    delete_portfolio_lineage,
     list_portfolio_history,
     update_harga_beli,
     get_portfolio_performance,
+    add_live_capital,
+    preview_bear_market,
+    preview_bear_series,
 )
 from src.backend.controller.market_controller import (
     get_price_history,
@@ -34,6 +44,75 @@ from src.backend.controller.market_controller import (
 from src.backend.core.deps import get_current_user
 
 router = APIRouter()
+
+
+class BearPolicyUpdate(BaseModel):
+    policy: Literal["manual", "always_follow"]
+
+
+@router.get("/bear-policy", response_model=ApiResponse[dict])
+def api_get_bear_policy(db: Session = Depends(get_db),
+                        current_user: dict = Depends(get_current_user)):
+    user = db.query(User).filter(User.id == UUID(current_user["sub"])).first()
+    if user is None:
+        raise HTTPException(status_code=404, detail="User tidak ditemukan.")
+    return ApiResponse(data={"policy": user.bear_allocation_policy})
+
+
+@router.patch("/bear-policy", response_model=ApiResponse[dict])
+def api_update_bear_policy(body: BearPolicyUpdate, db: Session = Depends(get_db),
+                           current_user: dict = Depends(get_current_user)):
+    user = db.query(User).filter(User.id == UUID(current_user["sub"])).first()
+    if user is None:
+        raise HTTPException(status_code=404, detail="User tidak ditemukan.")
+    user.bear_allocation_policy = body.policy
+    db.commit()
+    return ApiResponse(data={"policy": body.policy})
+
+
+@router.get("/bear-market-preview", response_model=ApiResponse[dict])
+def api_preview_bear_market(
+    risk_profile: str, backtest: bool = False, date_ref: date | None = None,
+    current_user: dict = Depends(get_current_user),
+):
+    try:
+        return ApiResponse(data=preview_bear_market(risk_profile, backtest, date_ref))
+    except (ValueError, MarketDataUnavailableError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/bear-market-series-preview", response_model=ApiResponse[dict])
+def api_preview_bear_series(
+    body: RebalanceSeriesGenerateRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    try:
+        return ApiResponse(data=preview_bear_series(
+            body.start_date, body.end_date, body.interval_months, body.risk_profile,
+        ))
+    except (ValueError, MarketDataUnavailableError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/my-portfolio/add-capital", response_model=ApiResponse[PortfolioResponse])
+def api_add_live_capital(
+    body: AddCapitalRequest,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Antrekan setoran pada portofolio live aktif; dana dipakai saat rebalance."""
+    try:
+        result = add_live_capital(db, current_user["sub"], body.amount)
+    except (PortfolioNotFoundError, UserNotFoundError) as exc:
+        db.rollback()
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Gagal mencatat setoran: {exc}") from exc
+    return ApiResponse(message="Setoran dicatat dan tersedia pada rebalance live berikutnya.", data=result)
 
 @router.post("/generate", response_model=ApiResponse[PortfolioResponse])
 def api_generate_portfolio(
@@ -313,6 +392,30 @@ def api_my_portfolio_all(
     )
 
 
+@router.delete("/my-portfolio/{portfolio_id}", response_model=ApiResponse[dict])
+def api_delete_portfolio(
+    portfolio_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Hapus portofolio milik user, item, dan seluruh rebalance turunannya."""
+    try:
+        result = delete_portfolio_lineage(db, current_user["sub"], str(portfolio_id))
+    except (PortfolioNotFoundError, UserNotFoundError) as exc:
+        db.rollback()
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PortfolioLineageConflictError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Gagal menghapus portofolio.") from exc
+    return ApiResponse(
+        message=f"{result['deleted_portfolios']} portofolio dan seluruh item terkait berhasil dihapus.",
+        data=result,
+    )
+
+
 @router.get("/price-history", response_model=ApiResponse[dict])
 def price_history_endpoint(
     db: Session = Depends(get_db),
@@ -353,7 +456,9 @@ def portofolio_performance_endpoint(
     Perhitungan memakai rantai snapshot parent_portofolio_id dan selisih lot
     BUY/SELL/HOLD. date_ref adalah tanggal pembentukan/jadwal; execution_date
     adalah hari komposisi baru mulai berlaku. Window item [start_date, end_date)
-    membatasi masa berlaku snapshot. NAV = kas + lot aktif x 100 x raw Close.
+    membatasi masa berlaku snapshot. NAV = kas + lot aktif x 100 x raw Close
+    + piutang dividen bruto. Dividen diakui sejak ex-date dari posisi sebelumnya;
+    pembayaran/reinvestasi tidak diasumsikan tanpa tanggal pembayaran.
     Untuk seluruh rangkaian rebalance, gunakan ID snapshot terakhir.
 
     Path param:
@@ -406,6 +511,8 @@ def update_harga_beli_endpoint(
         )
     except ItemNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     return ApiResponse(
         status="success",
         message="Harga beli berhasil diperbarui.",

@@ -1,6 +1,10 @@
 from dataclasses import dataclass
-from typing import List, Optional
+from datetime import date
+from typing import List, Optional, TYPE_CHECKING
 import numpy as np
+
+if TYPE_CHECKING:
+    from .market_stress import MarketStressData
 
 @dataclass
 class MarketData:
@@ -14,6 +18,15 @@ class MarketData:
     fundamental_metrics: np.ndarray      # (n_stocks, 5) PER/PBV/ROE/DER/DivYld
     risk_free_rate: float                # annual fraction, e.g. 0.0575
     rebalance_signal: Optional[np.ndarray] = None  # recent trend/downside change, [-1, 1]
+    price_date: Optional[date] = None    # session of raw candidate Close used for a live fill
+    momentum_signal: Optional[np.ndarray] = None  # trailing risk-adjusted momentum, [-1, 1]
+    market_stress: Optional["MarketStressData"] = None
+    dividend_yields: Optional[np.ndarray] = None  # fractional TTM yields for explicit dividend bonus
+    profile_features: Optional[object] = None  # opt-in as-of composition evidence
+    return_dates: Optional[object] = None
+    buy_eligible: Optional[np.ndarray] = None  # False: existing position may HOLD/REDUCE only
+    benchmark_returns: Optional[np.ndarray] = None  # same daily sessions as returns, IHSG Close
+    held_history_diagnostics: Optional[dict] = None
 
     def __post_init__(self) -> None:
         self.prices_per_lot = np.asarray(self.prices_per_lot, dtype=float)
@@ -21,12 +34,42 @@ class MarketData:
         self.correlation    = np.asarray(self.correlation, dtype=float)
         self.fundamental_scores  = np.asarray(self.fundamental_scores, dtype=float)
         self.fundamental_metrics = np.asarray(self.fundamental_metrics, dtype=float)
+        if self.dividend_yields is not None:
+            self.dividend_yields = np.asarray(self.dividend_yields, dtype=float)
+            if self.dividend_yields.shape != (self.n_stocks,):
+                raise ValueError("dividend_yields harus memiliki satu nilai fraksi per saham.")
         if self.rebalance_signal is None:
             self.rebalance_signal = self._recent_risk_reward_change()
         else:
             self.rebalance_signal = np.asarray(self.rebalance_signal, dtype=float)
         if self.rebalance_signal.shape != (self.n_stocks,):
             raise ValueError("rebalance_signal harus memiliki satu nilai per saham.")
+        if self.momentum_signal is None:
+            self.momentum_signal = self._risk_adjusted_momentum()
+        else:
+            self.momentum_signal = np.asarray(self.momentum_signal, dtype=float)
+        if self.momentum_signal.shape != (self.n_stocks,) or not np.isfinite(self.momentum_signal).all():
+            raise ValueError("momentum_signal harus finite dan memiliki satu nilai per saham.")
+        if self.market_stress is not None and self.market_stress.stock_codes != self.stock_codes:
+            raise ValueError("Urutan saham market_stress harus sama dengan MarketData.")
+
+    def _risk_adjusted_momentum(self) -> np.ndarray:
+        """63 completed sessions of return divided by downside volatility.
+
+        MarketData.returns has already been cut off at the decision session.
+        A short or incomplete window has no signal, not an invented forecast.
+        """
+        if self.returns.ndim != 2 or self.returns.shape[1] < 63:
+            return np.zeros(self.n_stocks)
+        recent = self.returns[:, -63:]
+        valid = np.isfinite(recent).sum(axis=1) >= 60
+        clean = np.where(np.isfinite(recent), recent, 0.0)
+        downside = np.sqrt(np.mean(np.minimum(clean, 0.0) ** 2, axis=1))
+        score = np.tanh(
+            (np.mean(clean, axis=1) / np.maximum(downside, 0.005))
+            * np.sqrt(63.0) / 2.0
+        )
+        return np.where(valid, score, 0.0)
 
     def _recent_risk_reward_change(self) -> np.ndarray:
         """Change in 21-session risk/reward versus the preceding 63 sessions.

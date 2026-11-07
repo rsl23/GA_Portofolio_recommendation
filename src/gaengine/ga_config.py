@@ -15,6 +15,13 @@ from enum import Enum
 from typing import Any, Optional
 
 
+REBALANCE_FITNESS_PARAMETERS = {
+    "momentum_bonus": 0.0,
+    "rebalance_utility_weight": 0.0,
+    "cash_return_weight": 0.0,
+}
+
+
 class RiskProfile(Enum):
     """Risk tolerance that sets the Maximum-Drawdown penalty weight (lambda)."""
 
@@ -33,6 +40,11 @@ class RiskProfile(Enum):
 
     @staticmethod
     def from_name(name: str) -> "RiskProfile":
+        aliases = {"konservatif": RiskProfile.CONSERVATIVE,
+                   "moderat": RiskProfile.MODERATE, "agresif": RiskProfile.AGGRESSIVE}
+        name = str(name).strip()
+        if name.lower() in aliases:
+            return aliases[name.lower()]
         for profile in RiskProfile:
             if profile.value.lower() == str(name).lower():
                 return profile
@@ -72,6 +84,7 @@ class GAConfig:
     crossover_rate: float = 0.8
     tournament_size: int = 5
     elitism_count: int = 10
+    operator_policy: str = "sparse_v1"
 
     # --- portfolio constraints -----------------------------------------
     budget: float = 100_000_000.0    # IDR
@@ -80,9 +93,17 @@ class GAConfig:
 
     # --- fitness coefficients (final formula) ---------------------------
     risk_profile: str = "Moderate"
+    profile_policy: str = "legacy"
+    fitness_policy: str = "legacy"
     risk_free_rate: float = 0.0625
     correlation_penalty: float = 0.5   # gamma
     fundamental_bonus: float = 0.8     # alpha
+    momentum_bonus: float = 0.0
+    dividend_bonus_override: Optional[float] = None
+    dividend_yield_cap: float = 0.10
+    risk_model: str = "market_stress"
+    mdd_residual_weight: float = 0.25
+    stress_missing_penalty: float = 0.03
     mdd_penalty_override: Optional[float] = None
     death_penalty: float = 50000.0
     
@@ -104,10 +125,14 @@ class GAConfig:
 
     # --- rebalancing ----------------------------------------------------
     is_rebalance: bool = False
+    rebalance_model: str = "legacy"
+    min_utility_gain: float = 0.002
+    scenario_shrinkage: float = 0.5
     old_weights: Optional[Any] = None
     old_lots: Optional[Any] = None
     old_prices_per_lot: Optional[Any] = None
     old_cost_basis: Optional[Any] = None  # accounting context; not a fitness bonus/penalty
+    old_cash: Optional[float] = None
     turnover_penalty_beta: float = 0.4
     rebalance_utility_weight: float = 0.0
     allow_cash: bool = False
@@ -115,10 +140,51 @@ class GAConfig:
     max_exposure: float = 1.0  # profile risk ceiling; residual NAV remains cash
     cash_return_weight: float = 0.0
     lookthrough_stock_risk: bool = False  # score invested basket risk before cash dilution
+    forecast_horizon_days: int = 63
+    cvar_tail_fraction: float = 0.10
+    lambda_cvar: float = 0.5
+    lambda_benchmark_downside: float = 0.5
+    lambda_concentration: float = 0.02
+    lambda_uncertainty: float = 0.25
+    buy_fee_rate: float = 0.0
+    sell_fee_rate: float = 0.0
 
     def __post_init__(self) -> None:
-        if self.fitness_mode not in ("baseline", "rebalance_aware"):
-            raise ValueError("fitness_mode harus baseline atau rebalance_aware.")
+        for name, allowed in {
+            'operator_policy': ('legacy', 'sparse_v1'),
+            'profile_policy': ('legacy', 'composition_v1'),
+            'fitness_policy': ('legacy', 'net_cvar_ihsg_v1'),
+            'rebalance_model': ('legacy', 'guarded_v1'),
+            'risk_model': ('mdd', 'market_stress'),
+            'fitness_mode': ('baseline', 'rebalance_aware', 'decision_aware'),
+        }.items():
+            if getattr(self, name) not in allowed:
+                raise ValueError(f'{name} tidak dikenal: {getattr(self, name)}')
+        for name in ('momentum_bonus', 'rebalance_utility_weight', 'cash_return_weight',
+                     'stress_missing_penalty', 'min_utility_gain', 'lambda_cvar',
+                     'lambda_benchmark_downside', 'lambda_concentration', 'lambda_uncertainty',
+                     'buy_fee_rate', 'sell_fee_rate'):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f'{name} harus finite dan non-negatif.')
+        if (not math.isfinite(self.dividend_yield_cap) or self.dividend_yield_cap <= 0 or
+            self.dividend_bonus_override is not None and
+            (not math.isfinite(self.dividend_bonus_override) or self.dividend_bonus_override < 0)):
+            raise ValueError('Parameter bonus dividen tidak valid.')
+        if (not math.isfinite(self.mdd_residual_weight) or not 0 <= self.mdd_residual_weight <= 1 or
+            not math.isfinite(self.scenario_shrinkage) or not 0 <= self.scenario_shrinkage <= 1 or
+            self.forecast_horizon_days < 1 or not 0 < self.cvar_tail_fraction <= 1):
+            raise ValueError('Parameter risiko/skenario tidak valid.')
+        if self.profile_policy != 'legacy':
+            if str(self.risk_profile).strip().lower() not in (
+                'conservative','moderate','aggressive','konservatif','moderat','agresif'):
+                raise ValueError('Profil risiko tidak dikenal untuk composition_v1.')
+            if self.fitness_mode != 'rebalance_aware':
+                raise ValueError('composition_v1 memerlukan fitness rebalance_aware.')
+        if (not 0 <= self.crossover_rate <= 1 or
+            not 0 <= self.mutation_rate_end <= self.mutation_rate_start <= 1 or
+            not 0 <= self.creep_prob <= 1 or self.tournament_size < 1):
+            raise ValueError('Parameter operator GA tidak valid.')
         if not 0 < self.min_exposure <= self.max_exposure <= 1:
             raise ValueError("Exposure harus memenuhi 0 < min_exposure <= max_exposure <= 1.")
         if self.lookthrough_stock_risk and not self.allow_cash:
@@ -127,6 +193,12 @@ class GAConfig:
     @property
     def profile(self) -> RiskProfile:
         return RiskProfile.from_name(self.risk_profile)
+
+    @property
+    def dividend_bonus_weight(self) -> float:
+        return (self.dividend_bonus_override if self.dividend_bonus_override is not None else {
+            RiskProfile.CONSERVATIVE: 0.15, RiskProfile.MODERATE: 0.08, RiskProfile.AGGRESSIVE: 0.03,
+        }[self.profile])
 
     @property
     def lambda_mdd(self) -> float:
