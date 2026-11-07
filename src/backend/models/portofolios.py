@@ -45,6 +45,8 @@ class Portofolio(Base):
     date_ref = Column(DateTime, nullable=True)  # tanggal pembentukan/jadwal snapshot
     execution_date = Column(Date, nullable=True)  # hari bursa saat komposisi baru mulai berlaku
     execution_prices = Column(JSON, nullable=True)  # ticker -> raw Close per lembar, termasuk full sell
+    transaction_costs = Column(Float, nullable=False, default=0.0)
+    rebalance_metadata = Column(JSON, nullable=True)
     
     # rebalance
     is_rebalance = Column(Boolean, nullable=False, default=False)  # yes or no

@@ -4,6 +4,7 @@ from typing import Optional
 import re
 
 from pydantic import EmailStr
+from uuid import UUID
 
 
 # Schema untuk Validasi Input (Request) - Signup
@@ -53,3 +54,9 @@ class TokenResponse(BaseModel):
 # Payload respons untuk operasi tanpa data (mis. signup)
 class MessageResponse(BaseModel):
     detail: str = ""
+
+
+class UserProfileResponse(MessageResponse):
+    id: UUID
+    name: str
+    email: EmailStr

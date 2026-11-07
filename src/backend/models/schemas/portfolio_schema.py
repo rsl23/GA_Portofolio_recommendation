@@ -15,8 +15,19 @@ class ApiResponse(BaseModel, Generic[T]):
 
 # Schema untuk Validasi Input (Request)
 class PortfolioGenerateRequest(BaseModel):
+    charge_transaction_fees: bool = False
+    fitness_policy: Literal["legacy", "net_cvar_ihsg_v1"] = "legacy"
+    fitness_horizon_days: int = Field(63, ge=1, le=252)
+    fitness_cvar_tail_fraction: float = Field(.1, gt=0, le=1, allow_inf_nan=False)
+    fitness_lambda_cvar: float = Field(.5, ge=0, allow_inf_nan=False)
+    fitness_lambda_benchmark_downside: float = Field(.5, ge=0, allow_inf_nan=False)
     budget: float = Field(..., gt=0, description="Total modal investasi dalam IDR")
     risk_profile: str = Field(..., description="Konservatif, Moderat, atau Agresif")
+    profile_policy: Literal["legacy", "composition_v1"] = Field(
+        "legacy", description="Mode eksperimen batas komposisi; legacy sebagai pembanding")
+    rebalance_model: Literal["legacy", "guarded_v1"] = "legacy"
+    rebalance_buy_fee_rate: float = Field(.0015,ge=0,le=.05,allow_inf_nan=False)
+    rebalance_sell_fee_rate: float = Field(.0025,ge=0,le=.05,allow_inf_nan=False)
     name_portofolio: Optional[str] = Field(None, max_length=80, description="Nama portofolio agar mudah dikenali")
     description: Optional[str] = Field(None, max_length=500, description="Catatan pribadi mengenai tujuan portofolio")
     backtest: bool = Field(False, description="Jika True, lakukan backtest portofolio terhadap data historis")
@@ -55,14 +66,14 @@ class PortfolioItem(BaseModel):
     ticker: str                    # kode saham, misal BBCA
     lots: int                      # jumlah lot (1 lot = 100 lembar)
     price_per_lot: float           # harga 1 lot saat ini (100 lembar)
-    harga_beli: Optional[float] = None  # harga beli aktual user per lembar (bisa diedit)
+    harga_beli: Optional[float] = None  # average beli per lembar; None bila riwayat tidak cukup
     allocation: float              # alokasi dana = lots * price_per_lot
     weight: float                  # bobot alokasi terhadap total terpakai (0-1)
 
 
 # Request ubah harga beli milik user pada satu item portofolio
 class UpdateHargaBeliRequest(BaseModel):
-    harga_beli: float = Field(..., gt=0, description="Harga beli aktual per lembar (IDR)")
+    harga_beli: float = Field(..., gt=0, allow_inf_nan=False, description="Harga beli aktual per lembar (IDR)")
 
 
 # Baris riwayat portofolio (ringkasan, tanpa alokasi detail)
@@ -99,6 +110,11 @@ class RebalanceDeltaItem(BaseModel):
 
 
 class PortfolioResponse(BaseModel):
+    fitness_policy: Literal["legacy", "net_cvar_ihsg_v1"] = "legacy"
+    fitness_diagnostics: Optional[dict] = None
+    transaction_costs: float = 0
+    rebalance_diagnostics: Optional[dict] = None
+    profile_composition: Optional[dict] = None  # diagnostics at generation; not persisted
     id: str
     parent_portofolio_id: Optional[str] = None
     execution_date: Optional[date] = None
@@ -140,6 +156,16 @@ class PortfolioResponse(BaseModel):
 # tanggal dalam rentang [start_date, end_date] kelipatan interval (mis. tiap 2
 # bulan pada 2022-2026 -> lebih dari 10 portofolio).
 class RebalanceSeriesGenerateRequest(BaseModel):
+    charge_transaction_fees: bool = False
+    fitness_policy: Literal["legacy", "net_cvar_ihsg_v1"] = "legacy"
+    fitness_horizon_days: int = Field(63, ge=1, le=252)
+    fitness_cvar_tail_fraction: float = Field(.1, gt=0, le=1, allow_inf_nan=False)
+    fitness_lambda_cvar: float = Field(.5, ge=0, allow_inf_nan=False)
+    fitness_lambda_benchmark_downside: float = Field(.5, ge=0, allow_inf_nan=False)
+    rebalance_model: Literal["legacy", "guarded_v1"] = "legacy"
+    rebalance_buy_fee_rate: float = Field(.0015,ge=0,le=.05,allow_inf_nan=False)
+    rebalance_sell_fee_rate: float = Field(.0025,ge=0,le=.05,allow_inf_nan=False)
+    profile_policy: Literal["legacy", "composition_v1"] = "legacy"
     budget: float = Field(..., gt=0, description="Modal awal portofolio pada start_date (IDR)")
     risk_profile: str = Field(..., description="Konservatif, Moderat, atau Agresif")
     name_portofolio: Optional[str] = Field(None, max_length=80)

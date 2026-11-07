@@ -17,8 +17,8 @@ class PortofolioItem(Base):
     jumlah_lot = Column(Integer, nullable=False)
 
     harga_acuan = Column(Float, nullable=False)  # harga per LEMBAR (1 lot = 100 lembar)
-    # harga beli aktual menurut user; default = harga_acuan saat item dibuat,
-    # bisa diubah user lewat endpoint PATCH (mis. harga eksekusi berbeda)
+    # Average harga beli per lembar dari posisi tersisa. Untuk live, pengguna
+    # dapat mengoreksi basis ini melalui PATCH tanpa mengubah kas atau lot.
     harga_beli = Column(Float, nullable=True)
     total_investasi = Column(Float, nullable=False)
 
