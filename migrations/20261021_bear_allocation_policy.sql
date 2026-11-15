@@ -1,0 +1,1 @@
+ALTER TABLE users ADD COLUMN IF NOT EXISTS bear_allocation_policy VARCHAR(20) NOT NULL DEFAULT 'manual';
