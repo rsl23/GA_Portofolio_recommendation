@@ -1,5 +1,6 @@
 import logging
-from datetime import date
+from datetime import date, timedelta
+import pandas as pd
 
 from fastapi import BackgroundTasks
 from sqlalchemy import func
@@ -75,7 +76,8 @@ def run_daily_pipeline() -> dict:
       1. Filtering saham hari ini -> simpan ke filtered_stock_cache.
       2. build_market_data() -> muat data pasar + fundamental ke RAM untuk GA.
       3. sync_market_data -> tarik harga terbaru (yfinance) untuk market_data
-         & idx_composite milik portofolio user.
+         & idx_composite untuk riwayat portofolio live pengguna.
+      4. Hangatkan cache breadth seluruh emiten untuk pratinjau bear market.
     Returns: statistik ringkas; 'market_data' berupa objek MarketData untuk
     disimpan ke app.state oleh pemanggil.
     """
@@ -100,10 +102,22 @@ def run_daily_pipeline() -> dict:
         stats = sync_market_data(db)
         logger.info("Pipeline harian [3/3]: sync_market_data selesai (%s).", stats)
 
+        # Independent of the GA-filtered universe. A missing optional breadth
+        # source must not abort the existing daily market-data pipeline.
+        from src.preprocessing.bear_market_detection import assess_market
+        try:
+            assessment = assess_market(date.today() - timedelta(days=1), False)
+            breadth = assessment.get("breadth_details")
+            logger.info("Pipeline harian: cache breadth %s.", breadth)
+        except Exception:
+            logger.exception("Pembaruan cache breadth tidak tersedia.")
+            breadth = None
+
         return {
             "filtered_stocks": len(daftar_saham),
             "market_data": market_data,
             "sync_stats": stats,
+            "market_breadth": breadth,
         }
     finally:
         db.close()
@@ -123,11 +137,16 @@ def save_filtered_stocks_to_db(data_records: list):
         
         # Insert data baru satu per satu
         for row in data_records:
+            # IDX supplies the actual session in Tanggal. Do not derive it
+            # from ingestion time (after midnight/weekends/fundamental edits).
+            value = row.get('Tanggal')
+            price_date = pd.to_datetime(value, errors='coerce') if value is not None else pd.NaT
             cache_item = FilteredStockCache(
                 kode=row.get('Kode', ''),
                 nama=row.get('NamaEmiten', ''), # Sesuaikan dengan nama kolom dari API IDX
                 sektor=row.get('Sektor', ''),
                 close=float(row.get('Close', 0.0)),
+                price_date=price_date.date() if pd.notna(price_date) else None,
                 market_cap=float(row.get('Market_Cap', 0.0)),
                 eps=float(row.get('EPS', 0.0)),
                 roe=float(row.get('ROE', 0.0)),

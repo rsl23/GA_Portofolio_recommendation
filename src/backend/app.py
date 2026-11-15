@@ -7,7 +7,6 @@ from src.backend.routes.api import api_router
 from src.backend.core.config import settings
 from src.backend.models.database import engine, Base, SessionLocal
 from sqlalchemy import inspect, text
-import src.backend.models.filtered_stocks_cache
 from src.backend.controller.market_controller import (
     get_last_filter_update,
     run_daily_pipeline,
@@ -77,11 +76,37 @@ def _ensure_portfolio_columns(database_engine) -> None:
             connection.execute(text(f"ALTER TABLE portofolios ADD COLUMN {optional}name_portofolio VARCHAR(80)"))
         if "description" not in existing:
             connection.execute(text(f"ALTER TABLE portofolios ADD COLUMN {optional}description TEXT"))
+        if "is_list_active" not in existing:
+            connection.execute(text(f"ALTER TABLE portofolios ADD COLUMN {optional}is_list_active BOOLEAN"))
         if "transaction_costs" not in existing:
             connection.execute(text(f"ALTER TABLE portofolios ADD COLUMN {optional}transaction_costs DOUBLE PRECISION NOT NULL DEFAULT 0"))
         if "rebalance_metadata" not in existing:
             data_type="JSONB" if database_engine.dialect.name=="postgresql" else "JSON"
             connection.execute(text(f"ALTER TABLE portofolios ADD COLUMN {optional}rebalance_metadata {data_type}"))
+        # Freeze the legacy list badges once. Later generations must not
+        # silently deactivate a root the user already sees as active.
+        connection.execute(text("""
+            WITH RECURSIVE current_chains AS (
+                SELECT id, parent_portofolio_id FROM portofolios
+                WHERE status_portofolio IN ('active', 'active_backtest')
+                UNION
+                SELECT p.id, p.parent_portofolio_id FROM portofolios p
+                JOIN current_chains c ON p.id = c.parent_portofolio_id
+            )
+            UPDATE portofolios SET is_list_active = id IN (
+                SELECT id FROM current_chains WHERE parent_portofolio_id IS NULL
+            )
+            WHERE is_list_active IS NULL AND parent_portofolio_id IS NULL
+        """))
+
+
+def _ensure_filtered_stock_cache_columns(database_engine) -> None:
+    """Preserve source-session provenance for cached Close fallback."""
+    columns = {column['name'] for column in inspect(database_engine).get_columns('filtered_stock_cache')}
+    if 'price_date' not in columns:
+        with database_engine.begin() as connection:
+            optional = 'IF NOT EXISTS ' if database_engine.dialect.name == 'postgresql' else ''
+            connection.execute(text(f'ALTER TABLE filtered_stock_cache ADD COLUMN {optional}price_date DATE'))
 
 
 def _ensure_user_columns(database_engine) -> None:
@@ -100,6 +125,7 @@ async def lifespan(app: FastAPI):
     # 1. Generate tabel saat startup (lebih aman di sini daripada global scope)
     print("Mengecek dan membuat tabel database...")
     Base.metadata.create_all(bind=engine)
+    _ensure_filtered_stock_cache_columns(engine)
     # create_all does not add columns to existing installations. Keep the
     # additive accounting migration idempotent for deployments without Alembic.
     _ensure_portfolio_columns(engine)

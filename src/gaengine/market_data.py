@@ -27,6 +27,8 @@ class MarketData:
     buy_eligible: Optional[np.ndarray] = None  # False: existing position may HOLD/REDUCE only
     benchmark_returns: Optional[np.ndarray] = None  # same daily sessions as returns, IHSG Close
     held_history_diagnostics: Optional[dict] = None
+    price_sources: Optional[dict[str, str]] = None  # provenance of latest execution Close
+    untraded_tickers: Optional[list[str]] = None  # no positive volume on the live mark session
 
     def __post_init__(self) -> None:
         self.prices_per_lot = np.asarray(self.prices_per_lot, dtype=float)

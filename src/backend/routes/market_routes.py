@@ -47,6 +47,7 @@ def run_daily_pipeline_endpoint(request: Request):
                 "filtered_stocks": result["filtered_stocks"],
                 "market_data_stocks": market_data.n_stocks,
                 "sync_stats": result["sync_stats"],
+                "market_breadth": result.get("market_breadth"),
             },
         )
     except HTTPException:
@@ -104,15 +105,16 @@ def sync_prices_endpoint(
     current_user: dict = Depends(get_current_user),
 ):
     """
-    Trigger sinkronisasi histori harga harian (OHLCV via yfinance) untuk semua
-    saham yang pernah dibeli user, sejak tanggal pembelian terawal hingga hari ini.
-    Data di-upsert ke tabel market_data (aman dijalankan berulang).
+    Lengkapi tanggal harga yang belum tersimpan (OHLCV via yfinance) untuk
+    saham yang pernah dibeli dalam mode LIVE. Rentang dimulai dari pembelian
+    live terawal hingga
+    sesi terakhir yang selesai; tanggal lengkap tidak diunduh ulang.
     Dipanggil oleh job harian (cron/scheduler) atau manual oleh user login.
     """
     stats = sync_market_data(db)
     return ApiResponse(
         status="success",
-        message="Sinkronisasi harga selesai.",
+        message="Sinkronisasi harga portofolio live selesai.",
         data=stats,
     )
 

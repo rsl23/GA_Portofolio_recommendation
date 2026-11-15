@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Float, DateTime
+from sqlalchemy import Column, String, Float, DateTime, Date
 from datetime import datetime
 from sqlalchemy.sql import func
 # Asumsi Base berasal dari konfigurasi database.py milikmu
@@ -14,6 +14,7 @@ class FilteredStockCache(Base):
     
     # Metrik Valuasi & Harga
     close = Column(Float)
+    price_date = Column(Date, nullable=True)  # tanggal Close dari IDX summary, bukan updated_at
     market_cap = Column(Float)
     
     # Metrik Fundamental
@@ -39,4 +40,3 @@ class FilteredStockCache(Base):
     
     # Waktu pembaruan data
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
-    

@@ -41,6 +41,9 @@ class Portofolio(Base):
     
     # status dan penjelasan
     status_portofolio = Column(String, nullable=False, default="active")  # active, rebalanced, inactive, etc.
+    # User-managed activity of the whole series, stored on its root.
+    # Legacy roots are initialized once from their current chain at startup.
+    is_list_active = Column(Boolean, nullable=True, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     date_ref = Column(DateTime, nullable=True)  # tanggal pembentukan/jadwal snapshot
     execution_date = Column(Date, nullable=True)  # hari bursa saat komposisi baru mulai berlaku
