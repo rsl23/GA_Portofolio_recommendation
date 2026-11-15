@@ -61,5 +61,8 @@ logs/
 
 # ---------- GA run artifacts ----------------------------------
 *.csv
-
+docs/
+test_*
 reports/
+
+tuning/
