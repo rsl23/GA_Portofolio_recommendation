@@ -5,11 +5,10 @@ from __future__ import annotations
 import numpy as np
 
 from .chromosome import Chromosome
-from .operators import (
-    adaptive_hybrid_mutation,
-    tournament_select,
-    two_point_crossover,
-)
+from .progress import report_candidates, report_generation
+from .fitness_context import fitness_inputs_scope
+from .runtime_performance import evolution_performance
+from .operators import tournament_select
 from .population import create_initial_population, create_rebalance_population
 from .profile_policy import prepare_policy, ProfileConstraintError
 from .constrained_operators import (
@@ -33,19 +32,21 @@ class GeneticEngine:
         self.diagnostics = []
 
     def run(self, verbose: bool = True, log_every: int = 25) -> Chromosome:
+        with evolution_performance(), fitness_inputs_scope(self.config):
+            return self._run(verbose=verbose, log_every=log_every)
+
+    def _run(self, verbose: bool = True, log_every: int = 25) -> Chromosome:
         cfg = self.config
+        if cfg.operator_policy != "sparse_v1":
+            raise ValueError(f"operator_policy tidak dikenal: {cfg.operator_policy}")
         prepare_policy(cfg)
         rng = np.random.default_rng(cfg.seed)
-        sparse = cfg.operator_policy == "sparse_v1"
-        if sparse:
-            try:
-                check_affordability(cfg)
-            except PortfolioFeasibilityError as exc:
-                if cfg.profile_policy != "legacy":
-                    raise ProfileConstraintError(str(exc)) from exc
-                raise
-        crossover = sparse_set_crossover if sparse else two_point_crossover
-        mutation = sparse_portfolio_mutation if sparse else adaptive_hybrid_mutation
+        try:
+            check_affordability(cfg)
+        except PortfolioFeasibilityError as exc:
+            if cfg.profile_policy != "legacy":
+                raise ProfileConstraintError(str(exc)) from exc
+            raise
         if verbose:
             print(f"[GA] operators={cfg.operator_policy}")
 
@@ -53,10 +54,11 @@ class GeneticEngine:
             population = create_rebalance_population(cfg, rng)
         else:
             population = create_initial_population(cfg, rng)
-        for chrom in population:
-            if sparse:
-                repair_sparse(chrom, preserve_valid=True)
+        report_candidates(0, len(population), evaluating=True)
+        for index, chrom in enumerate(population):
+            repair_sparse(chrom, preserve_valid=True)
             chrom.evaluate_fitness()
+            report_candidates(index + 1, len(population), evaluating=True)
 
         prior_best = None
         stagnant = 0
@@ -65,6 +67,7 @@ class GeneticEngine:
             population.sort(key=_fit, reverse=True)
             best = population[0]
             self.history.append(best.fitness)
+            report_generation(generation + 1, cfg.generations, best.fitness)
             feasible = [c for c in population if c.lots is not None and c.budget_ok and c.diversification_ok
                         and c.profile_constraints_ok]
             self.diagnostics.append(dict(
@@ -100,7 +103,7 @@ class GeneticEngine:
                       f"n_active={best.n_active}")
 
             # ---- elitism + reproduction -------------------------------
-            elite_count = min(cfg.elitism_count, cfg.population_size-1) if sparse else cfg.elitism_count
+            elite_count = min(cfg.elitism_count, cfg.population_size-1)
             elites = population[:elite_count]
             needed = cfg.population_size - len(elites)
             children = []
@@ -114,14 +117,14 @@ class GeneticEngine:
                     guard += 1
 
                 if rng.random() < cfg.crossover_rate:
-                    child_a, child_b = crossover(parent_a, parent_b, rng)
+                    child_a, child_b = sparse_set_crossover(parent_a, parent_b, rng)
                 else:
                     child_a, child_b = parent_a.clone(), parent_b.clone()
                     child_a.fitness = None
                     child_b.fitness = None
 
                 for child in (child_a, child_b):
-                    mutation(child, generation, cfg.generations, rng)
+                    sparse_portfolio_mutation(child, generation, cfg.generations, rng)
                     child.evaluate_fitness()
                     if len(children) < needed:
                         children.append(child)
@@ -132,7 +135,7 @@ class GeneticEngine:
 
         population.sort(key=_fit, reverse=True)
         self.solution = population[0]
-        if sparse and not (self.solution.budget_ok and self.solution.diversification_ok):
+        if not (self.solution.budget_ok and self.solution.diversification_ok):
             raise PortfolioFeasibilityError('GA tidak menemukan portofolio sesuai modal dan jumlah saham.')
         if cfg.profile_policy != "legacy":
             self.solution.evaluate_fitness()

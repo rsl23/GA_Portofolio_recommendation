@@ -5,16 +5,19 @@ from __future__ import annotations
 import numpy as np
 
 from .chromosome import Chromosome
+from .progress import report_candidates
 
 
 def create_initial_population(config, rng=None):
     """Create ``config.population_size`` randomly initialised chromosomes."""
     rng = rng or np.random.default_rng(config.seed)
     population = []
+    report_candidates(0, config.population_size)
     for _ in range(config.population_size):
         chrom = Chromosome(config)
         chrom.random_initialization(rng)
         population.append(chrom)
+        report_candidates(len(population), config.population_size)
     return population
 
 
@@ -26,6 +29,7 @@ def create_rebalance_population(config, rng=None):
     """
     rng = rng or np.random.default_rng(config.seed)
     population = []
+    report_candidates(0, config.population_size)
     
     n_seeded = int(config.population_size * 0.15)
     n_seeded = max(1, n_seeded)  # Ensure at least 1 seeded chromosome
@@ -68,11 +72,13 @@ def create_rebalance_population(config, rng=None):
                                   if config.min_exposure == config.max_exposure
                                   else float(rng.uniform(config.min_exposure, config.max_exposure)))
         population.append(chrom)
+        report_candidates(len(population), config.population_size)
         
     # Generate the rest randomly
     for _ in range(config.population_size - n_seeded):
         chrom = Chromosome(config)
         chrom.random_initialization(rng)
         population.append(chrom)
+        report_candidates(len(population), config.population_size)
         
     return population

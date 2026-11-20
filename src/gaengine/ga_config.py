@@ -12,7 +12,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 
 REBALANCE_FITNESS_PARAMETERS = {
@@ -84,7 +84,7 @@ class GAConfig:
     crossover_rate: float = 0.8
     tournament_size: int = 5
     elitism_count: int = 10
-    operator_policy: str = "sparse_v1"
+    operator_policy: Literal["sparse_v1"] = "sparse_v1"
 
     # --- portfolio constraints -----------------------------------------
     budget: float = 100_000_000.0    # IDR
@@ -101,7 +101,7 @@ class GAConfig:
     momentum_bonus: float = 0.0
     dividend_bonus_override: Optional[float] = None
     dividend_yield_cap: float = 0.10
-    risk_model: str = "market_stress"
+    risk_model: Literal["market_stress"] = "market_stress"
     mdd_residual_weight: float = 0.25
     stress_missing_penalty: float = 0.03
     mdd_penalty_override: Optional[float] = None
@@ -109,7 +109,8 @@ class GAConfig:
     
     annualization: float = math.sqrt(252.0)
 
-    # --- adaptive hybrid mutation --------------------------------------
+    # Archived configuration compatibility; sparse_v1 does not use these
+    # legacy mutation controls (it has bounded set/weight moves of its own).
     mutation_rate_start: float = 0.15
     mutation_rate_end: float = 0.01
     creep_prob: float = 0.5
@@ -143,7 +144,6 @@ class GAConfig:
     forecast_horizon_days: int = 63
     cvar_tail_fraction: float = 0.10
     lambda_cvar: float = 0.5
-    lambda_benchmark_downside: float = 0.5
     lambda_concentration: float = 0.02
     lambda_uncertainty: float = 0.25
     buy_fee_rate: float = 0.0
@@ -151,18 +151,20 @@ class GAConfig:
 
     def __post_init__(self) -> None:
         for name, allowed in {
-            'operator_policy': ('legacy', 'sparse_v1'),
+            'operator_policy': ('sparse_v1',),
             'profile_policy': ('legacy', 'composition_v1'),
-            'fitness_policy': ('legacy', 'net_cvar_ihsg_v1'),
+            'fitness_policy': ('legacy', 'legacy_cvar_v1'),
             'rebalance_model': ('legacy', 'guarded_v1'),
-            'risk_model': ('mdd', 'market_stress'),
+            'risk_model': ('market_stress',),
             'fitness_mode': ('baseline', 'rebalance_aware', 'decision_aware'),
         }.items():
             if getattr(self, name) not in allowed:
                 raise ValueError(f'{name} tidak dikenal: {getattr(self, name)}')
+        if self.fitness_policy == 'legacy_cvar_v1' and self.fitness_mode != 'rebalance_aware':
+            raise ValueError('legacy_cvar_v1 memerlukan fitness_mode rebalance_aware.')
         for name in ('momentum_bonus', 'rebalance_utility_weight', 'cash_return_weight',
                      'stress_missing_penalty', 'min_utility_gain', 'lambda_cvar',
-                     'lambda_benchmark_downside', 'lambda_concentration', 'lambda_uncertainty',
+                     'lambda_concentration', 'lambda_uncertainty',
                      'buy_fee_rate', 'sell_fee_rate'):
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0:

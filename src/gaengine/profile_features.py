@@ -5,21 +5,40 @@ import pandas as pd
 from .profile_policy import ProfileConstraintError, ProfileFeatures
 
 
-def build_profile_features(data, closes, liquidity, data_dir, sectors):
+def build_profile_features(data, closes, liquidity, data_dir, sectors,
+                           live_benchmark=False):
     codes = data.stock_codes
     days = pd.DatetimeIndex(closes.sort_index().index)
     asof = data.price_date
-    context = pd.read_parquet(data_dir/'Master_Market_Context_15Tahun.parquet',
-        filters=[('Ticker','==','^JKSE'),('Date','>=',pd.Timestamp(days[0])-pd.Timedelta(days=14)),
-                 ('Date','<=',pd.Timestamp(asof))],columns=['Date','Close'])
-    marks = context.assign(Date=pd.to_datetime(context.Date)).groupby('Date').Close.last().sort_index()
+    if live_benchmark:
+        import yfinance as yf
+
+        frame = yf.download('^JKSE',
+            start=(days[0]-pd.Timedelta(days=14)).date().isoformat(),
+            end=(pd.Timestamp(asof)+pd.Timedelta(days=1)).date().isoformat(),
+            interval='1d', auto_adjust=False, progress=False)
+        close = frame['Close'] if frame is not None and 'Close' in frame else pd.Series(dtype=float)
+        close = close.iloc[:, 0] if isinstance(close, pd.DataFrame) else close
+        marks = pd.Series(pd.to_numeric(close, errors='coerce').to_numpy(),
+                          index=pd.DatetimeIndex(close.index).tz_localize(None)).sort_index()
+        marks = marks[marks.gt(0) & np.isfinite(marks)]
+    else:
+        context = pd.read_parquet(data_dir/'Master_Market_Context_15Tahun.parquet',
+            filters=[('Ticker','==','^JKSE'),('Date','>=',pd.Timestamp(days[0])-pd.Timedelta(days=14)),
+                     ('Date','<=',pd.Timestamp(asof))],columns=['Date','Close'])
+        marks = context.assign(Date=pd.to_datetime(context.Date)).groupby('Date').Close.last().sort_index()
     if marks.empty:
         raise ProfileConstraintError('Riwayat IHSG untuk profil kosong.')
     calendar = marks.index.union(days).sort_values()
     aligned = marks.reindex(calendar).ffill().reindex(days)
     seen = pd.Series(marks.index,index=marks.index).reindex(calendar).ffill().reindex(days)
-    if aligned.isna().any() or ((days.to_series()-seen)>pd.Timedelta(days=7)).any():
-        raise ProfileConstraintError('IHSG tidak lengkap/stale pada window saham.')
+    stale = aligned.isna() | ((days.to_series()-seen)>pd.Timedelta(days=7))
+    if stale.any():
+        failed = days[np.asarray(stale)].strftime('%Y-%m-%d').tolist()
+        last = marks.index.max().date().isoformat()
+        raise ProfileConstraintError(
+            f'IHSG tidak lengkap/stale pada window saham; sesi pertama {failed[0]}, '
+            f'IHSG terakhir {last}, sumber {"live" if live_benchmark else "arsip"}.')
     benchmark = aligned.pct_change(fill_method=None).fillna(0).to_numpy()
 
     events = pd.read_excel(data_dir/'dividend_events_20_tahun.xlsx')

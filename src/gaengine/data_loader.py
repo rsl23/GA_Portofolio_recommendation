@@ -44,7 +44,9 @@ from dotenv import load_dotenv
 from src.backend.models.database import SessionLocal
 from src.backend.models.filtered_stocks_cache import FilteredStockCache
 from src.backend.services.api_bi import fetch_bi_rate
+from src.backend.services.cached_close_prices import cached_close_for_session
 from src.gaengine.market_data import MarketData
+from src.gaengine.progress import report_progress
 from src.gaengine.market_stress import load_market_stress
 from src.preprocessing.stock_filtering import get_fiscal_period, run_live_preprocessing
 
@@ -73,6 +75,7 @@ DEFAULT_LOOKBACK_DAYS = 365
 # Nilai ETV harian = Close x Volume; rata-ratanya dipakai untuk memilih
 # N kandidat paling likuid (sama seperti metrik ADTV_60 di stock_filtering).
 LIQUIDITY_WINDOW_DAYS = 60
+LIVE_MAX_PRICE_AGE_DAYS = 10
 
 # Fundamental metric columns: PER, PBV, ROE, DER, Dividend-Yield.
 # ``+1`` berarti "lower is better", ``-1`` berarti "higher is better".
@@ -235,7 +238,7 @@ def process_single_fundamental(kode):
         return None
 
 
-def take_ohlcv_data():
+def take_ohlcv_data(as_of: Optional[date] = None):
     """
     LIVE: Ambil daftar saham lolos preprocessing dari DB (filtered_stock_cache),
     lalu tarik OHLCV 1 tahun terakhir dari yfinance.
@@ -254,10 +257,16 @@ def take_ohlcv_data():
         yf_tickers = [f"{kode}.JK" for kode in daftar_kode]
         # Execution and valuation use raw Close, not a dividend/split-adjusted
         # series whose price cannot represent a simulated trade.
+        window = ({"start": (as_of - timedelta(days=DEFAULT_LOOKBACK_DAYS)).isoformat(),
+                   "end": (as_of + timedelta(days=1)).isoformat()}
+                  if as_of is not None else {"period": "1y"})
         df_ohlcv = yf.download(
-            yf_tickers, period="1y", interval="1d",
+            yf_tickers, **window, interval="1d",
             auto_adjust=False, progress=False,
         )
+        # Older yfinance versions return flat OHLCV columns for one ticker.
+        if not isinstance(df_ohlcv.columns, pd.MultiIndex) and len(yf_tickers) == 1:
+            df_ohlcv.columns = pd.MultiIndex.from_product([df_ohlcv.columns, yf_tickers])
 
         print("Data OHLCV berhasil diunduh!")
         return df_ohlcv
@@ -570,12 +579,16 @@ def _positive_or_nan(series: Optional[pd.Series]) -> Optional[pd.Series]:
 # ----------------------------------------------------------------------
 def _provide_backtest_data(date_ref: date, lookback_days: int):
     """
-    Sumber data BACKTEST (semua bebas look-ahead, dibatasi `date_ref`):
+    Sumber penilaian BACKTEST (dibatasi `date_ref`):
       - universe + ROE/DER  : run_live_preprocessing(backtest=True, date=date_ref)
       - OHLCV harian        : Master_OHLCV_15Tahun.parquet (window <= date_ref)
       - PER & PBV           : fundamental_quarterly.parquet (periode fiskal date_ref)
       - Dividend yield      : dividend_events_20_tahun.xlsx (ex-date <= date_ref)
       - Risk-free rate      : BI-7Day-RR.xlsx (baris terakhir <= date_ref)
+
+    Kandidat dan seluruh data penilaian dibatasi sampai tanggal keputusan.
+    Volume/harga pada sesi eksekusi diperiksa controller setelah keputusan GA,
+    bukan untuk menyaring kandidat sebelum optimasi.
 
     Returns: (df_close, metrics_map, risk_free, liquidity)
     """
@@ -590,6 +603,8 @@ def _provide_backtest_data(date_ref: date, lookback_days: int):
     print(f"[DataLoader] Mode BACKTEST - merakit data per {date_ref}...")
 
     # 1. Universe + fundamental dasar (EPS/ROE/DER/ADTV) dari pipeline backtest
+    report_progress("market", "Membaca fundamental historis",
+                    "Menyaring kondisi keuangan perusahaan sesuai tanggal simulasi Anda.")
     _, df_lolos = run_live_preprocessing(backtest=True, date=date_ref)
     if df_lolos is None or df_lolos.empty:
         raise ValueError(f"Tidak ada saham yang lolos preprocessing pada {date_ref}.")
@@ -599,6 +614,8 @@ def _provide_backtest_data(date_ref: date, lookback_days: int):
                 len(codes), _probe_series(df_lolos["ROE"]), _probe_series(df_lolos["DER"]))
 
     # 2. OHLCV historis (window `lookback_days` hari ke belakang dari date_ref)
+    report_progress("market", "Membaca riwayat harga saham",
+                    "Mengumpulkan pergerakan harga dan aktivitas perdagangan pada periode simulasi.")
     df_price = pd.read_parquet(PRICE_FILE)
     df_price["Date"] = pd.to_datetime(df_price["Date"])
     df_price["Ticker"] = df_price["Ticker"].astype(str).str.replace(".JK", "", regex=False)
@@ -684,6 +701,8 @@ def _provide_backtest_data(date_ref: date, lookback_days: int):
     last_prices = df_close.ffill().iloc[-1]
     logger.info("[BACKTEST] last_prices (penyebut DivYld)=%s", _probe_series(last_prices))
     div_map = _load_dividend_yields(codes, date_ref, last_prices)
+    report_progress("market", "Membaca suku bunga Bank Indonesia",
+                    "Menggunakan BI Rate historis sebagai acuan perbandingan dalam analisis.")
     risk_free = _load_bi_rate_history(date_ref)
     logger.info("[BACKTEST] risk_free yang akan dipakai (dari BI-7Day-RR <= %s): %s",
                 date_ref, _fmt_rf(risk_free))
@@ -715,7 +734,74 @@ def _provide_backtest_data(date_ref: date, lookback_days: int):
 # ----------------------------------------------------------------------
 # Provider LIVE
 # ----------------------------------------------------------------------
-def _provide_live_data():
+def _fill_database_live_closes(df_close, df_ohlcv, cutoff):
+    """Use stored raw Close AND volume for a missing quote on the exact session."""
+    if df_close.empty:
+        return []
+    session = df_close.index[-1]
+    if pd.Timestamp(session).date() > cutoff:
+        return []
+    missing = [code for code in df_close if pd.isna(df_close.at[session, code])
+               and df_close[code].iloc[:-1].notna().any()]
+    if not missing:
+        return []
+    from src.backend.models.market_data import MarketData as StoredPrice
+    from src.backend.models.stock_universe import StockUniverse
+    db = SessionLocal()
+    try:
+        rows = db.query(StockUniverse.ticker, StoredPrice.close, StoredPrice.volume).join(
+            StoredPrice, StoredPrice.stock_id == StockUniverse.id_stock,
+        ).filter(StoredPrice.date == pd.Timestamp(session).date(), StockUniverse.ticker.in_(missing)).all()
+    finally:
+        db.close()
+    filled = []
+    for code, close, volume in rows:
+        if (close is None or volume is None or not np.isfinite([close, volume]).all()
+                or close <= 0 or volume <= 0):
+            continue
+        df_close.at[session, code] = float(close)
+        df_ohlcv.at[session, ('Close', f'{code}.JK')] = float(close)
+        df_ohlcv.at[session, ('Volume', f'{code}.JK')] = float(volume)
+        filled.append(code)
+    return filled
+
+
+def _fill_cached_live_closes(df_close: pd.DataFrame, df_ohlcv: pd.DataFrame,
+                             records, last_completed: date) -> list[str]:
+    """Fill only missing latest-session raw Close using dated IDX cache quotes.
+
+    Cache ingestion time is not a price date. Require source-session equality
+    and actual traded volume in Yahoo's bar; never overwrite a valid Yahoo
+    quote, fill a historical gap, or fabricate a missing year of OHLCV.
+    """
+    if df_close.empty or 'Volume' not in df_ohlcv:
+        return []
+    session = pd.Timestamp(df_close.index[-1])
+    if session.date() > last_completed:
+        return []
+    filled = []
+    for row in records:
+        code = row.kode
+        if code not in df_close.columns or pd.notna(df_close.at[session, code]):
+            continue
+        if not df_close[code].iloc[:-1].notna().any():
+            continue  # A single cached quote cannot replace price history.
+        try:
+            volume = df_ohlcv['Volume'].at[session, f'{code}.JK']
+        except KeyError:
+            continue
+        price = cached_close_for_session(row, session.date(), volume)
+        if price is None:
+            continue
+        df_close.at[session, code] = price
+        filled.append(code)
+    if filled:
+        logger.warning('[LIVE] Close fallback filtered_stock_cache pada %s: %d saham (%s).',
+                       session.date(), len(filled), ', '.join(sorted(filled)[:TRACE_SAMPLE]))
+    return filled
+
+
+def _provide_live_data(as_of: Optional[date] = None):
     """
     Sumber data LIVE:
       - OHLCV 1 tahun  : yfinance (daftar dari filtered_stock_cache)
@@ -725,7 +811,9 @@ def _provide_live_data():
     Returns: (df_close, metrics_map, risk_free, liquidity)
     """
     print("[DataLoader] Mode LIVE - menarik data OHLCV & fundamental...")
-    df_ohlcv = take_ohlcv_data()
+    report_progress("market", "Mengumpulkan riwayat harga saham",
+                    "Menyiapkan harga dan aktivitas perdagangan dari sesi pasar yang sudah selesai.")
+    df_ohlcv = take_ohlcv_data(as_of=as_of) if as_of is not None else take_ohlcv_data()
     # take_fundamental_data()
 
     if df_ohlcv is None or df_ohlcv.empty:
@@ -735,37 +823,77 @@ def _provide_live_data():
     # and its data feed have settled. Execute only from a completed WIB session.
     now_wib = datetime.now(timezone(timedelta(hours=7)))
     last_completed = now_wib.date() if now_wib.hour >= 17 else now_wib.date() - timedelta(days=1)
-    df_ohlcv = df_ohlcv.loc[pd.to_datetime(df_ohlcv.index).date <= last_completed]
+    if as_of is not None and as_of > last_completed:
+        raise ValueError("Sesi harga live yang diminta belum selesai.")
+    price_cutoff = min(last_completed, as_of) if as_of is not None else last_completed
+    df_ohlcv = df_ohlcv.loc[pd.to_datetime(df_ohlcv.index).date <= price_cutoff].sort_index()
     if df_ohlcv.empty:
         return None, {}, None, pd.Series(dtype=float)
+
+    report_progress("market", "Membaca data fundamental perusahaan",
+                    "Meninjau valuasi, profitabilitas, utang, dan dividen dari data yang tersedia.")
+    # Read fundamentals and dated prices in one cache snapshot.
+    db = SessionLocal()
+    try:
+        records = db.query(FilteredStockCache).all()
+        metrics_map: Dict[str, List[float]] = {
+            s.kode: [_to_float(s.per), _to_float(s.pbv), _to_float(s.roe),
+                     _to_float(s.der), _to_float(s.dividend_yield)] for s in records
+        }
+    finally:
+        db.close()
 
     # Keep the final Close raw. A ticker missing on the execution session must
     # not become a tradable candidate via forward-fill; returns are filled later.
     df_close = df_ohlcv["Close"]
+    df_close = df_close.apply(pd.to_numeric, errors="coerce")
+    df_close = df_close.where(np.isfinite(df_close) & (df_close > 0))
     df_close.columns = [str(c).replace(".JK", "") for c in df_close.columns]
+    database_codes = _fill_database_live_closes(df_close, df_ohlcv, price_cutoff)
+    fallback_codes = _fill_cached_live_closes(df_close, df_ohlcv, records, price_cutoff)
+
+    # Yahoo can append a wholly empty session, even after the WIB cut-off.
+    # It is not a price observation. Drop it for ALL aligned inputs and retain
+    # the actual last price_date; never forward-fill a missing execution quote.
+    valid_rows = df_close.notna().any(axis=1)
+    if not valid_rows.all():
+        logger.warning("[LIVE] Melewati %d baris tanpa Close valid; tanggal terakhir yang dilewati=%s",
+                       int((~valid_rows).sum()), df_close.index[~valid_rows][-1])
+    df_close = df_close.loc[valid_rows]
+    df_ohlcv = df_ohlcv.loc[df_close.index]
+    if df_close.empty:
+        logger.error("[LIVE] OHLCV tersedia tetapi seluruh harga Close kosong/tidak valid.")
+        return None, {}, None, pd.Series(dtype=float)
+    last_price_day = pd.Timestamp(df_close.index[-1]).date()
+    if (last_completed - last_price_day).days > LIVE_MAX_PRICE_AGE_DAYS:
+        raise ValueError(
+            f"Harga Close live terakhir pada {last_price_day} terlalu lama "
+            f"(batas {LIVE_MAX_PRICE_AGE_DAYS} hari kalender). Perbarui sumber OHLCV."
+        )
+    df_close.attrs['price_sources'] = {
+        code: ('market_data_db' if code in database_codes else
+               'filtered_stock_cache' if code in fallback_codes else 'yfinance')
+        for code in df_close.columns if pd.notna(df_close[code].iloc[-1])
+    }
+    session_volume = df_ohlcv['Volume'].iloc[-1]
+    df_close.attrs['untraded_tickers'] = [
+        str(code).removesuffix('.JK') for code, volume in session_volume.items()
+        if pd.isna(volume) or not np.isfinite(volume) or volume <= 0
+    ]
 
     # Likuiditas = ADTV 60 HARI BURSA TERAKHIR (ETV = Close x Volume).
     # df_ohlcv sudah terurut berdasarkan tanggal (index=Date), sehingga
     # tail(60) mengambil 60 hari bursa terakhir per ticker.
     try:
-        tv = df_ohlcv["Close"] * df_ohlcv["Volume"]
-        tv.columns = [str(c).replace(".JK", "") for c in tv.columns]
+        volume = df_ohlcv["Volume"].copy()
+        volume.columns = [str(c).replace(".JK", "") for c in volume.columns]
+        tv = df_close * volume
         liquidity = tv.tail(LIQUIDITY_WINDOW_DAYS).mean()
     except Exception:
         liquidity = pd.Series(dtype=float)
 
-    # Fundamental terbaru dari DB cache
-    db = SessionLocal()
-    try:
-        metrics_map: Dict[str, List[float]] = {}
-        for s in db.query(FilteredStockCache).all():
-            metrics_map[s.kode] = [
-                _to_float(s.per), _to_float(s.pbv), _to_float(s.roe),
-                _to_float(s.der), _to_float(s.dividend_yield),
-            ]
-    finally:
-        db.close()
-
+    report_progress("market", "Mengambil suku bunga Bank Indonesia",
+                    "Menyiapkan BI Rate sebagai acuan perbandingan dalam analisis.")
     risk_free = take_bi_rate()
     logger.info("[LIVE] df_close=%s", _probe_frame(df_close))
     logger.info("[LIVE] liquidity (ADTV %d hari, IDR)=%s",
@@ -826,10 +954,18 @@ def _assemble_market_data(
         return None
     df_close = df_close.sort_index()
 
+    # Daily cache entries may survive until the next refresh. Recheck the live
+    # session's volume even when stock_filtering ran on an earlier session.
+    untraded = set(df_close.attrs.get('untraded_tickers') or [])
+    excluded = sorted(set(df_close.columns) & untraded)
+    if excluded:
+        logger.info('Kandidat volume nol/tidak valid pada %s dikeluarkan sebelum GA: %s',
+                    pd.Timestamp(df_close.index[-1]).date(), excluded)
     # 1. Kandidat: ada di OHLCV & fundamental, harga terakhir >= min_price
     candidates = [
         c for c in df_close.columns
-        if c in metrics_map and pd.notna(df_close[c].iloc[-1]) and df_close[c].iloc[-1] >= min_price
+        if c not in untraded and c in metrics_map
+        and pd.notna(df_close[c].iloc[-1]) and df_close[c].iloc[-1] >= min_price
     ]
     candidates = sorted(candidates)
 
@@ -884,6 +1020,9 @@ def _assemble_market_data(
         risk_free_rate=rf,
         price_date=pd.Timestamp(df_close.index[-1]).date(),
         return_dates=list(df_close.index),
+        price_sources=({c: df_close.attrs['price_sources'][c] for c in candidates}
+                       if 'price_sources' in df_close.attrs else None),
+        untraded_tickers=df_close.attrs.get('untraded_tickers'),
     )
 
 
@@ -898,6 +1037,8 @@ def build_market_data(
     lookback_days: int = DEFAULT_LOOKBACK_DAYS,
     include_market_stress: bool = True,
     include_profile_features: bool = False,
+    live_as_of: Optional[date] = None,
+    profile_benchmark_live: bool = False,
 ) -> Optional[MarketData]:
     """
     Rakit MarketData untuk GA engine.
@@ -912,6 +1053,8 @@ def build_market_data(
                                selalu dipotong sampai sesi keputusan.
         include_profile_features : bukti as-of untuk mode composition_v1;
                                    saham inti adalah proxy, bukan daftar blue chip.
+        live_as_of : batas sesi harga live untuk menyelaraskan pratinjau pasar;
+                     semua return/likuiditas/dividen/stress dirakit ulang sesudah pemotongan.
 
     Returns:
         MarketData, atau None bila data live tidak tersedia (mis. cache DB
@@ -919,9 +1062,12 @@ def build_market_data(
         tanggal acuan tidak ada isinya.
     """
     if backtest:
-        df_close, metrics_map, risk_free, liquidity = _provide_backtest_data(date_ref, lookback_days)
+        df_close, metrics_map, risk_free, liquidity = _provide_backtest_data(
+            date_ref, lookback_days)
     else:
-        df_close, metrics_map, risk_free, liquidity = _provide_live_data()
+        df_close, metrics_map, risk_free, liquidity = (
+            _provide_live_data(as_of=live_as_of) if live_as_of is not None else _provide_live_data()
+        )
 
     logger.info("build_market_data: parameter -> min_price=%.0f, max_stocks=%s, "
                 "backtest=%s, date_ref=%s, lookback_days=%d",
@@ -944,6 +1090,7 @@ def build_market_data(
                     StockUniverse.ticker, StockUniverse.sektor).all()}
             market_data.profile_features = build_profile_features(
                 market_data, df_close, liquidity, DATA_DIR, sector_map,
+                live_benchmark=profile_benchmark_live,
             )
         # Explicit dividend reward uses the same as-of archive in live/backtest;
         # live cache dividend_yield has mixed provider units, so do not use it.

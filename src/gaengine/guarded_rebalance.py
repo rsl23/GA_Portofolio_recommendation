@@ -10,7 +10,6 @@ import numpy as np
 
 from .chromosome import Chromosome
 from .decision_utility import candidate_utility
-from .benchmark_fitness import benchmark_utility, fitness_scenarios
 from .profile_policy import composition_metrics, prepare_policy
 from .rebalancer import fit_buys_to_available_cash
 
@@ -87,10 +86,7 @@ class GuardedRebalance:
         nav=float(config.old_cash)+float(self.old@self.prices)
         if abs(nav-config.budget)>.05:
             raise ValueError('NAV sinyal tidak cocok dengan lot, harga dan kas lama.')
-        if config.fitness_policy == 'net_cvar_ihsg_v1':
-            self.scenarios, self.benchmark_scenarios = fitness_scenarios(self.data, config.forecast_horizon_days)
-        else:
-            self.scenarios=block_scenarios(self.data.returns,config.forecast_horizon_days,config.scenario_shrinkage)
+        self.scenarios=block_scenarios(self.data.returns,config.forecast_horizon_days,config.scenario_shrinkage)
         self.rng=np.random.default_rng(config.seed)
         self.cache={}
         self.history=[]
@@ -98,6 +94,8 @@ class GuardedRebalance:
         self.hold=self.evaluate(self.old)
 
     def evaluate(self,q):
+        from .progress import check_cancelled
+        check_cancelled()
         q=np.asarray(q,dtype=int)
         key=tuple(q)
         if key in self.cache:return self.cache[key]
@@ -111,8 +109,15 @@ class GuardedRebalance:
         metrics=composition_metrics(cfg,q)
         if metrics is not None and not metrics['compliant']:return None
         try:
-            if cfg.fitness_policy == 'net_cvar_ihsg_v1':
-                utility,cash,fees,_=benchmark_utility(cfg,q,(self.scenarios,self.benchmark_scenarios))
+            if cfg.fitness_policy == 'legacy_cvar_v1':
+                values=q*self.prices
+                if values.sum()<=0:return None
+                candidate=Chromosome(cfg,(values/values.sum()).tolist())
+                candidate.evaluate_fitness(lots_override=q)
+                if not candidate.budget_ok:return None
+                utility=candidate.fitness
+                cash=candidate.fitness_diagnostics['signal_cash_after']
+                fees=candidate.fitness_diagnostics['signal_transaction_costs']
             else:
                 utility,cash,fees=candidate_utility(q,self.codes,self.prices,cfg.old_lots,
                     dict(zip(self.codes,self.prices)),cfg.old_cash,self.scenarios,0.,
@@ -164,20 +169,30 @@ class GuardedRebalance:
         return self.repair(q)
 
     def run(self):
+        from .runtime_performance import evolution_performance
+        with evolution_performance():
+            return self._run()
+
+    def _run(self):
+        from .progress import report_candidates, report_generation
         cfg=self.config
         if cfg.population_size<2:raise ValueError('Populasi guarded_v1 minimal dua.')
         population=[self.hold] if self.hold is not None else []
         attempts=0
+        report_candidates(len(population), cfg.population_size, evaluating=True)
         while len(population)<cfg.population_size and attempts<cfg.population_size*40:
             q=self.mutate(self.old,global_search=attempts%5==0)
             item=self.evaluate(q)
-            if item is not None:population.append(item)
+            if item is not None:
+                population.append(item)
+                report_candidates(len(population), cfg.population_size, evaluating=True)
             attempts+=1
         if not population:
             raise ValueError('GA belum menemukan posisi feasible; HOLD melanggar batas. Tidak ada batas yang dilonggarkan.')
-        for _ in range(cfg.generations):
+        for generation in range(cfg.generations):
             population.sort(key=lambda c:c.utility,reverse=True)
             self.history.append(population[0].utility)
+            report_generation(generation + 1, cfg.generations, population[0].utility)
             next_population=population[:max(1,min(cfg.elitism_count,len(population)))]
             for j in range(cfg.population_size-len(next_population)):
                 picks=self.rng.integers(0,len(population),size=3)
@@ -208,7 +223,8 @@ class GuardedRebalance:
             hold_only_tickers=[c for c,b in zip(self.codes,self.buy) if not b],
             evaluated_candidates=len(self.cache),seed=cfg.seed)
         diagnostic['held_history'] = self.data.held_history_diagnostics or {}
-        if cfg.fitness_policy == 'net_cvar_ihsg_v1':
-            diagnostic.update(shrinkage_to_zero=0., scenario_transform='completed_nonoverlapping_blocks',
-                fitness_policy=cfg.fitness_policy, fitness_diagnostics=solution.fitness_diagnostics)
+        if cfg.fitness_policy == 'legacy_cvar_v1':
+            diagnostic.update(fitness_policy=cfg.fitness_policy,fitness_diagnostics=solution.fitness_diagnostics,
+                shrinkage_to_zero=0.,scenario_transform='completed_nonoverlapping_blocks',
+                score_units='legacy_score_minus_cvar_penalty')
         return solution,diagnostic

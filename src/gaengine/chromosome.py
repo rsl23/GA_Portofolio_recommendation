@@ -25,9 +25,11 @@ from typing import List, Optional
 import numpy as np
 
 from .decision_utility import candidate_utility, joint_horizon_returns
-from .benchmark_fitness import benchmark_utility, fitness_scenarios
+from .hybrid_fitness import hybrid_cvar
 from .rebalancer import fit_buys_to_available_cash
 from .profile_policy import composition_metrics, repair_weights
+from .progress import check_cancelled
+from .fitness_context import current_fitness_inputs
 
 
 class Chromosome:
@@ -101,7 +103,7 @@ class Chromosome:
         rng = rng or np.random.default_rng()
         cfg = self.config
         n = cfg.data.n_stocks
-        upper = min(cfg.max_stocks, n) if cfg.operator_policy == 'sparse_v1' else cfg.max_stocks
+        upper = min(cfg.max_stocks, n)
         k = int(rng.integers(cfg.min_stocks, upper + 1))
         indices = rng.choice(n, size=k, replace=False)
         weights = rng.uniform(0.05, 1.0, size=k)
@@ -145,14 +147,11 @@ class Chromosome:
     # ------------------------------------------------------------------
     def evaluate_fitness(self, lots_override: Optional[np.ndarray] = None) -> float:
         """Score lots with the configured historical or research utility mode."""
+        check_cancelled()
         cfg = self.config
         data = cfg.data
         self.fitness_diagnostics = None
-        benchmark_policy = cfg.fitness_policy == "net_cvar_ihsg_v1"
-        if benchmark_policy:
-            # Missing IHSG/history is a request error, never a zero-risk score.
-            fitness_scenarios(data, cfg.forecast_horizon_days)
-
+        prepared = current_fitness_inputs(cfg)
         w = np.asarray(self.genes, dtype=float)
         s = w.sum()
         if s <= 1e-12:
@@ -180,12 +179,15 @@ class Chromosome:
                 raise ValueError("lots_override harus berisi lot non-negatif untuk setiap kandidat.")
             cost = float((lots * prices).sum())
 
-        if (cfg.fitness_mode == "decision_aware" or benchmark_policy) and lots_override is None:
+        if (cfg.fitness_mode == "decision_aware" or cfg.fitness_policy == 'legacy_cvar_v1' or cfg.buy_fee_rate > 0 or cfg.sell_fee_rate > 0) and lots_override is None:
             if cfg.old_lots and cfg.old_cash is None:
                 raise ValueError("Decision-aware rebalance memerlukan kas snapshot lama.")
             desired = {code: int(qty) for code, qty in zip(data.stock_codes, lots) if qty > 0}
-            price_map = {c: p / 100. for c, p in (cfg.old_prices_per_lot or {}).items()}
-            price_map.update(dict(zip(data.stock_codes, (prices / 100.0).tolist())))
+            if prepared is not None:
+                price_map = prepared.execution_prices
+            else:
+                price_map = {c: p / 100. for c, p in (cfg.old_prices_per_lot or {}).items()}
+                price_map.update(dict(zip(data.stock_codes, (prices / 100.0).tolist())))
             try:
                 fitted, _ = fit_buys_to_available_cash(
                     cfg.old_lots or {}, desired,
@@ -306,15 +308,18 @@ class Chromosome:
         # DivYld column is a FRACTION for both live and backtest providers.
         # Clip each stock before weighting so one exceptional payout cannot
         # dominate the objective. Cash/missing/negative yields earn no bonus.
-        yields = np.asarray(data.dividend_yields if data.dividend_yields is not None
-                            else data.fundamental_metrics[:, 4], dtype=float)
-        dividend_signals = np.where(np.isfinite(yields), np.clip(yields, 0, cfg.dividend_yield_cap), 0)
-        self.dividend_score = float(np.dot(portfolio_w, dividend_signals / cfg.dividend_yield_cap))
-        self.dividend_bonus = (cfg.dividend_bonus_weight * self.dividend_score
+        if prepared is not None:
+            dividend_signals = prepared.dividend_signals
+        else:
+            yields = np.asarray(data.dividend_yields if data.dividend_yields is not None
+                                else data.fundamental_metrics[:, 4], dtype=float)
+            dividend_signals = np.where(np.isfinite(yields), np.clip(yields, 0, cfg.dividend_yield_cap), 0) / cfg.dividend_yield_cap
+        self.dividend_score = float(np.dot(portfolio_w, dividend_signals))
+        self.dividend_bonus = ((prepared.dividend_bonus_weight if prepared is not None else cfg.dividend_bonus_weight) * self.dividend_score
                                if cfg.fitness_mode == "rebalance_aware" and self.budget_ok else 0.0)
 
         # final multi-metric fitness
-        lam = cfg.lambda_mdd
+        lam = prepared.lambda_mdd if prepared is not None else cfg.lambda_mdd
         gamma = cfg.correlation_penalty
         alpha = cfg.fundamental_bonus
 
@@ -352,7 +357,7 @@ class Chromosome:
             getattr(cfg, 'old_lots', None)):
             # Marginal change in the *recent-vs-prior* risk/reward signal.
             # Neither realized gains nor losses enter this utility.
-            old_alloc = np.asarray([
+            old_alloc = prepared.old_alloc if prepared is not None else np.asarray([
                 cfg.old_lots.get(code, 0) * prices[i]
                 for i, code in enumerate(data.stock_codes)
             ], dtype=float)
@@ -367,11 +372,11 @@ class Chromosome:
             old_prices = getattr(cfg, 'old_prices_per_lot', None) or {}
             if old_prices:
                 new_lots = dict(zip(data.stock_codes, lots))
-                candidate_prices = dict(zip(data.stock_codes, data.prices_per_lot))
+                candidate_prices = prepared.candidate_prices if prepared is not None else dict(zip(data.stock_codes, data.prices_per_lot))
                 traded_value = sum(
                     abs(int(new_lots.get(code, 0)) - int(old_lots.get(code, 0)))
                     * float(old_prices.get(code, candidate_prices.get(code, 0.0)))
-                    for code in set(new_lots) | set(old_lots)
+                    for code in (prepared.turnover_codes if prepared is not None else set(new_lots) | set(old_lots))
                 )
                 self.turnover_rate = float(traded_value / budget)
             elif getattr(cfg, 'old_weights', None) is not None:
@@ -379,14 +384,7 @@ class Chromosome:
                 self.turnover_rate = float(np.abs(portfolio_w - cfg.old_weights).sum())
             turnover_penalty = getattr(cfg, 'turnover_penalty_beta', 0.4) * self.turnover_rate
 
-        if benchmark_policy:
-            try:
-                utility, _, _, self.fitness_diagnostics = benchmark_utility(cfg, lots)
-                self.fitness = utility - budget_death - div_death
-            except ValueError:
-                self.budget_ok = False
-                self.fitness = -cfg.death_penalty
-        elif cfg.fitness_mode == "decision_aware":
+        if cfg.fitness_mode == "decision_aware":
             horizon = cfg.forecast_horizon_days
             cache = getattr(data, "_decision_scenarios", None)
             if cache is None or cache[0] != horizon:
@@ -426,6 +424,16 @@ class Chromosome:
                 # This rewards portfolio return; it never credits cash interest.
                 + (cfg.cash_return_weight * ret_ann if cfg.allow_cash and not baseline_mode else 0.0)
             )
+
+        if cfg.fitness_policy == 'legacy_cvar_v1':
+            try:
+                penalty, _, _, self.fitness_diagnostics = hybrid_cvar(cfg, lots)
+                base = float(self.fitness)
+                self.fitness = base - penalty
+                self.fitness_diagnostics.update(legacy_score=base, utility=float(self.fitness))
+            except ValueError:
+                self.budget_ok = False
+                self.fitness = -cfg.death_penalty
 
         # Simpan metrik lengkap agar bisa dilaporkan oleh controller
         self.sharpe_ratio = sharpe
