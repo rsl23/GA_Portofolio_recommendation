@@ -5,6 +5,8 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from src.backend.routes.api import api_router
 from src.backend.core.config import settings
+from src.backend.core.analysis_shutdown import cancel_analyses_on_shutdown
+from src.backend.core.analysis_logging import nonblocking_analysis_logging
 from src.backend.models.database import engine, Base, SessionLocal
 from sqlalchemy import inspect, text
 from src.backend.controller.market_controller import (
@@ -156,12 +158,19 @@ async def lifespan(app: FastAPI):
     else:
         print("[Startup] Data filtering sudah terbaru (hari ini) -> pipeline dilewati.")
 
-    yield
-
-    # Clean up saat server dimatikan
-    app.state.market_data_today = None
-    scheduler.shutdown(wait=False)
-    print("[Scheduler] Dimatikan.")
+    with cancel_analyses_on_shutdown(), nonblocking_analysis_logging():
+        logging.getLogger(__name__).info(
+            "Analysis runtime ready: backend-clock-v3, GA thread HighQoS, cancellable narrative I/O, non-blocking logs, progress 1 Hz")
+        from src.gaengine.composition_v2_experiment import LIMITS, POLICY_VERSION
+        logging.getLogger(__name__).info("Composition v2 policy ready: %s | volatility caps=%s",
+            POLICY_VERSION, {profile: limits.max_vol_ratio for profile, limits in LIMITS.items()})
+        try:
+            yield
+        finally:
+            # Always clean up, including forced cancellation during shutdown.
+            app.state.market_data_today = None
+            scheduler.shutdown(wait=False)
+            print("[Scheduler] Dimatikan.")
 
 # Gabungkan seluruh konfigurasi (metadata + lifespan) dalam SATU instance FastAPI
 app = FastAPI(
@@ -228,6 +237,5 @@ def root():
     return {"message": "Selamat datang di API Sistem Rekomendasi Portofolio GA!"}
 
 if __name__ == "__main__":
-    import uvicorn
-    # Menjalankan server secara lokal
-    uvicorn.run("src.backend.app:app", host="127.0.0.1", port=8000, reload=True)
+    from src.backend.core.local_server import run_local_backend
+    run_local_backend()

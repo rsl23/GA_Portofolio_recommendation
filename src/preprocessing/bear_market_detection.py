@@ -1,6 +1,7 @@
 """Causal IHSG regime detection; allocation policy lives in another module.
 
 The Hanna turning-point method is ex-post and is not used as a trading signal.
+Live and backtest share the same point-in-time stock-breadth calculation.
 """
 
 from __future__ import annotations
@@ -14,18 +15,22 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 
+from src.preprocessing.market_breadth import load_market_breadth
+from src.preprocessing.live_regime_cache import live_assessment
+
 DATA_DIR = Path(__file__).resolve().parents[2] / "data"
 CONTEXT_FILE = DATA_DIR / "Master_Market_Context_15Tahun.parquet"
-STOCK_FILE = DATA_DIR / "Master_OHLCV_15Tahun.parquet"
 
 
 @dataclass(frozen=True)
 class RegimeConfig:
-    version: str = "bear-v1"
+    version: str = "bear-v4"
     peak_sessions: int = 252
     fast_ma: int = 50
     slow_ma: int = 200
     entry_drawdown: float = 0.10
+    sustained_drawdown: float = 0.15
+    sustained_confirmation_days: int = 2
     crash_drawdown: float = 0.20
     exit_drawdown: float = 0.08
     entry_confirmation_days: int = 5
@@ -36,22 +41,28 @@ class RegimeConfig:
     ma_gap_scale: float = 0.08
     breadth_start: float = 0.50
     breadth_scale: float = 0.30
+    breadth_min_stocks: int = 50
+    breadth_min_coverage: float = 0.70
     vix_start: float = 20.0
     vix_scale: float = 20.0
     fx_scale: float = 0.10
-    breadth_min_stocks: int = 50
     weights: dict[str, float] = field(default_factory=lambda: {
-        "drawdown": 0.50, "ma_gap": 0.25, "breadth": 0.15, "stress": 0.10,
+        "drawdown": .50, "ma_gap": .25, "breadth": .15, "stress": .10,
     })
 
     def __post_init__(self) -> None:
         if not (0 <= self.exit_drawdown < self.entry_drawdown <
+                self.sustained_drawdown <
                 self.crash_drawdown < 1):
             raise ValueError("Ambang drawdown/hysteresis tidak valid.")
         if min(self.peak_sessions, self.fast_ma, self.slow_ma,
-               self.entry_confirmation_days, self.exit_confirmation_days,
+               self.entry_confirmation_days, self.sustained_confirmation_days,
+               self.exit_confirmation_days,
                self.slow_ma_slope_days) <= 0:
             raise ValueError("Periode indikator harus positif.")
+        if (self.breadth_min_stocks < 1 or not 0 < self.breadth_min_coverage <= 1
+                or not 0 <= self.breadth_start < 1):
+            raise ValueError("Ambang cakupan breadth tidak valid.")
         if (min(self.depth_scale, self.ma_gap_scale, self.breadth_scale,
                 self.vix_scale, self.fx_scale) <= 0 or
             any(weight < 0 for weight in self.weights.values()) or
@@ -70,7 +81,8 @@ def _unknown(as_of: date, reason: str, cfg: RegimeConfig) -> dict:
     return {"status": "unknown", "severity": None, "as_of": None,
             "requested_date": as_of.isoformat(), "reason": reason,
             "config_version": cfg.version, "components": {}, "effective_weights": {},
-            "missing_indicators": [], "formula": None, "parameters": asdict(cfg)}
+            "missing_indicators": [], "breadth_details": None,
+            "formula": None, "parameters": asdict(cfg)}
 
 
 def _clean(values: pd.Series | None, as_of: date, *, allow_zero: bool = False) -> pd.Series:
@@ -85,9 +97,11 @@ def _clean(values: pd.Series | None, as_of: date, *, allow_zero: bool = False) -
 
 
 def detect_market_regime(
-    ihsg: pd.Series, as_of: date, *, breadth: pd.Series | None = None,
+    ihsg: pd.Series, as_of: date, *,
     vix: pd.Series | None = None, usd_idr: pd.Series | None = None,
+    breadth: pd.Series | None = None, breadth_details: dict | None = None,
     config: RegimeConfig = CONFIG,
+    return_history: bool = False,
 ) -> dict:
     """Replay hysteresis chronologically using observations no later than as_of."""
     price = _clean(ihsg, as_of)
@@ -103,16 +117,32 @@ def detect_market_regime(
     below = fast < slow
     above = fast > slow
     enter = below.rolling(config.entry_confirmation_days).sum().eq(config.entry_confirmation_days)
+    sustained = drawdown.ge(config.sustained_drawdown).rolling(
+        config.sustained_confirmation_days
+    ).sum().eq(config.sustained_confirmation_days)
     leave = above.rolling(config.exit_confirmation_days).sum().eq(config.exit_confirmation_days)
     falling = slow < slow.shift(config.slow_ma_slope_days)
     state = "normal"
+    entry_reason = None
+    history = []
     for day in price.index[required - 1:]:
         dd = float(drawdown.loc[day])
-        if state == "normal" and (dd >= config.crash_drawdown or
-            (dd >= config.entry_drawdown and bool(enter.loc[day]) and bool(falling.loc[day]))):
-            state = "bear"
+        if state == "normal":
+            if dd >= config.crash_drawdown:
+                state = "bear"
+                entry_reason = f"drawdown mencapai {config.crash_drawdown:.0%}"
+            elif bool(sustained.loc[day]):
+                state = "bear"
+                entry_reason = (f"drawdown minimal {config.sustained_drawdown:.0%} "
+                                f"selama {config.sustained_confirmation_days} sesi")
+            elif dd >= config.entry_drawdown and bool(enter.loc[day]) and bool(falling.loc[day]):
+                state = "bear"
+                entry_reason = "MA50 di bawah MA200 dan MA200 menurun"
         elif state == "bear" and dd < config.exit_drawdown and bool(leave.loc[day]):
             state = "normal"
+            entry_reason = None
+        if return_history:
+            history.append({"date": day.date().isoformat(), "status": state})
 
     last = price.index[-1]
     dd = float(drawdown.loc[last])
@@ -122,8 +152,8 @@ def detect_market_regime(
                           float(slow.loc[last])) / config.ma_gap_scale),
     }
     missing = []
-    breadth_data = _clean(breadth, as_of, allow_zero=True)
-    if last in breadth_data.index:
+    breadth_data = _clean(breadth, last.date(), allow_zero=True)
+    if last in breadth_data.index and breadth_data.loc[last] <= 1:
         components["breadth"] = _clip((float(breadth_data.loc[last]) -
                                        config.breadth_start) / config.breadth_scale)
     else:
@@ -151,15 +181,18 @@ def detect_market_regime(
     effective = {key: weights[key] / total_weight for key in components}
     severity = sum(components[key] * effective[key] for key in components)
     return {
+        **({"history": history} if return_history else {}),
         "status": state, "severity": round(severity, 6),
         "as_of": last.date().isoformat(), "requested_date": as_of.isoformat(),
         "reason": (f"IHSG turun {dd:.1%} dari puncak {config.peak_sessions} sesi; "
-                   f"MA50 {'di bawah' if below.loc[last] else 'di atas'} MA200."),
+                   f"MA50 {'di bawah' if below.loc[last] else 'di atas'} MA200."
+                   + (f" Status bear dipicu oleh {entry_reason}." if entry_reason else "")),
         "config_version": config.version, "components": components,
         "effective_weights": effective, "missing_indicators": missing,
+        "breadth_details": breadth_details,
         "formula": ("drawdown=clip((DD-entry_drawdown)/depth_scale); "
                     "ma_gap=clip(((MA200-MA50)/MA200)/ma_gap_scale); "
-                    "breadth=clip((below_MA200-breadth_start)/breadth_scale); "
+                    "breadth=clip((fraction_below_MA200-breadth_start)/breadth_scale); "
                     "stress=mean(clip((VIX-vix_start)/vix_scale), "
                     "clip(USDIDR_30d_change/fx_scale)); "
                     "severity=sum(component*effective_weight)"),
@@ -169,12 +202,23 @@ def detect_market_regime(
 
 @lru_cache(maxsize=1)
 def _historical_context() -> pd.DataFrame:
-    return pd.read_parquet(CONTEXT_FILE, columns=["Date", "Ticker", "Close"])
+    return pd.read_parquet(CONTEXT_FILE, columns=["Date", "Ticker", "Close", "Volume"])
 
 
 def _series(frame: pd.DataFrame, ticker: str) -> pd.Series:
     rows = frame[frame["Ticker"] == ticker]
+    if ticker == "^JKSE":
+        from src.preprocessing.ihsg_sessions import validated_ihsg_rows
+        rows = validated_ihsg_rows(rows)
     return pd.Series(rows["Close"].to_numpy(), index=pd.to_datetime(rows["Date"]))
+
+
+def _include_breadth(result: dict, as_of: date, backtest: bool) -> dict:
+    sessions = _clean(result["ihsg"], as_of).index
+    result["breadth"], result["breadth_details"] = load_market_breadth(
+        sessions, backtest, ma_sessions=CONFIG.slow_ma,
+        min_stocks=CONFIG.breadth_min_stocks, min_coverage=CONFIG.breadth_min_coverage)
+    return result
 
 
 def load_regime_data(as_of: date, backtest: bool) -> dict[str, pd.Series]:
@@ -186,18 +230,7 @@ def load_regime_data(as_of: date, backtest: bool) -> dict[str, pd.Series]:
         result = {"ihsg": _series(selected, "^JKSE"),
                   "vix": _series(selected, "^VIX"),
                   "usd_idr": _series(selected, "USDIDR=X")}
-        stocks = pd.read_parquet(
-            STOCK_FILE, columns=["Date", "Ticker", "Close"],
-            filters=[("Date", ">=", pd.Timestamp(as_of - timedelta(days=420))),
-                     ("Date", "<=", pd.Timestamp(as_of))],
-        )
-        closes = stocks.pivot_table(index="Date", columns="Ticker", values="Close", aggfunc="last")
-        ma = closes.rolling(CONFIG.slow_ma, min_periods=CONFIG.slow_ma).mean()
-        eligible = ma.notna() & closes.notna()
-        count = eligible.sum(axis=1)
-        result["breadth"] = ((closes < ma) & eligible).sum(axis=1).div(
-            count.where(count >= CONFIG.breadth_min_stocks))
-        return result
+        return _include_breadth(result, as_of, backtest)
     end = as_of + timedelta(days=1)  # yfinance end is exclusive
     result = {}
     for key, ticker in (("ihsg", "^JKSE"), ("vix", "^VIX"), ("usd_idr", "USDIDR=X")):
@@ -206,15 +239,44 @@ def load_regime_data(as_of: date, backtest: bool) -> dict[str, pd.Series]:
             frame = yf.download(ticker, start=start,
                                 end=end.isoformat(), auto_adjust=False, progress=False)
             close = frame["Close"]
-            result[key] = close.iloc[:, 0] if isinstance(close, pd.DataFrame) else close
+            close = close.iloc[:, 0] if isinstance(close, pd.DataFrame) else close
+            if key == "ihsg" and "Volume" in frame:
+                volume = frame["Volume"]
+                volume = volume.iloc[:, 0] if isinstance(volume, pd.DataFrame) else volume
+                close = close[pd.to_numeric(volume, errors="coerce") > 0]
+            result[key] = close
         except Exception:
             result[key] = pd.Series(dtype=float)
-    result["breadth"] = pd.Series(dtype=float)
-    return result
+    return _include_breadth(result, as_of, backtest)
+
+
+def _assess_market_uncached(as_of: date, backtest: bool) -> dict:
+    try:
+        inputs = load_regime_data(as_of, backtest)
+        result = detect_market_regime(**inputs, as_of=as_of, config=CONFIG)
+        if not backtest and result["as_of"] is not None:
+            session = date.fromisoformat(result["as_of"])
+            if session < as_of:
+                # Keep the stale-data rejection from the first call. For valid
+                # observations, ancillary indicators may not outrun the IHSG mark.
+                result = detect_market_regime(**inputs, as_of=session, config=CONFIG)
+                result["requested_date"] = as_of.isoformat()
+        return result
+    except Exception as exc:
+        return _unknown(as_of, f"Data pasar tidak tersedia: {exc}", CONFIG)
 
 
 def assess_market(as_of: date, backtest: bool) -> dict:
-    try:
-        return detect_market_regime(**load_regime_data(as_of, backtest), as_of=as_of)
-    except Exception as exc:
-        return _unknown(as_of, f"Data pasar tidak tersedia: {exc}", CONFIG)
+    if backtest:
+        return _assess_market_uncached(as_of, backtest)
+    parameters = {**asdict(CONFIG), "live_alignment_policy": "common-session-v1"}
+    result = live_assessment(as_of, parameters, lambda: _assess_market_uncached(as_of, False))
+    if result["as_of"] is not None:
+        session = date.fromisoformat(result["as_of"])
+        if session < as_of:
+            # Publish the exact same observation under its actual session key.
+            # Generate can then validate that preview without a fresh download
+            # or a second observation set. Do this outside the cache's lock.
+            canonical = {**result, "requested_date": session.isoformat()}
+            return live_assessment(session, parameters, lambda: canonical)
+    return result

@@ -13,5 +13,5 @@ psycopg2-binary
 bcrypt
 email-validator
 apscheduler
-google-genai
+openai>=2,<3
 PyJWT

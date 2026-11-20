@@ -2,13 +2,16 @@ from datetime import date
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from src.backend.services.api_idx import fetch_api_idx_saham, fetch_api_stock_summary
 from src.backend.models.database import SessionLocal
 from src.backend.models.stock_universe import StockUniverse
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -718,15 +721,137 @@ def fetch_fundamental_minimal(ticker):
         info = yf.Ticker(ticker + ".JK").info
         return {
             'Kode': ticker, # Samakan key dengan master agar mudah di-join
-            'EPS': info.get('trailingEps', 0) or 0,
-            'ROE': info.get('returnOnEquity', 0) or 0,
-            'DER': info.get('debtToEquity', None) / 100 or 0,
-            'PER': info.get('trailingPE', None) or 0,
-            'PBV': info.get('priceToBook', None) or 0,
-            'dividend_yield_ttm': info.get("trailingAnnualDividendYield")
+            'EPS': _fundamental_number(info.get('trailingEps')),
+            'ROE': _fundamental_number(info.get('returnOnEquity')),
+            'DER': _fundamental_number(info.get('debtToEquity')) / 100.,
+            'PER': _fundamental_number(info.get('trailingPE')),
+            'PBV': _fundamental_number(info.get('priceToBook')),
+            'dividend_yield_ttm': _fundamental_number(info.get("trailingAnnualDividendYield"))
         }
-    except Exception:
+    except Exception as exc:
+        logger.warning("Fundamental %s belum tersedia (%s).", ticker, type(exc).__name__)
         return None
+
+
+def _fundamental_number(value):
+    """Keep unavailable metrics missing; one missing field must not erase others."""
+    try:
+        value = float(value)
+        return value if np.isfinite(value) else np.nan
+    except (TypeError, ValueError):
+        return np.nan
+
+
+def _completed_live_screening_bars(frame):
+    """Discard only globally unpublished Close rows, never fill a ticker's quote.
+
+    A provider may append a new date with Volume but no Close for ANY ticker.
+    That is not yet an observed price session. If even one ticker has a valid
+    Close, retain that date and let exact-session trading checks reject the
+    tickers without a quote or traded volume on that session.
+    """
+    if frame is None or frame.empty:
+        raise ValueError("Riwayat harga live belum tersedia dari penyedia data.")
+    frame = frame.sort_index().copy()
+    days = pd.DatetimeIndex(frame.index)
+    if days.tz is not None:
+        days = days.tz_convert('Asia/Jakarta').tz_localize(None)
+    frame.index = days.normalize()
+    now = datetime.now(timezone(timedelta(hours=7)))
+    cutoff = now.date() if now.hour >= 17 else now.date() - timedelta(days=1)
+    frame = frame.loc[frame.index.date <= cutoff]
+    if isinstance(frame.columns, pd.MultiIndex):
+        level = next((i for i in range(frame.columns.nlevels)
+                      if 'Close' in frame.columns.get_level_values(i)), None)
+        if level is None:
+            raise ValueError("Kolom Close live belum tersedia dari penyedia data.")
+        close = frame.xs('Close', axis=1, level=level)
+    else:
+        close = frame[['Close']]
+    close = close.apply(pd.to_numeric, errors='coerce')
+    observed = (np.isfinite(close) & close.gt(0)).any(axis=1)
+    if not observed.any():
+        raise ValueError("Belum ada harga Close valid pada sesi pasar yang sudah selesai.")
+    if not observed.all():
+        logger.warning("Harga live: melewati %d baris tanggal tanpa Close valid; sesi harga terakhir %s.",
+                       int((~observed).sum()), frame.index[observed][-1].date())
+    return frame.loc[observed]
+
+
+def _fill_live_screening_closes(frame, quotes):
+    """Use a dated IDX Close only for a missing Yahoo quote on that same day.
+
+    Retain positive traded Volume from Yahoo and an existing price history;
+    never relabel yesterday's quote, overwrite a valid Close, or fill zero-volume
+    bars. This matches the dated-cache fallback used by the live GA loader.
+    """
+    if frame is None or frame.empty:
+        return frame
+    frame = frame.sort_index().copy()
+    days = pd.DatetimeIndex(frame.index)
+    if days.tz is not None:
+        days = days.tz_convert('Asia/Jakarta').tz_localize(None)
+    frame.index = days.normalize()
+    now = datetime.now(timezone(timedelta(hours=7)))
+    cutoff = now.date() if now.hour >= 17 else now.date() - timedelta(days=1)
+    frame = frame.loc[frame.index.date <= cutoff]
+    if frame.empty:
+        return frame
+    session = frame.index[-1]
+    filled = []
+    for code, quote in quotes.iterrows():
+        try:
+            ticker = frame[f'{code}.JK'] if isinstance(frame.columns, pd.MultiIndex) else frame
+            quote_day = pd.to_datetime(quote.get('Tanggal'), errors='coerce')
+            close = _fundamental_number(quote.get('Close'))
+            volume = _fundamental_number(ticker['Volume'].iloc[-1])
+            current = _fundamental_number(ticker['Close'].iloc[-1])
+            if (pd.isna(quote_day) or quote_day.date() != session.date()
+                    or not np.isfinite(close) or close <= 0
+                    or not np.isfinite(volume) or volume <= 0
+                    or (np.isfinite(current) and current > 0)
+                    or not pd.to_numeric(ticker['Close'].iloc[:-1], errors='coerce').gt(0).any()):
+                continue
+            column = (f'{code}.JK', 'Close') if isinstance(frame.columns, pd.MultiIndex) else 'Close'
+            frame.at[session, column] = close
+            filled.append(code)
+        except KeyError:
+            continue
+    if filled:
+        logger.info("Harga Close IDX sesi %s melengkapi %d quote Yahoo yang kosong (%s).",
+                    session.date(), len(filled), ', '.join(filled[:7]))
+    return frame
+
+def filter_traded_candidates(codes, session_date, *, bars=None):
+    """Keep only positive Close and traded volume on the exact requested session.
+
+    Missing rows/volume are not filled from another day. Candidate screening
+    must use a session no later than the GA decision date. Execution-session
+    availability is checked separately after the GA has made its decision.
+    """
+    codes = list(codes)
+    if not codes:
+        return codes
+    session = pd.Timestamp(session_date).normalize()
+    if bars is None:
+        bars = pd.read_parquet(
+            Path(__file__).resolve().parents[2] / 'data' / 'Master_OHLCV_15Tahun.parquet',
+            columns=['Date', 'Ticker', 'Close', 'Volume'],
+            filters=[('Date', '=', session),
+                     ('Ticker', 'in', [f'{code}.JK' for code in codes])],
+        )
+    close = pd.to_numeric(bars['Close'], errors='coerce')
+    volume = pd.to_numeric(bars['Volume'], errors='coerce')
+    valid = (pd.to_datetime(bars['Date']).dt.normalize().eq(session)
+             & np.isfinite(close) & close.gt(0)
+             & np.isfinite(volume) & volume.gt(0))
+    traded = set(bars.loc[valid, 'Ticker'].astype(str).str.removesuffix('.JK'))
+    excluded = [code for code in codes if code not in traded]
+    if excluded:
+        print(f"   [!] Tidak ada Close/volume perdagangan valid pada sesi acuan "
+              f"{session.date()} ({len(excluded)} saham); dikeluarkan sebelum GA: {excluded[:7]}...")
+    return [code for code in codes if code in traded]
+
 
 def run_live_preprocessing(backtest: bool = False, date: date = None):
     print(f"1. Mengambil & Menyaring Data... (backtest={backtest})")
@@ -831,8 +956,23 @@ def run_live_preprocessing(backtest: bool = False, date: date = None):
     else:
         print("2. Mengunduh Fundamental & OHLCV via yfinance...")
 
-        # Tarik OHLCV (Hanya untuk keperluan ADTV 60 dan Vol Sporadis)
-        df_tech = yf.download(ticker_yf, period="120d", interval="1d", group_by='ticker')
+        # Use provider Close consistently with the GA price loader. Automatic
+        # adjustment would change Close x Volume and the abnormal-price signals.
+        df_tech = yf.download(
+            ticker_yf, period="120d", interval="1d", group_by='ticker',
+            auto_adjust=False,
+        )
+        df_tech = _fill_live_screening_closes(df_tech, df_master)
+        df_tech = _completed_live_screening_bars(df_tech)
+
+        # Cache Close and its source date must describe the same observed bar.
+        # Do not store today's IDX date against a previous Yahoo quote.
+        session = pd.Timestamp(df_tech.index[-1])
+        for code in df_master.index:
+            frame = df_tech[code + '.JK'] if isinstance(df_tech.columns, pd.MultiIndex) else df_tech
+            df_master.at[code, 'Close'] = _fundamental_number(frame['Close'].iloc[-1])
+        df_master['Tanggal'] = session
+        df_master['Market_Cap'] = df_master['ListedShares'] * df_master['Close']
 
         # Eksekusi Multithreading untuk data fundamental (EPS, ROE, DER)
         fundamentals = []
@@ -842,7 +982,8 @@ def run_live_preprocessing(backtest: bool = False, date: date = None):
                 res = future.result()
                 if res: fundamentals.append(res)
 
-        df_fund = pd.DataFrame(fundamentals).set_index('Kode')
+        df_fund = pd.DataFrame(fundamentals, columns=[
+            'Kode', 'EPS', 'ROE', 'DER', 'PER', 'PBV', 'dividend_yield_ttm']).set_index('Kode')
 
     df_master = df_master.join(df_fund, how='left')
 
@@ -851,7 +992,10 @@ def run_live_preprocessing(backtest: bool = False, date: date = None):
     for ticker in df_master.index:
         try:
             ticker_jk = ticker + ".JK"
-            df_saham = df_tech[ticker_jk].dropna() if len(ticker_yf) > 1 else df_tech.dropna()
+            # yfinance can return ticker-grouped columns even for one ticker.
+            df_saham = df_tech[ticker_jk] if isinstance(df_tech.columns, pd.MultiIndex) else df_tech
+            # Only these fields enter the metrics; optional Adj Close may be missing.
+            df_saham = df_saham.dropna(subset=['Close', 'Volume'])
 
             if len(df_saham) == 0 or len(df_saham) < 60:
                 continue
@@ -984,10 +1128,10 @@ def run_live_preprocessing(backtest: bool = False, date: date = None):
     # --- LOGGING: Rincian Eliminasi Mikro ---
     print("\n--- RINCIAN ELIMINASI MIKRO (FUNDAMENTAL & LIKUIDITAS) ---")
     
-    failed_eps = df_master[~cond_eps].index.tolist()
+    failed_eps = df_master[df_master['EPS'].notna() & ~cond_eps].index.tolist()
     if failed_eps: print(f"   [!] Gagal Laba EPS <= 0 ({len(failed_eps)} saham) -> Contoh: {failed_eps[:7]}...")
     
-    failed_roe = df_master[~cond_roe].index.tolist()
+    failed_roe = df_master[df_master['ROE'].notna() & ~cond_roe].index.tolist()
     if failed_roe: print(f"   [!] Gagal ROE <= 0 ({len(failed_roe)} saham) -> Contoh: {failed_roe[:7]}...")
     
     failed_adtv = df_master[~cond_adtv].index.tolist()
@@ -996,10 +1140,37 @@ def run_live_preprocessing(backtest: bool = False, date: date = None):
     failed_sporadic = df_master[df_master['Is_Sporadic']].index.tolist()
     if failed_sporadic: print(f"   [!] Gagal Volume Sporadis / Manipulasi ({len(failed_sporadic)} saham) -> Contoh: {failed_sporadic[:7]}...")
     
-    failed_der = df_master[~cond_der].index.tolist()
+    failed_der = df_master[df_master['DER'].notna() & ~cond_der].index.tolist()
     if failed_der: print(f"   [!] Gagal Utang DER >= 200% (Bukan Bank) ({len(failed_der)} saham) -> Contoh: {failed_der[:7]}...")
 
+    missing_fundamental = df_master.index[
+        df_master['EPS'].isna() | df_master['ROE'].isna()
+        | (df_master['DER'].isna() & df_master['Sektor'].ne('Keuangan'))].tolist()
+    if missing_fundamental:
+        print(f"   [!] Data fundamental wajib belum tersedia ({len(missing_fundamental)} saham) "
+              f"-> Contoh: {missing_fundamental[:7]}...")
+
     df_lolos = df_master[cond_eps & cond_roe & cond_adtv & cond_sporadic & cond_der]
+    if not backtest:
+        df_lolos = df_lolos[df_lolos['Market_Cap'].ge(batas_mcap)]
+
+    # Screening only knows the latest observed session at the decision cutoff.
+    # Do not inspect a future execution bar to choose the GA candidate universe.
+    # Read the exact final row, before dropping missing fields per ticker.
+    session = pd.Timestamp(df_tech.index.max()).normalize()
+    rows = []
+    for code in df_lolos.index:
+        frame = df_tech[code + '.JK'] if isinstance(df_tech.columns, pd.MultiIndex) else df_tech
+        observed = frame.loc[pd.to_datetime(frame.index).normalize() == session]
+        if not observed.empty:
+            row = observed.iloc[-1]
+            rows.append(dict(Date=session, Ticker=code,
+                             Close=row['Close'], Volume=row['Volume']))
+    selected = filter_traded_candidates(
+        df_lolos.index, session,
+        bars=pd.DataFrame(rows, columns=['Date', 'Ticker', 'Close', 'Volume']),
+    )
+    df_lolos = df_lolos.loc[selected]
 
     print(f"Pipeline Live Selesai! Dari ratusan emiten, tersisa {len(df_lolos)} saham unggulan.")
     return df_lolos.index.tolist(), df_lolos

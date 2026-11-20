@@ -1,4 +1,5 @@
 import logging
+import math
 from datetime import date, timedelta
 import pandas as pd
 
@@ -26,6 +27,19 @@ class PortfolioNotFoundError(Exception):
     """Exception domain: user belum memiliki portofolio (tidak ada histori harga)."""
 
 
+def _filter_records(frame):
+    records = frame.reset_index().astype(object)
+    return records.where(pd.notna(records), None).to_dict(orient='records')
+
+
+def _cache_number(value):
+    try:
+        number = float(value)
+        return number if math.isfinite(number) else None
+    except (TypeError, ValueError):
+        return None
+
+
 def run_and_cache_stock_filtering(
     background_tasks: BackgroundTasks,
     backtest: bool = False,
@@ -46,7 +60,9 @@ def run_and_cache_stock_filtering(
         raise StockFilteringError(f"Filtering saham gagal: {e}")
 
     # 'Kode' tersembunyi sebagai index di df_lolos, jadi di-reset dulu
-    df_json = df_lolos.reset_index().to_dict(orient="records")
+    df_json = _filter_records(df_lolos)
+    if not backtest and not df_json:
+        raise StockFilteringError("Belum ada saham yang lolos dengan data live lengkap. Cache sebelumnya tetap disimpan.")
 
     if not backtest:
         background_tasks.add_task(save_filtered_stocks_to_db, df_json)
@@ -89,12 +105,14 @@ def run_daily_pipeline() -> dict:
         # 1. Filtering & simpan cache (SINKRON, bukan background task,
         #    karena scheduler tidak punya BackgroundTasks FastAPI)
         daftar_saham, df_lolos = run_live_preprocessing(False)
-        df_json = df_lolos.reset_index().to_dict(orient="records")
+        df_json = _filter_records(df_lolos)
         save_filtered_stocks_to_db(df_json)
         logger.info("Pipeline harian [1/3]: filtering selesai (%d saham lolos).", len(daftar_saham))
 
         # 2. Perakitan MarketData ke RAM (fundamental + OHLCV 1 tahun)
         market_data = build_market_data()
+        if market_data is None or market_data.n_stocks == 0:
+            raise StockFilteringError("Harga atau fundamental live belum cukup untuk merakit MarketData. Periksa sumber data terbaru.")
         logger.info("Pipeline harian [2/3]: build_market_data selesai (%s saham).",
                     market_data.n_stocks if market_data else 0)
 
@@ -129,6 +147,8 @@ def save_filtered_stocks_to_db(data_records: list):
     Tugasnya adalah menyimpan hasil dataframe yang sudah diubah menjadi dictionary
     ke dalam tabel filtered_stock_cache di database.
     """
+    if not data_records:
+        raise StockFilteringError("Filtering live belum menghasilkan kandidat. Cache sebelumnya tetap disimpan; coba kembali setelah data tersedia.")
     # Membuat sesi DB baru khusus untuk proses background
     db = SessionLocal()
     try:
@@ -145,16 +165,16 @@ def save_filtered_stocks_to_db(data_records: list):
                 kode=row.get('Kode', ''),
                 nama=row.get('NamaEmiten', ''), # Sesuaikan dengan nama kolom dari API IDX
                 sektor=row.get('Sektor', ''),
-                close=float(row.get('Close', 0.0)),
+                close=_cache_number(row.get('Close')),
                 price_date=price_date.date() if pd.notna(price_date) else None,
-                market_cap=float(row.get('Market_Cap', 0.0)),
-                eps=float(row.get('EPS', 0.0)),
-                roe=float(row.get('ROE', 0.0)),
-                der=float(row.get('DER', 0.0)),
-                adtv_60=float(row.get('ADTV_60', 0.0)),
-                per=float(row.get('PER', 0.0)),
-                pbv=float(row.get('PBV', 0.0)),
-                dividend_yield=float(row.get('dividend_yield_ttm', 0.0)),
+                market_cap=_cache_number(row.get('Market_Cap')),
+                eps=_cache_number(row.get('EPS')),
+                roe=_cache_number(row.get('ROE')),
+                der=_cache_number(row.get('DER')),
+                adtv_60=_cache_number(row.get('ADTV_60')),
+                per=_cache_number(row.get('PER')),
+                pbv=_cache_number(row.get('PBV')),
+                dividend_yield=_cache_number(row.get('dividend_yield_ttm')),
             )
             db.add(cache_item)
             
@@ -164,7 +184,7 @@ def save_filtered_stocks_to_db(data_records: list):
     
     except Exception as e:
         db.rollback()
-        print(f"Background Task Error saat menyimpan ke DB: {e}")
+        raise StockFilteringError("Pembaruan cache saham gagal; data sebelumnya tetap dipertahankan.") from e
     finally:
         # Tutup sesi agar memori tidak bocor
         db.close()
