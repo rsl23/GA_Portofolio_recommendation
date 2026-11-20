@@ -52,6 +52,8 @@ def run_daily_pipeline_endpoint(request: Request):
         )
     except HTTPException:
         raise
+    except StockFilteringError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("Daily pipeline manual gagal")
         raise HTTPException(status_code=500, detail=f"Daily pipeline gagal: {exc}") from exc
@@ -73,7 +75,7 @@ def filter_stocks_endpoint(
     try:
         hasil = run_and_cache_stock_filtering(background_tasks, backtest=backtest, date_ref=date_ref)
     except StockFilteringError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=503, detail=str(e))
     return ApiResponse(
         status="success",
         message="Filtering berhasil dilakukan.",

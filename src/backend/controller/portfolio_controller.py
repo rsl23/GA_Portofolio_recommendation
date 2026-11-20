@@ -1,4 +1,4 @@
-import calendar
+﻿import calendar
 import logging
 import os
 import hashlib
@@ -27,12 +27,15 @@ from src.backend.models.schemas.portfolio_schema import (
     RebalanceSeriesResponse,
     SkippedRebalanceStep,
 )
-from src.backend.services.gemini_llm_caller import explain_portfolio
+from src.backend.services.openai_llm_caller import explain_portfolio
+from src.gaengine.narrative_style import NARRATIVE_VERSION
 from src.backend.services.portfolio_dividends import (
     DividendDataUnavailableError, dividend_entitlements, load_dividend_history,
 )
+from src.backend.services.portfolio_return_metrics import calculate_return_metrics
 from src.gaengine.data_loader import build_market_data
 from src.gaengine.engine import GeneticEngine
+from src.gaengine.progress import check_cancelled, report_progress, set_progress_context
 from src.gaengine.ga_config import GAConfig, REBALANCE_FITNESS_PARAMETERS
 from src.gaengine.rebalancer import (
     compute_nav,
@@ -44,7 +47,7 @@ from src.gaengine.rebalancer import (
 from src.preprocessing.bear_market_detection import assess_market
 from src.preprocessing.capital_allocation_policy import (
     CONFIG as ALLOCATION_CONFIG,
-    effective_fraction, recommend_fraction,
+    effective_fraction, recommend_fraction, resolve_bear_choice,
 )
 logger = logging.getLogger(__name__)
 
@@ -156,6 +159,79 @@ def _execution_close_prices(db: Session, tickers: set[str], requested: date, bac
     return effective, prices
 
 
+def _backtest_untraded_tickers(tickers: set[str], execution_day: date) -> set[str]:
+    """Stocks with no actual trade on the execution session (Close is only a mark)."""
+    if not tickers:
+        return set()
+    import pandas as pd
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent.parent.parent
+    try:
+        frame = pd.read_parquet(
+            root / "data" / "Master_OHLCV_15Tahun.parquet",
+            columns=["Date", "Ticker", "Volume"],
+            filters=[("Date", "=", pd.Timestamp(execution_day)),
+                     ("Ticker", "in", [f"{ticker}.JK" for ticker in tickers])],
+        )
+    except Exception as exc:
+        raise MarketDataUnavailableError(f"Volume eksekusi backtest tidak dapat dibaca: {exc}") from exc
+    traded = {
+        str(row.Ticker).removesuffix(".JK") for row in frame.itertuples()
+        if pd.notna(row.Volume) and row.Volume > 0
+    }
+    return tickers - traded
+
+
+def _retain_untraded_lots(old_lots: dict[str, int], desired: dict[str, int],
+                           untraded: set[str], priorities: dict[str, float],
+                           max_stocks: int, min_stocks: int = 3) -> dict[str, int]:
+    """Cancel unfillable orders and keep suspended holdings across snapshots."""
+    result = {code: qty for code, qty in desired.items() if qty > 0 and code not in untraded}
+    frozen = {code: qty for code, qty in old_lots.items() if qty > 0 and code in untraded}
+    result.update(frozen)
+    # Prefer carrying a tradable old position to inventing a new BUY when a
+    # zero-volume candidate leaves fewer than the required number of stocks.
+    for code in sorted(set(old_lots) - set(result) - untraded,
+                       key=lambda ticker: (-priorities.get(ticker, 0.0), ticker)):
+        if len(result) >= min_stocks:
+            break
+        result[code] = old_lots[code]
+    while len(result) > max(max_stocks, len(frozen)):
+        removable = set(result) - set(frozen)
+        if not removable:
+            break
+        code = min(removable, key=lambda ticker: (priorities.get(ticker, 0.0), ticker))
+        del result[code]
+    return result
+
+
+def _deferred_untraded_signals(old_lots: dict[str, int], ga_target: dict[str, int],
+                                untraded: set[str]) -> list[dict]:
+    """Keep GA intentions visible without booking impossible transactions."""
+    signals = []
+    for code in sorted(untraded):
+        held, target = old_lots.get(code, 0), ga_target.get(code, 0)
+        if held == target:
+            continue
+        signals.append({
+            "ticker": code,
+            "action": "BUY" if target > held else "SELL",
+            "held_lots": held,
+            "target_lots": target,
+            "reason": "Belum ada bukti volume perdagangan positif pada sesi acuan; sinyal GA belum dilaksanakan.",
+        })
+    return signals
+
+
+def _marked_holdings_value(lots: dict[str, int], prices: dict[str, float]) -> Decimal:
+    """Value every retained position, including holdings outside the GA universe."""
+    return sum(
+        (_money(qty) * 100 * _money(prices[code]) for code, qty in lots.items()),
+        Decimal("0"),
+    )
+
+
 def _live_execution_prices(db: Session, ga_data, old_lots: dict[str, int]) -> tuple[date, dict[str, float]]:
     """Use the GA's raw, completed-session Close for live candidates.
 
@@ -181,13 +257,32 @@ def _live_execution_prices(db: Session, ga_data, old_lots: dict[str, int]) -> tu
         raise MarketDataUnavailableError("Harga Close live kandidat GA tidak valid.")
     outside = set(old_lots) - set(prices)
     if outside:
-        old_day, old_prices = _execution_close_prices(db, outside, execution_day, False)
-        if old_day != execution_day:
-            raise MarketDataUnavailableError(
-                f"Harga aktual posisi lama di luar kandidat GA tidak tersedia pada {execution_day}."
-            )
-        prices.update(old_prices)
+        # A suspended holding still has value. Its last observed Close is a
+        # valuation mark only; _live_untraded_tickers prevents a fictional sale.
+        rows = db.query(StockUniverse.ticker, MarketData.date, MarketData.close).join(
+            MarketData, MarketData.stock_id == StockUniverse.id_stock,
+        ).filter(StockUniverse.ticker.in_(outside), MarketData.date <= execution_day).order_by(
+            MarketData.date.desc()).all()
+        for code, _, close in rows:
+            if code not in prices and close is not None and math.isfinite(close) and close > 0:
+                prices[code] = float(close)
+        missing = outside - set(prices)
+        if missing:
+            raise MarketDataUnavailableError(f"Harga penilaian posisi lama belum tersedia: {', '.join(sorted(missing))}.")
     return execution_day, prices
+
+
+def _live_untraded_tickers(db, ga_data, old_lots, execution_day):
+    """Use actual session volume; missing evidence outside the screen means HOLD."""
+    untraded = set(getattr(ga_data, "untraded_tickers", None) or [])
+    outside = set(old_lots) - set(ga_data.stock_codes)
+    if outside:
+        rows = db.query(StockUniverse.ticker, MarketData.volume).join(
+            MarketData, MarketData.stock_id == StockUniverse.id_stock,
+        ).filter(StockUniverse.ticker.in_(outside), MarketData.date == execution_day).all()
+        traded = {code for code, volume in rows if volume is not None and volume > 0}
+        untraded.update(outside - traded)
+    return untraded
 
 
 def _backtest_trading_day(requested: date) -> date:
@@ -212,7 +307,7 @@ def _backtest_trading_day(requested: date) -> date:
 
 
 def preview_bear_market(risk_profile: str, backtest: bool = False,
-                        date_ref: date | None = None) -> dict:
+                        date_ref: date | None = None, live_as_of: date | None = None) -> dict:
     """Read-only, as-of regime and allocation preview for one execution date."""
     if backtest:
         if date_ref is None:
@@ -221,8 +316,20 @@ def preview_bear_market(risk_profile: str, backtest: bool = False,
         decision_day = _backtest_trading_day(execution_day - timedelta(days=1))
     else:
         execution_day = None
-        decision_day = date.today() - timedelta(days=1)
+        now_wib = datetime.now(timezone(timedelta(hours=7)))
+        decision_day = now_wib.date() if now_wib.hour >= 17 else now_wib.date() - timedelta(days=1)
+        if live_as_of is not None:
+            if live_as_of > decision_day or (decision_day - live_as_of).days > 7:
+                raise ValueError("Pratinjau bear market sudah berubah; muat ulang sebelum generate.")
+            decision_day = live_as_of
     assessment = assess_market(decision_day, backtest)
+    if not backtest and assessment["as_of"] is not None:
+        decision_day = _as_date(assessment["as_of"])
+        completed = now_wib.date() if now_wib.hour >= 17 else now_wib.date() - timedelta(days=1)
+        if (completed - decision_day).days > 7:
+            raise MarketDataUnavailableError(
+                f"Data IHSG terakhir {decision_day} terlalu lama untuk sesi bersama live; perbarui sumber pasar."
+            )
     result = {
         **assessment,
         "execution_date": execution_day.isoformat() if execution_day else None,
@@ -248,7 +355,10 @@ def preview_bear_market(risk_profile: str, backtest: bool = False,
 
 def preview_bear_series(start_date: date, end_date: date,
                         interval_months: int, risk_profile: str) -> dict:
-    schedule = build_rebalance_schedule(start_date, end_date, interval_months)
+    # The first date belongs to the already stored base snapshot.
+    schedule = build_rebalance_schedule(start_date, end_date, interval_months)[1:]
+    if not schedule:
+        raise ValueError("Tanggal akhir harus mencakup minimal satu jadwal rebalance.")
     if len(schedule) > MAX_SERIES_STEPS:
         raise ValueError(f"Jumlah langkah melebihi {MAX_SERIES_STEPS}.")
     return {"scheduled_dates": [day.isoformat() for day in schedule],
@@ -262,33 +372,73 @@ def preview_bear_series(start_date: date, end_date: date,
 def _limit_lots_to_exposure(old_lots: dict[str, int], desired: dict[str, int],
                             cash_before: float, prices: dict[str, float],
                             fraction: float, min_stocks: int,
-                            priority: dict[str, float]) -> dict[str, int]:
-    """Trim existing or new holdings against execution NAV, never only BUY value."""
+                            priority: dict[str, float], buy_fee_rate: float = 0.0,
+                            sell_fee_rate: float = 0.0,
+                            frozen: set[str] | None = None) -> dict[str, int]:
+    """Cap all holdings against post-fee execution NAV, including old positions.
+
+    Cancelling a BUY saves its fee; reducing a HOLD creates a SELL fee. Reprice
+    these deltas after every trim rather than treating the pre-trade NAV as a
+    fixed denominator. Prices are per share and all adjustments are whole lots.
+    """
+    fraction, buy_fee, sell_fee = map(_money, (fraction, buy_fee_rate, sell_fee_rate))
+    if (not fraction.is_finite() or not 0 <= fraction <= 1 or
+            any(not fee.is_finite() or not 0 <= fee < 1 for fee in (buy_fee, sell_fee))):
+        raise ValueError("Porsi modal atau tarif biaya transaksi tidak valid.")
+    if not _money(cash_before).is_finite() or cash_before < 0:
+        raise ValueError("Kas sebelum transaksi tidak valid.")
+    for positions in (old_lots, desired):
+        if any(not isinstance(qty, (int, np.integer)) or qty < 0 for qty in positions.values()):
+            raise ValueError("Lot harus integer non-negatif.")
+    for code in set(old_lots) | set(desired):
+        price = prices.get(code)
+        if price is None or not _money(price).is_finite() or _money(price) <= 0:
+            raise ValueError(f"Harga eksekusi tidak valid untuk {code}.")
     nav = _money(cash_before) + sum(
         _money(qty) * 100 * _money(prices[code]) for code, qty in old_lots.items()
     )
-    cap = nav * _money(fraction)
-    result = dict(desired)
+    result = {code: qty for code, qty in desired.items() if qty > 0}
     def holdings_value() -> Decimal:
         return sum((_money(qty) * 100 * _money(prices[code])
                     for code, qty in result.items()), Decimal("0"))
-    while holdings_value() > cap + Decimal("0.01"):
+    def post_fee_nav() -> Decimal:
+        fees = Decimal("0")
+        for code in set(old_lots) | set(result):
+            delta = result.get(code, 0) - old_lots.get(code, 0)
+            fees += abs(delta) * 100 * _money(prices[code]) * (buy_fee if delta > 0 else sell_fee)
+        return nav - fees
+    while holdings_value() > fraction * post_fee_nav() + Decimal("0.01"):
         candidates = [
             code for code, qty in result.items()
-            if qty > 1 or sum(x > 0 for x in result.values()) > min_stocks
+            if code not in (frozen or set()) and
+            (qty > 1 or sum(x > 0 for x in result.values()) > min_stocks)
         ]
         if not candidates:
+            frozen_value = sum(
+                _money(result.get(code, 0)) * 100 * _money(prices[code])
+                for code in (frozen or set())
+            )
+            if frozen and frozen_value > fraction * post_fee_nav() + Decimal("0.01"):
+                return result
             raise ValueError(
-                "Batas porsi saham tidak dapat dipenuhi dengan minimum saham dan lot."
+                "Batas porsi saham tidak dapat dipenuhi karena posisi tidak diperdagangkan atau batas minimum saham."
             )
         code = min(candidates, key=lambda ticker: (priority.get(ticker, 0.0), ticker))
-        excess = holdings_value() - cap
+        excess = holdings_value() - fraction * post_fee_nav()
         lot_value = _money(prices[code]) * 100
-        required_sale = int((excess / lot_value).to_integral_value(rounding="ROUND_CEILING"))
+        pending_buy = max(0, result[code] - old_lots.get(code, 0))
+        # Stop at HOLD before switching to SELL: the marginal fee changes sign.
+        reduction_per_lot = lot_value * (1 + fraction * buy_fee if pending_buy
+                                         else 1 - fraction * sell_fee)
+        required_sale = int((excess / reduction_per_lot).to_integral_value(rounding="ROUND_CEILING"))
         max_sale = result[code] if sum(x > 0 for x in result.values()) > min_stocks else result[code] - 1
+        if pending_buy:
+            max_sale = min(max_sale, pending_buy)
         result[code] -= min(required_sale, max_sale)
         if result[code] == 0:
             del result[code]
+    if post_fee_nav() <= 0 or post_fee_nav() - holdings_value() < Decimal("-0.01"):
+        raise ValueError("NAV atau kas setelah pembatasan exposure tidak valid.")
     return result
 
 
@@ -334,11 +484,8 @@ def generate_new_portfolio(
     )
     guarded = (getattr(request, "rebalance_model", "legacy") == "guarded_v1"
                and getattr(request, "rebalance", False))
-    benchmark_fitness = getattr(request, "fitness_policy", "legacy") == "net_cvar_ihsg_v1"
-    if benchmark_fitness and not backtest:
-        raise ValueError("net_cvar_ihsg_v1 tersedia sebagai eksperimen backtest terlebih dahulu.")
-    if getattr(request, "rebalance_model", "legacy") == "guarded_v1" and not backtest:
-        raise ValueError("guarded_v1 tersedia sebagai eksperimen backtest terlebih dahulu.")
+    hybrid_fitness = getattr(request, "fitness_policy", "legacy") == "legacy_cvar_v1"
+    experimental_fitness = hybrid_fitness
 
     # 0. Validasi user dari payload JWT (sub). Lempar error jika sudah terhapus.
     try:
@@ -350,14 +497,15 @@ def generate_new_portfolio(
         raise UserNotFoundError("User pada token tidak ditemukan di database.")
     exposure_limit = None
     if getattr(request, "bear_management", False):
+        report_progress("market", "Memeriksa kondisi pasar",
+                        "Menyesuaikan analisis dengan kondisi pasar dan pilihan alokasi modal Anda.")
         preview = preview_bear_market(request.risk_profile, backtest, date_ref)
         if (preview["as_of"] is not None and
             str(request.bear_preview_as_of) != preview["as_of"]):
             raise ValueError("Pratinjau bear market sudah berubah; muat ulang sebelum generate.")
         if request.bear_preview_fingerprint != preview["fingerprint"]:
             raise ValueError("Indikator pasar berubah sejak pratinjau; muat ulang sebelum generate.")
-        choice = ("recommended" if user.bear_allocation_policy == "always_follow"
-                  and preview["status"] != "unknown" else request.bear_choice)
+        choice = resolve_bear_choice(user.bear_allocation_policy, preview["status"], request.bear_choice)
         exposure_limit = effective_fraction(preview, request.risk_profile, choice)
 
     # 1. Siapkan MarketData.
@@ -379,31 +527,57 @@ def generate_new_portfolio(
             profile_options = ({"include_profile_features": True}
                                if getattr(request, "profile_policy", "legacy") != "legacy" else {})
             market_data = build_market_data(
-                min_price=1.0, backtest=True, date_ref=decision_day, **profile_options
+                min_price=1.0, backtest=True, date_ref=decision_day,
+                **profile_options
             )
         except Exception as e:
             raise MarketDataUnavailableError(
                 f"Gagal merakit MarketData backtest untuk {decision_day}: {e}"
             ) from e
-    elif market_data is None:
+    elif market_data is None or market_data.n_stocks == 0:
         logger.info("Membentuk MarketData menggunakan data LIVE...")
-        market_data = build_market_data(min_price=1.0, **(
-            {"include_profile_features": True} if getattr(request, "profile_policy", "legacy") != "legacy" else {}))
+        try:
+            profile_choice = getattr(request, "profile_policy", "legacy")
+            profile_options = (
+                {"include_profile_features": True,
+                 "profile_benchmark_live": profile_choice == "composition_v2"}
+                if profile_choice != "legacy" else {})
+            market_data = build_market_data(min_price=1.0, **profile_options)
+        except ValueError as exc:
+            raise MarketDataUnavailableError(f"Gagal merakit MarketData live: {exc}") from exc
 
     if market_data is None or market_data.n_stocks == 0:
         raise MarketDataUnavailableError(
-            "Gagal membentuk MarketData. Pastikan tabel filtered_stock_cache sudah terisi "
-            "(live) atau tanggal backtest memiliki data (backtest)."
+            "Gagal membentuk MarketData: histori OHLCV/fundamental tidak tersedia, "
+            "atau tidak ada kandidat dengan harga Close valid pada sesi penilaian. "
+            "filtered_stock_cache yang terisi saja belum cukup; periksa juga sumber harga."
         )
+    # Bear indicators have their own observed date. Older causal indicators
+    # must not rewind a newer stock-price/return snapshot to the IHSG date.
+    if not backtest and getattr(request, "bear_management", False) and preview["as_of"] is not None:
+        if _as_date(preview["as_of"]) > _as_date(market_data.price_date):
+            raise MarketDataUnavailableError(
+                "Harga saham tertinggal dari indikator pasar; perbarui OHLCV sebelum generate."
+            )
 
     if getattr(request, "profile_policy", "legacy") != "legacy" and market_data.profile_features is None:
         # Startup's live cache is deliberately legacy. Reload a local object;
         # never mutate the shared cache while another request is using it.
         if not backtest:
-            market_data = build_market_data(min_price=1.0, include_profile_features=True)
+            expected_session = market_data.price_date
+            market_data = build_market_data(min_price=1.0, include_profile_features=True,
+                                           live_as_of=expected_session,
+                                           profile_benchmark_live=(getattr(request, "profile_policy", "legacy") == "composition_v2"))
+            if market_data is not None and market_data.price_date != expected_session:
+                raise MarketDataUnavailableError(
+                    f"Histori komposisi live untuk sesi {expected_session} belum lengkap; perbarui sumber harga."
+                )
         if market_data is None or market_data.profile_features is None:
             raise ValueError("Bukti komposisi profil tidak tersedia.")
 
+    report_progress("analyzing", "Menganalisis saham pilihan",
+                    f"Menyiapkan {market_data.n_stocks} kandidat saham beserta risiko dan hubungan antar saham.",
+                    candidates=market_data.n_stocks)
     # --- REBALANCING LOGIC ---
     old_portfolio_id = None
     old_lots = {}
@@ -423,23 +597,31 @@ def generate_new_portfolio(
     name_portofolio = (getattr(request, "name_portofolio", None) or "").strip()
     description = (getattr(request, "description", None) or "").strip() or None
     
+    live_formation_day = datetime.now(timezone(timedelta(hours=7))).date() if not backtest else None
     if getattr(request, 'rebalance', False):
         try:
-            old_portfolio_res = get_active_portfolio(db, str(user_uuid), backtest=backtest)
-            old_portfolio_id = old_portfolio_res.id
-            old_snapshot_row = db.query(Portofolio).filter(
-                Portofolio.id == UUID(str(old_portfolio_id)), Portofolio.user_id == user_uuid
-            ).with_for_update().first()
-            if old_snapshot_row is None:
-                raise PortfolioNotFoundError("Portofolio aktif tidak ditemukan.")
+            old_snapshot_row = _resolve_action_portfolio(db, user_uuid,
+                getattr(request, 'rebalance_portfolio_id', None), backtest=backtest)
+            old_portfolio_id = str(old_snapshot_row.id)
+            old_portfolio_res = _to_portfolio_response(db, old_snapshot_row)
             # Snapshot hasil rebalance tetap memakai identitas portofolio lama.
             name_portofolio = name_portofolio or getattr(old_snapshot_row, "name_portofolio", None) or ""
             description = description if description is not None else getattr(old_snapshot_row, "description", None)
+            previous_default_name = (
+                f"Portofolio {old_snapshot_row.risk_profile} {_snapshot_date(old_snapshot_row).isoformat()}"
+            )
+            if not name_portofolio or name_portofolio == previous_default_name:
+                root_snapshot = _portfolio_lineage(db, old_snapshot_row, user_uuid)[0]
+                name_portofolio = (
+                    getattr(root_snapshot, "name_portofolio", None) or
+                    f"Portofolio {root_snapshot.risk_profile} {_snapshot_date(root_snapshot).isoformat()}"
+                )
             applied_contribution = _money(requested_contribution) + _money(old_snapshot_row.pending_deposit or 0)
             if not applied_contribution.is_finite() or applied_contribution < 0:
                 raise ValueError("Total setoran untuk rebalance tidak valid.")
             for alloc in old_portfolio_res.allocations:
-                old_lots[alloc.ticker] = alloc.lots
+                if alloc.lots > 0:
+                    old_lots[alloc.ticker] = alloc.lots
             
             # Validasi khusus BACKTEST: tanggal simulasi baru tidak boleh lebih
             # awal dari portofolio backtest aktif yang akan di-rebalance.
@@ -478,9 +660,10 @@ def generate_new_portfolio(
                 old_snapshot_row.execution_date if old_snapshot_row is not None else None
             ) or old_portfolio_res.date_ref or old_portfolio_res.created_at
             previous_execution_day = _as_date(previous_execution_day)
-            if execution_day <= previous_execution_day:
+            effective_day = execution_day if backtest else live_formation_day
+            if effective_day <= previous_execution_day:
                 raise MarketDataUnavailableError(
-                    f"Hari eksekusi {execution_day} harus sesudah snapshot sebelumnya ({previous_execution_day})."
+                    f"Hari pembentukan {effective_day} harus sesudah snapshot sebelumnya ({previous_execution_day})."
                 )
             current_prices = {code: price * 100.0 for code, price in all_close_prices.items()}
             
@@ -534,23 +717,47 @@ def generate_new_portfolio(
         if backtest and execution_day != execution_target:
             raise MarketDataUnavailableError("Hari harga eksekusi berbeda dari jadwal bursa efektif.")
     if not name_portofolio:
-        name_portofolio = f"Portofolio {request.risk_profile} {execution_day.isoformat()}"
-    if guarded:
+        name_portofolio = f"Portofolio {request.risk_profile} {(execution_day if backtest else live_formation_day).isoformat()}"
+    live_untraded = (_live_untraded_tickers(db, market_data, old_lots, execution_day)
+                     if not backtest else set())
+    experimental_profile_v2 = getattr(request, "profile_policy", "legacy") == "composition_v2"
+    if experimental_profile_v2 and guarded:
+        raise ValueError("composition_v2 belum mendukung guarded_v1; pilih rebalance legacy.")
+    if guarded or (experimental_profile_v2 and old_lots):
         from src.gaengine.held_universe import load_held_universe
         from src.gaengine.data_loader import DATA_DIR
         sector_map = None
         if market_data.profile_features is not None:
             sector_map = {ticker: sector for ticker, sector in db.query(
                 StockUniverse.ticker, StockUniverse.sektor).all()}
-        market_data = load_held_universe(market_data, old_lots, DATA_DIR, sector_map)
+        if backtest:
+            market_data = load_held_universe(
+                market_data, old_lots, DATA_DIR, sector_map,
+                allow_untraded_signal=experimental_profile_v2,
+            )
+        else:
+            from src.gaengine.live_evidence import load_live_held_universe
+            market_data = load_live_held_universe(market_data, old_lots, sector_map,
+                                                 frozen_tickers=live_untraded)
+        if hybrid_fitness and market_data.market_stress is None:
+            # Extending the holdings universe invalidates the old stock-row
+            # matrix. Rebuild it so hybrid retains legacy market-stress risk.
+            from src.gaengine.market_stress import load_market_stress
+            market_data.market_stress = load_market_stress(
+                market_data.stock_codes, market_data.price_date, DATA_DIR)
         old_weights_aligned = [old_lots.get(c, 0)*p/ga_budget for c,p in
                                zip(market_data.stock_codes,market_data.prices_per_lot)]
         # A failed BUY screen no longer makes an old holding a forced sell.
         eliminated_stocks = []
-    if benchmark_fitness:
-        from src.gaengine.benchmark_fitness import load_benchmark_data
-        from src.gaengine.data_loader import DATA_DIR
-        market_data = load_benchmark_data(market_data, DATA_DIR)
+    if experimental_fitness:
+        horizon = getattr(request, "fitness_horizon_days", 63)
+        history = np.asarray(market_data.returns)
+        if history.shape[1] < 3 * horizon or not np.isfinite(history).all() or np.any(history <= -1):
+            raise MarketDataUnavailableError(
+                f"{request.fitness_policy} memerlukan minimal {3*horizon} sesi return valid "
+                f"({history.shape[1]} tersedia). Gunakan fitness legacy pada kedua mode "
+                "atau lengkapi histori; CVaR tidak diganti dengan angka nol."
+            )
     # Backtest GA sizes positions with the prior session's prices, while the
     # simulated order and post-trade allocation use the execution-day Close.
     ga_prices = ({code: _money(all_close_prices[code]) for code in market_data.stock_codes}
@@ -567,7 +774,7 @@ def generate_new_portfolio(
         budget=ga_budget,            # NAV known when the GA decision is made
         risk_profile=request.risk_profile,
         min_stocks=3,
-        profile_policy=getattr(request, "profile_policy", "legacy"),
+        profile_policy=("legacy" if experimental_profile_v2 else getattr(request, "profile_policy", "legacy")),
         max_stocks=10,
         risk_free_rate=market_data.risk_free_rate,
         # seed=42,
@@ -576,11 +783,10 @@ def generate_new_portfolio(
         forecast_horizon_days=getattr(request, "fitness_horizon_days", 63),
         cvar_tail_fraction=getattr(request, "fitness_cvar_tail_fraction", .1),
         lambda_cvar=getattr(request, "fitness_lambda_cvar", .5),
-        lambda_benchmark_downside=getattr(request, "fitness_lambda_benchmark_downside", .5),
         is_rebalance=getattr(request, 'rebalance', False),
         rebalance_model="guarded_v1" if guarded else "legacy",
-        buy_fee_rate=getattr(request, "rebalance_buy_fee_rate", .0015) if (guarded or benchmark_fitness or getattr(request, "charge_transaction_fees", False)) else 0.,
-        sell_fee_rate=getattr(request, "rebalance_sell_fee_rate", .0025) if (guarded or benchmark_fitness or getattr(request, "charge_transaction_fees", False)) else 0.,
+        buy_fee_rate=getattr(request, "rebalance_buy_fee_rate", .0015) if (guarded or experimental_fitness or getattr(request, "charge_transaction_fees", False)) else 0.,
+        sell_fee_rate=getattr(request, "rebalance_sell_fee_rate", .0025) if (guarded or experimental_fitness or getattr(request, "charge_transaction_fees", False)) else 0.,
         old_weights=old_weights_aligned,
         old_lots=old_lots,
         old_prices_per_lot=old_signal_prices_per_lot,
@@ -600,20 +806,35 @@ def generate_new_portfolio(
         )
 
     # 3. Evolusi genetika
+    report_progress("optimizing", "Merangkai kombinasi saham",
+                    "Menyiapkan kombinasi awal untuk dibandingkan oleh algoritma genetika.",
+                    total_generations=config.generations)
     logger.info("=== MEMULAI EVOLUSI GENETIKA ===")
     rebalance_diagnostics = None
-    if guarded:
+    if experimental_profile_v2:
+        from types import SimpleNamespace
+        from src.gaengine.composition_v2_experiment import run as run_profile_v2
+
+        solution, history = run_profile_v2(config)
+        engine = SimpleNamespace(history=history)
+    elif guarded:
         from src.gaengine.guarded_rebalance import GuardedRebalance
         engine = GuardedRebalance(config)
         solution, rebalance_diagnostics = engine.run()
     else:
         engine = GeneticEngine(config)
-        solution = engine.run(verbose=True)
+        # Generation information already goes through the non-blocking logger
+        # and progress stream; avoid synchronous print() to the VS Code PTY.
+        solution = engine.run(verbose=False)
     if not solution.diversification_ok or not solution.budget_ok:
         raise ValueError("GA tidak menghasilkan portofolio yang memenuhi batas saham dan budget.")
     
+    report_progress("allocating", "Memeriksa komposisi terpilih",
+                    "Menghitung jumlah lot, sisa kas, dan biaya sesuai alokasi Anda.",
+                    generation=len(engine.history), total_generations=config.generations,
+                    fitness=float(solution.fitness))
     # --- APPLY NO TRADE BAND ---
-    if getattr(request, 'rebalance', False) and not guarded and not benchmark_fitness and not (
+    if getattr(request, 'rebalance', False) and not guarded and not experimental_profile_v2 and not (
         exposure_limit is not None and exposure_limit < 1.0
     ):
         if config.allow_cash:
@@ -642,6 +863,19 @@ def generate_new_portfolio(
     # and trim lowest-priority BUY lots before the snapshot is persisted.
     desired_lots = {code: int(qty) for code, qty in
                     zip(market_data.stock_codes, solution.lots) if qty > 0}
+    ga_signal_lots = dict(desired_lots)
+    untraded = (_backtest_untraded_tickers(
+        set(old_lots) | set(market_data.stock_codes), execution_day)
+        if backtest else live_untraded)
+    frozen = set(old_lots) & untraded
+    if untraded:
+        desired_lots = _retain_untraded_lots(
+            old_lots, desired_lots, untraded,
+            dict(zip(market_data.stock_codes, solution.genes)),
+            config.max_stocks, config.min_stocks,
+        )
+        logger.info("Rebalance %s: posisi dibekukan %s; kandidat tanpa transaksi %s",
+                    execution_day, sorted(frozen), sorted(untraded - set(old_lots)))
     # The live candidate fill follows MarketData/GA prices, while a full sell
     # outside that universe follows its observed Close. Use exactly those same
     # prices for affordability, exposure, and the persisted cash delta.
@@ -658,43 +892,84 @@ def generate_new_portfolio(
         affordable_lots = _limit_lots_to_exposure(
             old_lots, affordable_lots,
             leftover_cash if old_portfolio_id else float(request.budget),
-            execution_price_map, exposure_limit, config.min_stocks,
+            execution_price_map, exposure_limit,
+            len(frozen) if frozen else config.min_stocks,
             dict(zip(market_data.stock_codes, solution.genes)),
+            config.buy_fee_rate, config.sell_fee_rate,
+            frozen=frozen,
         )
+    if experimental_profile_v2:
+        from src.gaengine.composition_v2_experiment import trim_execution_lots
+
+        execution_lot_prices = np.asarray(
+            [execution_price_map[c] * 100 for c in market_data.stock_codes], dtype=float)
+        trimmed = trim_execution_lots(
+            config,
+            [affordable_lots.get(c, 0) for c in market_data.stock_codes],
+            execution_lot_prices,
+            min_lots=[old_lots.get(c, 0) if c in frozen else 0
+                      for c in market_data.stock_codes],
+        )
+        reductions = {
+            c: affordable_lots.get(c, 0) - int(q)
+            for c, q in zip(market_data.stock_codes, trimmed)
+            if affordable_lots.get(c, 0) > int(q)
+        }
+        if reductions:
+            rebalance_diagnostics = rebalance_diagnostics or {}
+            rebalance_diagnostics["composition_v2_execution_reductions"] = reductions
+        affordable_lots = {c: int(q) for c, q in zip(market_data.stock_codes, trimmed) if q > 0}
+    if any(affordable_lots.get(code, 0) != old_lots[code] for code in frozen):
+        raise ValueError("Lot saham tanpa perdagangan berubah saat penyesuaian eksekusi.")
     if affordable_lots != desired_lots:
-        logger.info("Menyesuaikan BUY lot ke kas tersedia pada harga eksekusi %s", execution_day)
-    solution.evaluate_fitness(lots_override=np.asarray(
-        [affordable_lots.get(code, 0) for code in market_data.stock_codes], dtype=int
-    ))
+        logger.info("Menyesuaikan lot ke kas dan batas exposure pada harga eksekusi %s", execution_day)
+    from src.backend.services.portfolio_signal_snapshot import score_execution_lots
+    solution = score_execution_lots(config, solution.genes, solution.exposure, affordable_lots)
+    if experimental_profile_v2:
+        from src.gaengine.composition_v2_experiment import ExperimentalChromosome
+
+        rescored = ExperimentalChromosome(config, solution.genes)
+        rescored.exposure = solution.exposure
+        rescored.evaluate_fitness(lots_override=solution.lots)
+        solution = rescored
     if guarded:
-        candidate = engine.evaluate(solution.lots)
-        # Cash trimming is an execution contingency, not a reason to rotate
-        # into a different stock using execution-day information.
-        if candidate is None or (engine.hold is not None and
-                candidate.utility <= engine.hold.utility + config.min_utility_gain):
-            if engine.hold is None:
-                raise ValueError("Penyesuaian eksekusi gagal memulihkan batas risiko guarded_v1.")
-            candidate = engine.hold
-            solution.evaluate_fitness(lots_override=candidate.lots)
-            rebalance_diagnostics['reason'] = 'hold'
-        solution.fitness = candidate.utility
-        rebalance_diagnostics['selected_utility'] = candidate.utility
-        rebalance_diagnostics['signal_transaction_costs'] = candidate.fees
-        rebalance_diagnostics['signal_cash_after'] = candidate.cash
-        rebalance_diagnostics['execution_adjusted'] = (
-            {c:int(q) for c,q in zip(market_data.stock_codes,candidate.lots) if q>0} != desired_lots)
-    if not solution.diversification_ok or not solution.budget_ok:
+        # HOLD/rotation was decided before the fill, just as in a live plan.
+        # Do not cancel executed trades after observing the execution Close.
+        rebalance_diagnostics.update(decision_locked=True, selected_utility=float(solution.fitness),
+                                     execution_adjusted=affordable_lots != ga_signal_lots)
+    if (not solution.budget_ok or
+            (not solution.diversification_ok and
+             not (frozen and len(affordable_lots) >= config.min_stocks))):
         raise ValueError("Lot eksekusi melanggar batas saham atau budget.")
-    if benchmark_fitness:
+    deferred_signals = _deferred_untraded_signals(old_lots, ga_signal_lots, untraded)
+    if deferred_signals:
+        rebalance_diagnostics = rebalance_diagnostics or {}
+        rebalance_diagnostics['deferred_signals'] = deferred_signals
+    if experimental_fitness:
         rebalance_diagnostics = rebalance_diagnostics or {}
         rebalance_diagnostics.update(fitness_policy=config.fitness_policy,
             fitness_diagnostics=solution.fitness_diagnostics,
             score_basis='decision_prices_with_execution_fitted_lots')
-    from src.gaengine.profile_policy import validate_execution
-    profile_composition = validate_execution(
-        config, solution.lots,
-        np.asarray([execution_price_map[c] * 100 for c in market_data.stock_codes]),
-    )
+    if frozen:
+        rebalance_diagnostics = rebalance_diagnostics or {}
+        rebalance_diagnostics['frozen_lots'] = {code: old_lots[code] for code in sorted(frozen)}
+        rebalance_diagnostics['fitness_excludes_frozen_outside_universe'] = bool(
+            frozen - set(market_data.stock_codes))
+    if experimental_profile_v2:
+        from src.gaengine.composition_v2_experiment import validate_execution
+    else:
+        from src.gaengine.profile_policy import validate_execution
+    if frozen - set(market_data.stock_codes) and config.profile_policy != "legacy":
+        profile_composition = {
+            "version": "composition_v2" if experimental_profile_v2 else config.profile_policy,
+            "compliant": None,
+            "reason": "Posisi tanpa perdagangan di luar kandidat tidak tercakup dalam metrik komposisi.",
+        }
+    else:
+        profile_composition = validate_execution(
+            config, solution.lots,
+            np.asarray([execution_price_map[c] * 100 for c in market_data.stock_codes]),
+        )
 
     # 4. Susun laporan hasil
     if getattr(market_data, "market_stress", None) is not None:
@@ -710,10 +985,11 @@ def generate_new_portfolio(
               if backtest else market_data.prices_per_lot)
     lots = solution.lots
     alloc = lots * prices
-    total = float(alloc.sum())
+    total = float(_marked_holdings_value(affordable_lots, execution_price_map))
 
     rows = sorted(
-        ((codes[i], int(lots[i]), float(prices[i])) for i in range(len(codes))),
+        ((code, int(qty), float(execution_price_map[code] * 100))
+         for code, qty in affordable_lots.items()),
         key=lambda r: r[1] * r[2],
         reverse=True,
     )
@@ -733,8 +1009,9 @@ def generate_new_portfolio(
     
     rebalance_deltas = None
     if getattr(request, 'rebalance', False):
-        new_lots_dict = {code: int(lot) for code, lot in zip(codes, lots)}
-        new_weights_dict = {code: float(w) for code, w in zip(codes, solution.genes)}
+        new_lots_dict = dict(affordable_lots)
+        new_weights_dict = {code: (qty * execution_price_map[code] * 100 / total if total else 0)
+                            for code, qty in affordable_lots.items()}
         old_weights_dict = {code: w for code, w in zip(market_data.stock_codes, old_weights_aligned)}
         
         rebalance_deltas = compute_rebalance_deltas(
@@ -746,91 +1023,19 @@ def generate_new_portfolio(
             old_cost_basis=old_cost_basis,
             execution_prices=execution_price_map,
         )
+        for delta in rebalance_deltas:
+            if delta["kode"] in frozen:
+                delta["reason"] = "Tidak diperdagangkan pada hari eksekusi; lot lama tetap dimiliki"
+                delta["action_detail"] = "HOLD_NO_TRADE"
 
     # Estimasi return tahunan dari alokasi terhadap modal termasuk sisa kas.
     expected_return = None
-    if total > 0 and market_data.returns.shape[0] >= solution.n_active:
+    if total > 0 and not (frozen - set(codes)) and market_data.returns.shape[0] >= solution.n_active:
         aw = alloc / float(request.budget)
         p_daily = (market_data.returns * aw[:, None]).sum(axis=0)
         p_daily = p_daily[~np.isnan(p_daily) & ~np.isinf(p_daily)]
         if p_daily.size:
             expected_return = float(p_daily.mean() * 252.0)
-
-    # 4a. Narasi TEMPLATE (selalu dibuat): dipakai apa adanya bila narasi LLM
-    #     tidak tersedia / gagal, sehingga endpoint generate tidak pernah gagal
-    #     hanya karena layanan LLM bermasalah.
-    narasi = (
-        f"Portofolio dengan profil risiko {request.risk_profile} memilih {solution.n_active} "
-        f"saham dari {market_data.n_stocks} kandidat. Total dana terpakai "
-        f"Rp{total:,.0f} dari budget Rp{request.budget:,.0f}. Skor fitness yang dicapai "
-        f"{solution.fitness:.4f} dengan Sharpe ratio {solution.sharpe_ratio:.3f}. "
-        f"Penurunan maksimum (max drawdown) tercatat {solution.max_drawdown:.2%} "
-        f"dan korelasi rata-rata antar saham {solution.avg_correlation:.3f}. "
-        f"Rekomendasi ini dihasilkan Algoritma Genetika."
-    )
-
-    # 4b. Narasi LLM (Gemini): menjelaskan MENGAPA & BAGAIMANA portofolio ini
-    #     terpilih oleh GA -- metrik fitness function (Sharpe, MDD, korelasi,
-    #     bonus fundamental), batasan budget/diversifikasi, serta peran tiap
-    #     emiten pemenang. Bahan/prompt dirakit src/gaengine/prompt_builder.py,
-    #     pemanggilan model ada di src/backend/services/gemini_llm_caller.py.
-    #     Bila gagal (tanpa API key, timeout, dsb) -> None, narasi template dipakai.
-    narasi_llm = None if (guarded or benchmark_fitness) else explain_portfolio(
-        solution=solution,
-        market_data=market_data,
-        config=config,
-        allocations=allocations,
-        mode="backtest" if backtest else "live",
-        date_ref=date_ref,
-        budget=request.budget,
-        expected_return=expected_return,
-        generations_run=len(engine.history),
-        fallback=None,
-        rebalance_deltas=rebalance_deltas,
-    )
-    if narasi_llm:
-        narasi = narasi_llm
-    if benchmark_fitness:
-        d = solution.fitness_diagnostics
-        narasi = (
-            f"Portofolio {request.risk_profile}: {solution.n_active} saham, "
-            f"fitness eksperimen net_cvar_ihsg_v1 {solution.fitness:.6f}. "
-            f"Pada horizon {config.forecast_horizon_days} sesi, rata-rata return skenario "
-            f"bersih biaya {d['mean_net_return']:.2%}, CVaR kerugian {d['downside_cvar']:.2%}, "
-            f"dan downside terhadap IHSG {d['benchmark_downside']:.2%}. "
-            f"Tersedia {d['scenario_count']} blok historis tanpa overlap; "
-            "angka ini merupakan penilaian historis, bukan prediksi atau hasil return aktual. "
-            "Sharpe dan MDD yang ditampilkan merupakan metrik historis pendamping."
-        )
-    if guarded:
-        narasi += (
-            f" Mode guarded_v1: keputusan {rebalance_diagnostics['reason']}. "
-            f"Utility skenario bersih {solution.fitness:.6f}; HOLD persis dibandingkan "
-            "dengan perubahan posisi setelah biaya. Skenario historis "
-            "belum merupakan prediksi return tervalidasi."
-        )
-    if not benchmark_fitness and config.risk_model == "market_stress" and getattr(market_data, "market_stress", None) is not None:
-        evidence = market_data.market_stress
-        narasi += (
-            f" Penilaian risiko memakai {len(evidence.events)} periode tekanan IHSG historis "
-            f"dalam {evidence.lookback_years} tahun sebelum {evidence.as_of}; "
-            f"arsip tersedia hingga {evidence.history_end or 'tanggal tidak tersedia'}. "
-            f"Cakupan bukti historis posisi saham "
-            f"{(solution.market_stress_coverage or 0):.1%}; data yang belum terbukti "
-            f"diberi penalti ketidakpastian, bukan dinyatakan aman."
-        )
-    logger.info(
-        "Narasi portofolio memakai %s.",
-        "penjelasan LLM (Gemini)" if narasi_llm else "template GA (fallback)",
-    )
-
-    if backtest:
-        narasi += (
-            f" Hasil ini berasal dari SIMULASI BACKTEST per {date_ref} "
-            f"(data historis, bukan kondisi pasar hari ini) dan disimpan sebagai "
-            f"portofolio simulasi (status {STATUS_ACTIVE_BACKTEST}) sehingga tidak "
-            f"mengubah portofolio live Anda."
-        )
 
     # 5a. date_ref acuan portofolio (kolom Portofolio.date_ref):
     #     - BACKTEST : tanggal simulasi dari parameter.
@@ -839,7 +1044,14 @@ def generate_new_portfolio(
     if backtest:
         date_ref_dt = _dt.combine(date_ref, _dt.min.time())
     else:
-        date_ref_dt = _dt.now()
+        # Quote provenance and position inception are different dates. Never
+        # grant live performance before the recommendation was created.
+        rebalance_diagnostics = rebalance_diagnostics or {}
+        rebalance_diagnostics.update(bear_assessment_date=(preview['as_of'] if getattr(request, 'bear_management', False) else None),
+                                     valuation_mark_date=execution_day.isoformat(),
+                                     live_date_policy='formation-wib-v1')
+        execution_day = live_formation_day
+        date_ref_dt = _dt.combine(live_formation_day, _dt.min.time())
 
     new_lots_for_accounting = {code: int(lot) for code, lot, _ in rows if lot > 0}
     changed_tickers = {code for code in set(old_lots) | set(new_lots_for_accounting)
@@ -869,23 +1081,125 @@ def generate_new_portfolio(
         config.buy_fee_rate, config.sell_fee_rate,
     )
     cash_after -= _money(transaction_costs)
+    fallback_sources = {code: source for code, source in (getattr(market_data, 'price_sources', None) or {}).items()
+                        if source in {'filtered_stock_cache', 'market_data_db'} and code in new_lots_for_accounting}
+    if fallback_sources:
+        rebalance_diagnostics = rebalance_diagnostics or {}
+        rebalance_diagnostics.update(execution_price_sources=fallback_sources,
+                                     fallback_price_date=market_data.price_date.isoformat())
+    rebalance_diagnostics = rebalance_diagnostics or {}
+    if experimental_profile_v2:
+        rebalance_diagnostics["profile_policy"] = "composition_v2"
+        rebalance_diagnostics["profile_composition"] = profile_composition
     if rebalance_diagnostics is not None:
         rebalance_diagnostics.update(execution_transaction_costs=transaction_costs,
             buy_fee_rate=config.buy_fee_rate, sell_fee_rate=config.sell_fee_rate,
             execution_delta_lots={c:new_lots_for_accounting.get(c,0)-old_lots.get(c,0)
                                   for c in sorted(changed_tickers)})
-    holdings_after = sum(_money(lot) * 100 * ga_prices[code]
-                         for code, lot in new_lots_for_accounting.items())
+    holdings_after = _marked_holdings_value(new_lots_for_accounting, execution_price_map)
     if exposure_limit is not None and exposure_limit < 1.0:
         execution_nav = cash_after + holdings_after
-        if execution_nav <= 0 or holdings_after > execution_nav * _money(exposure_limit) + Decimal("0.01"):
-            raise ValueError("Exposure portofolio melebihi batas modal terpilih pada harga eksekusi.")
+        frozen_value = sum(
+            _money(new_lots_for_accounting.get(code, 0)) * 100 * _money(execution_price_map[code])
+            for code in frozen
+        )
+        unavoidable = frozen_value > execution_nav * _money(exposure_limit) + Decimal("0.01")
+        if execution_nav <= 0 or (holdings_after > execution_nav * _money(exposure_limit) + Decimal("0.01")
+                                  and not unavoidable):
+            raise ValueError(
+                "Exposure portofolio melebihi batas modal terpilih pada harga eksekusi "
+                f"(saham Rp{holdings_after:.2f}, kas Rp{cash_after:.2f}, "
+                f"NAV Rp{execution_nav:.2f}, batas {exposure_limit:.4%}, "
+                f"biaya Rp{transaction_costs:.2f})."
+            )
+        if unavoidable:
+            rebalance_diagnostics = rebalance_diagnostics or {}
+            rebalance_diagnostics['exposure_cap_blocked_by_frozen_lots'] = True
+            logger.warning("Batas exposure tidak dapat dicapai: posisi tanpa perdagangan bernilai Rp%s", frozen_value)
     if cash_after < Decimal("-0.01"):
         raise ValueError("Rebalance menghasilkan kas negatif; snapshot dibatalkan.")
     # budget is the pre-trade NAV at the valuation mark. If an actual/simulated
     # execution differs from that mark, the difference is trading slippage,
     # not an external cash flow or an invalid snapshot.
 
+    # 4a. Narasi TEMPLATE (selalu dibuat): dipakai apa adanya bila narasi LLM
+    #     tidak tersedia / gagal, sehingga endpoint generate tidak pernah gagal
+    #     hanya karena layanan LLM bermasalah.
+    narasi = (
+        f"Portofolio dengan profil risiko {request.risk_profile} memiliki {len(affordable_lots)} "
+        f"saham (GA menilai {market_data.n_stocks} kandidat). Total dana terpakai "
+        f"Rp{total:,.0f} dari budget Rp{request.budget:,.0f}. Skor fitness yang dicapai "
+        f"{solution.fitness:.4f} dengan Sharpe ratio {solution.sharpe_ratio:.3f}. "
+        f"Penurunan maksimum (max drawdown) tercatat {solution.max_drawdown:.2%} "
+        f"dan korelasi rata-rata antar saham {solution.avg_correlation:.3f}. "
+        f"Sisa kas setelah biaya Rp{cash_after:,.0f}, dengan biaya transaksi Rp{transaction_costs:,.0f}. "
+        f"Rekomendasi ini dihasilkan Algoritma Genetika."
+    )
+
+    # 4b. Narasi LLM (OpenAI): menjelaskan MENGAPA & BAGAIMANA portofolio ini
+    #     terpilih oleh GA -- metrik fitness function (Sharpe, MDD, korelasi,
+    #     bonus fundamental), batasan budget/diversifikasi, serta peran tiap
+    #     emiten pemenang. Bahan/prompt dirakit src/gaengine/prompt_builder.py,
+    #     pemanggilan model ada di src/backend/services/openai_llm_caller.py.
+    #     Bila gagal (tanpa API key, timeout, dsb) -> None, narasi template dipakai.
+    report_progress("narrative", "Merangkai penjelasan untuk Anda",
+                    "Membandingkan hasil, merangkum risiko, dan mencari konteks berita sesuai tanggal keputusan.")
+    narasi_llm = explain_portfolio(
+        solution=solution,
+        market_data=market_data,
+        config=config,
+        allocations=allocations,
+        mode="backtest" if backtest else "live",
+        date_ref=date_ref,
+        budget=request.budget,
+        expected_return=expected_return,
+        generations_run=len(engine.history),
+        fallback=None,
+        rebalance_deltas=rebalance_deltas,
+        reporting={
+            "cash_after": float(cash_after),
+            "transaction_costs": float(transaction_costs),
+            "investment_total": float(holdings_after),
+            "execution_prices": {code: float(price) for code, price in execution_price_map.items()},
+            "exposure_limit": exposure_limit,
+            "uncovered_positions": sorted(frozen - set(market_data.stock_codes)),
+        },
+    )
+    if narasi_llm:
+        narasi = narasi_llm
+    if not narasi_llm:
+        from src.gaengine.narrative_evidence import risk_notes
+        notes = risk_notes(solution, config)
+        if notes:
+            narasi += " " + " ".join(notes)
+    if guarded and not narasi_llm:
+        narasi += (
+            f" Mode guarded_v1: keputusan {rebalance_diagnostics['reason']}. "
+            f"Skor keputusan {solution.fitness:.6f}; HOLD persis dibandingkan "
+            "dengan perubahan posisi setelah biaya. Skenario historis "
+            "belum merupakan prediksi return tervalidasi."
+        )
+    if frozen:
+        narasi += (f" Saham tanpa perdagangan pada {execution_day}: "
+                   f"{', '.join(sorted(frozen))}; lot lama tetap dimiliki dan tidak diperdagangkan.")
+        if frozen - set(market_data.stock_codes):
+            narasi += " Skor GA tidak mencakup posisi tertahan di luar kandidat filter."
+    logger.info(
+        "Narasi portofolio memakai %s.",
+        ("penjelasan fakta terverifikasi (fallback OpenAI)"
+         if getattr(narasi_llm, "source", None) == "verified_template"
+         else "penjelasan LLM (OpenAI)" if narasi_llm else "template GA (fallback)"),
+    )
+    rebalance_diagnostics["narrative_source"] = getattr(narasi_llm, "source", "openai" if narasi_llm else "ga_template")
+    rebalance_diagnostics["narrative_version"] = NARRATIVE_VERSION
+    if getattr(narasi_llm, "news_context", None) is not None:
+        rebalance_diagnostics["news_context"] = narasi_llm.news_context
+
+    if backtest and not narasi_llm:
+        narasi += f" Simulasi memakai data historis per {date_ref}, bukan kondisi pasar saat ini."
+
+    report_progress("saving", "Menyimpan hasil analisis",
+                    "Menyiapkan rincian portofolio agar siap Anda tinjau.")
     # 5. Supersede: portofolio lama DIGANTIKAN STATUSNYA (tidak dihapus).
     #    Mode LIVE     : active            -> replaced
     #    Mode BACKTEST : active_backtest   -> replaced_backtest
@@ -899,13 +1213,14 @@ def generate_new_portfolio(
         status_lama = STATUS_ACTIVE
         status_digantikan = STATUS_REPLACED
 
-    replaced = (
-        db.query(Portofolio)
-        .filter(
-            Portofolio.user_id == user_uuid,
-            Portofolio.status_portofolio == status_lama,
-        )
-        .update({"status_portofolio": status_digantikan}, synchronize_session=False)
+    replace_query = db.query(Portofolio).filter(Portofolio.user_id == user_uuid)
+    if old_portfolio_id:
+        # A selected series must never replace an unrelated active portfolio.
+        replace_query = replace_query.filter(Portofolio.id == UUID(old_portfolio_id))
+    else:
+        replace_query = replace_query.filter(Portofolio.status_portofolio == status_lama)
+    replaced = replace_query.update(
+        {"status_portofolio": status_digantikan}, synchronize_session=False,
     )
     if replaced:
         logger.info(
@@ -918,6 +1233,7 @@ def generate_new_portfolio(
     # 6. Simpan hasil ke database: portofolios + portofolio_items
     portofolio = Portofolio(
         user_id=user_uuid,
+        is_list_active=not getattr(request, 'rebalance', False),
         name_portofolio=name_portofolio,
         description=description,
         budget=request.budget,
@@ -1005,6 +1321,7 @@ def generate_new_portfolio(
             
     db.add_all(items)
     try:
+        check_cancelled()
         db.commit()
     except Exception:
         db.rollback()
@@ -1022,11 +1339,15 @@ def generate_new_portfolio(
 
     return PortfolioResponse(
         id=str(portofolio.id),
+        execution_prices=portofolio.execution_prices,
+        price_date=execution_day if backtest else market_data.price_date,
+        is_list_active=getattr(portofolio, "is_list_active", None),
         fitness_policy=config.fitness_policy,
         fitness_diagnostics=getattr(solution, "fitness_diagnostics", None),
         profile_composition=profile_composition,
         transaction_costs=transaction_costs,
         rebalance_diagnostics=rebalance_diagnostics,
+        deferred_signals=deferred_signals,
         parent_portofolio_id=str(old_portfolio_id) if old_portfolio_id else None,
         execution_date=execution_day,
         name_portofolio=name_portofolio,
@@ -1055,9 +1376,9 @@ def generate_new_portfolio(
 
 
 # ----------------------------------------------------------------------
-# Rebalance series: generate awal + rebalance berantai tiap N bulan
+# Rebalance series: lanjutkan snapshot tersimpan tiap N bulan
 # ----------------------------------------------------------------------
-# Batas jumlah tanggal (langkah) per series. Tiap langkah menjalankan GA penuh
+# Batas jumlah tanggal (langkah) rebalance. Tiap langkah menjalankan GA penuh
 # (200 populasi x 500 generasi) + narasi LLM, sehingga series yang sangat
 # panjang butuh waktu lama -- batas ini mencegah request tak terkendali.
 MAX_SERIES_STEPS = 60
@@ -1105,16 +1426,13 @@ def generate_rebalance_series(
     user_id: str,
 ) -> RebalanceSeriesResponse:
     """
-    Controller REBALANCE SERIES (khusus BACKTEST): menjalankan generate awal
-    lalu rebalance BERANTAI berulang pada banyak tanggal sekaligus.
+    Controller REBALANCE SERIES (khusus BACKTEST): melanjutkan snapshot yang
+    sudah tersimpan, lalu rebalance berantai pada tanggal berikutnya.
 
     Alur (eksekusi SEKUENSIAL, bukan paralel -- tiap langkah bergantung pada
     hasil langkah sebelumnya: NAV, old_lots, dan status active_backtest):
-      1. langkah pertama (start_date) : generate portofolio AWAL (rebalance=false)
-      2. langkah berikutnya (+interval tiap N bulan sampai end_date):
-         rebalance (rebalance=true) dari portofolio aktif hasil langkah
-         sebelumnya -- NAV dihitung ulang dari harga pada tanggal tsb, rantai
-         induk tercatat di parent_portofolio_id.
+      1. start_date adalah tanggal snapshot tersimpan; GA tidak dijalankan lagi.
+      2. tiap +interval bulan: rebalance dari ID snapshot terakhir yang sukses.
 
     Semua langkah memakai mode backtest (date_ref = tanggal jadwal, data
     historis parquet) sehingga portofolio LIVE tidak tersentuh. Portofolio
@@ -1122,30 +1440,44 @@ def generate_rebalance_series(
     "replaced_backtest" (tetap tersimpan di DB).
 
     Kegagalan per langkah:
-      - langkah AWAL gagal -> seluruh series gagal (tidak ada yang direbalance)
-      - langkah berikutnya gagal MarketDataUnavailableError (mis. tanggal di
+      - langkah gagal MarketDataUnavailableError (mis. tanggal di
         luar cakupan parquet) -> dicatat pada `skipped`, series LANJUT dari
         portofolio terakhir yang berhasil
       - error lain (ticker tak terdaftar, SQL, dll.) -> series berhenti dan
         error diteruskan; portofolio yang sudah terlanjur commit TIDAK dihapus
+      - composition_v2 yang tidak menemukan komposisi patuh -> tanggal dicatat
+        sebagai skipped; komposisi lama tetap aktif dan tidak memakai legacy
 
-    Returns: RebalanceSeriesResponse berisi SEMUA portofolio berhasil, urut
-    kronologis dari start_date (jumlahnya mengikuti jadwal, BUKAN angka pasti),
+    Returns: RebalanceSeriesResponse berisi snapshot lama dalam rangkaian
+    beserta hasil baru, urut kronologis dari portofolio awal,
     plus daftar tanggal yang dilewati beserta alasannya.
 
     Raises: ValueError (rentang salah / jumlah langkah > MAX_SERIES_STEPS),
-            UserNotFoundError, MarketDataUnavailableError (langkah awal),
+            UserNotFoundError,
             StockNotFoundError.
     """
+    user_uuid = _parse_user_uuid(user_id, db)
+    base = _resolve_action_portfolio(
+        db, user_uuid, request.base_portfolio_id, backtest=True,
+    )
+    if request.start_date != _snapshot_date(base):
+        raise ValueError("Tanggal mulai harus sama dengan tanggal snapshot backtest terbaru yang dipilih.")
+    if request.risk_profile != base.risk_profile:
+        raise ValueError("Profil risiko tidak sesuai dengan portofolio yang dipilih.")
+    if request.profile_policy == "composition_v2" and request.rebalance_model != "legacy":
+        raise ValueError("composition_v2 belum mendukung guarded_v1; pilih rebalance legacy.")
     schedule = build_rebalance_schedule(
         request.start_date, request.end_date, request.interval_months
-    )
+    )[1:]
+    if not schedule:
+        raise ValueError("Tanggal akhir harus mencakup minimal satu jadwal rebalance.")
     if len(schedule) > MAX_SERIES_STEPS:
         raise ValueError(
             f"Jumlah langkah series ({len(schedule)}) melebihi batas "
             f"{MAX_SERIES_STEPS}. Perbesar interval_months atau perpendek rentang."
         )
     policy = "legacy"
+    resolved_bear_choices: dict[date, str] = {}
     if request.bear_management:
         user = db.query(User).filter(User.id == UUID(user_id)).first()
         if user is None:
@@ -1161,12 +1493,9 @@ def generate_rebalance_series(
                 raise ValueError(f"Pratinjau tanggal {day} sudah berubah; muat ulang.")
             if (request.bear_preview_fingerprints or {}).get(day) != preview["fingerprint"]:
                 raise ValueError(f"Indikator tanggal {day} berubah sejak pratinjau; muat ulang.")
-            effective_fraction(
-                preview, request.risk_profile,
-                ("recommended" if policy == "always_follow" and
-                 preview["status"] != "unknown" else
-                 (request.bear_choices or {}).get(day)),
-            )
+            choice = resolve_bear_choice(policy, preview["status"], (request.bear_choices or {}).get(day))
+            effective_fraction(preview, request.risk_profile, choice)
+            resolved_bear_choices[day] = choice
     if not math.isfinite(request.contribution_amount) or request.contribution_amount < 0:
         raise ValueError("Nominal setoran berkala tidak valid.")
     if request.contribution_amount > 0 and request.contribution_interval_months is None:
@@ -1182,12 +1511,21 @@ def generate_rebalance_series(
         len(schedule), request.start_date, request.end_date, request.interval_months,
     )
 
-    portfolios: list[PortfolioResponse] = []
+    portfolios: list[PortfolioResponse] = [
+        _to_portfolio_response(db, node)
+        for node in _portfolio_lineage(db, base, user_uuid)
+    ]
     skipped: list[SkippedRebalanceStep] = []
     last_applied_date = request.start_date
+    last_portfolio_id = base.id
+
+    from src.gaengine.profile_policy import ProfileConstraintError
 
     for index, tanggal in enumerate(schedule):
-        is_initial = index == 0
+        set_progress_context(series_index=index + 1, series_total=len(schedule),
+                             series_date=tanggal.isoformat())
+        report_progress("market", "Menyiapkan rebalance berikutnya",
+                        f"Membaca data historis untuk jadwal {tanggal.isoformat()}.")
         due_count = sum(last_applied_date < due <= tanggal for due in contribution_dates)
         # Request BARU tiap langkah: generate_new_portfolio memutasi budget
         # (override NAV) pada objek request, jadi tidak boleh dipakai ulang.
@@ -1197,7 +1535,6 @@ def generate_rebalance_series(
             fitness_horizon_days=request.fitness_horizon_days,
             fitness_cvar_tail_fraction=request.fitness_cvar_tail_fraction,
             fitness_lambda_cvar=request.fitness_lambda_cvar,
-            fitness_lambda_benchmark_downside=request.fitness_lambda_benchmark_downside,
             charge_transaction_fees=request.charge_transaction_fees,
             rebalance_model=getattr(request, "rebalance_model", "legacy"),
             rebalance_buy_fee_rate=getattr(request, "rebalance_buy_fee_rate", .0015),
@@ -1208,11 +1545,11 @@ def generate_rebalance_series(
             description=request.description,
             backtest=True,
             date_ref=tanggal,
-            rebalance=not is_initial,  # langkah 1 = generate awal, sisanya rebalance
+            rebalance=True,
+            rebalance_portfolio_id=last_portfolio_id,
             contribution_amount=due_count * request.contribution_amount,
             bear_management=request.bear_management,
-            bear_choice=((request.bear_choices or {}).get(tanggal)
-                         if request.bear_management else None),
+            bear_choice=resolved_bear_choices.get(tanggal),
             bear_preview_as_of=(request.bear_preview_dates or {}).get(tanggal),
             bear_preview_fingerprint=(request.bear_preview_fingerprints or {}).get(tanggal),
         )
@@ -1226,25 +1563,39 @@ def generate_rebalance_series(
                 date_ref=tanggal,
             )
         except MarketDataUnavailableError as e:
-            if is_initial:
-                raise  # tanpa portofolio awal, series mustahil jalan
             db.rollback()
             logger.warning(
                 "Rebalance series: langkah %d/%d (%s) dilewati -> %s",
                 index + 1, len(schedule), tanggal, e,
             )
             skipped.append(SkippedRebalanceStep(date=tanggal, reason=str(e)))
+            report_progress("skipped", "Jadwal ini dilewati",
+                            "Data historis belum memadai. Melanjutkan ke jadwal berikutnya.")
+            continue
+        except ProfileConstraintError as e:
+            if request.profile_policy != "composition_v2":
+                raise
+            db.rollback()
+            logger.warning(
+                "Rebalance series v2: langkah %d/%d (%s) dilewati karena batas profil: %s",
+                index + 1, len(schedule), tanggal, e,
+            )
+            skipped.append(SkippedRebalanceStep(date=tanggal, reason=str(e)))
+            report_progress("skipped", "Jadwal ini dilewati",
+                            "Komposisi yang memenuhi profil belum ditemukan. Melanjutkan jadwal berikutnya.")
             continue
         except ValueError as e:
             logger.error("Rebalance series gagal pada %s (fitness=%s, model=%s): %s",
                          tanggal, request.fitness_policy, request.rebalance_model, e)
             raise ValueError(f"Rebalance series gagal pada {tanggal}: {e}") from e
 
+        portfolios[-1].status_portofolio = STATUS_REPLACED_BACKTEST
         portfolios.append(hasil)
         last_applied_date = tanggal
+        last_portfolio_id = UUID(hasil.id)
         logger.info(
             "Rebalance series: langkah %d/%d selesai (%s, rebalance=%s, id=%s).",
-            index + 1, len(schedule), tanggal, not is_initial, hasil.id,
+            index + 1, len(schedule), tanggal, True, hasil.id,
         )
 
     logger.info(
@@ -1259,7 +1610,7 @@ def generate_rebalance_series(
         portfolios=portfolios,
         skipped=skipped,
         evaluation_mode=("legacy" if not request.bear_management else
-                         "automatic_strategy" if policy == "always_follow" else "what_if"),
+                         "automatic_strategy" if policy in ("always_follow", "always_full") else "what_if"),
     )
 
 
@@ -1331,6 +1682,10 @@ def _to_portfolio_response(
     metadata = getattr(portofolio, "rebalance_metadata", None) or {}
     return PortfolioResponse(
         id=str(portofolio.id),
+        is_list_active=getattr(portofolio, "is_list_active", None),
+        holdings_edited=bool(metadata.get("holdings_edited")),
+        price_date=metadata.get('valuation_mark_date') or portofolio.execution_date,
+        execution_prices=portofolio.execution_prices,
         fitness_policy=metadata.get("fitness_policy", "legacy"),
         fitness_diagnostics=metadata.get("fitness_diagnostics"),
         parent_portofolio_id=(str(portofolio.parent_portofolio_id)
@@ -1347,7 +1702,7 @@ def _to_portfolio_response(
         skor_fundamental=portofolio.skor_fundamental,
         total_terpakai=portofolio.total_terpakai,
         sisa_budget=portofolio.sisa_budget,
-        n_active=len(items),
+        n_active=sum(1 for item in items if item.jumlah_lot > 0),
         allocated_budget_ok=portofolio.sisa_budget >= -0.01,
         risk_profile=portofolio.risk_profile,
         status_portofolio=portofolio.status_portofolio,
@@ -1360,6 +1715,7 @@ def _to_portfolio_response(
         capital_contribution=getattr(portofolio, "capital_contribution", 0) or 0.0,
         transaction_costs=getattr(portofolio, "transaction_costs", 0) or 0.0,
         rebalance_diagnostics=getattr(portofolio, "rebalance_metadata", None),
+        deferred_signals=metadata.get("deferred_signals", []),
     )
 
 
@@ -1453,6 +1809,27 @@ def get_all_my_portfolios(
         _to_portfolio_response(db, portofolio, replay_cache, known_portfolios)
         for portofolio in rows
     ]
+
+
+def set_portfolio_list_activity(
+    db: Session, user_id: str, portfolio_id: str, is_active: bool,
+) -> dict:
+    """Set user-managed root activity without changing snapshot execution status."""
+    user_uuid = _parse_user_uuid(user_id, db)
+    try:
+        portfolio_uuid = UUID(str(portfolio_id))
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise PortfolioNotFoundError("Portofolio tidak ditemukan.") from exc
+    portfolio = db.query(Portofolio).filter(
+        Portofolio.id == portfolio_uuid, Portofolio.user_id == user_uuid,
+    ).with_for_update().first()
+    if portfolio is None:
+        raise PortfolioNotFoundError("Portofolio tidak ditemukan.")
+    if portfolio.parent_portofolio_id is not None:
+        raise ValueError("Status aktif hanya dapat diatur pada portofolio awal.")
+    portfolio.is_list_active = is_active
+    db.commit()
+    return {"portfolio_id": str(portfolio.id), "is_list_active": is_active}
 
 
 def delete_portfolio_lineage(db: Session, user_id: str, portfolio_id: str) -> dict:
@@ -1611,6 +1988,35 @@ def list_portfolio_history(db: Session, user_id: str) -> list[PortfolioHistoryIt
         for p in rows
     ]
 
+
+def update_portfolio_identity(
+    db: Session, user_id: str, portfolio_id: str, name: str, description: str | None,
+) -> PortfolioResponse:
+    """Set one user-facing name and description across a live rebalance chain."""
+    user_uuid = _parse_user_uuid(user_id, db)
+    try:
+        portfolio_uuid = UUID(portfolio_id)
+    except (ValueError, TypeError) as exc:
+        raise PortfolioNotFoundError("ID portofolio tidak valid.") from exc
+    portfolio = db.query(Portofolio).filter(
+        Portofolio.id == portfolio_uuid, Portofolio.user_id == user_uuid,
+    ).first()
+    if portfolio is None:
+        raise PortfolioNotFoundError("Portofolio tidak ditemukan.")
+    if portfolio.status_portofolio not in (STATUS_ACTIVE, STATUS_REPLACED):
+        raise ValueError("Nama portofolio live hanya dapat diubah pada rangkaian live.")
+    if db.query(Portofolio.id).filter(
+        Portofolio.parent_portofolio_id == portfolio_uuid,
+        Portofolio.user_id == user_uuid,
+    ).first():
+        raise ValueError("Pilih snapshot terbaru untuk mengubah identitas rangkaian.")
+    lineage = _portfolio_lineage(db, portfolio, user_uuid)
+    for snapshot in lineage:
+        snapshot.name_portofolio = name
+        snapshot.description = description
+    db.commit()
+    return _to_portfolio_response(db, portfolio)
+
 def get_portfolio_by_id(db: Session, portfolio_id: str) -> PortfolioResponse:
     """
     Ambil portofolio beserta itemnya dari database berdasarkan ID.
@@ -1631,7 +2037,29 @@ class ItemNotFoundError(Exception):
     """Exception domain: item portofolio tidak ditemukan / bukan milik user."""
 
 
-def add_live_capital(db: Session, user_id: str, amount: float) -> PortfolioResponse:
+def _resolve_action_portfolio(db: Session, user_uuid: UUID, portfolio_id=None, backtest=False):
+    """Lock the selected series leaf; a historical snapshot is never a trade target."""
+    active = STATUS_ACTIVE_BACKTEST if backtest else STATUS_ACTIVE
+    replaced = STATUS_REPLACED_BACKTEST if backtest else STATUS_REPLACED
+    query = db.query(Portofolio).filter(Portofolio.user_id == user_uuid)
+    if portfolio_id is None:
+        query = query.filter(Portofolio.status_portofolio == active).order_by(
+            Portofolio.created_at.desc(), Portofolio.id.desc())
+    else:
+        query = query.filter(Portofolio.id == UUID(str(portfolio_id)))
+    portfolio = query.with_for_update().first()
+    if portfolio is None:
+        raise PortfolioNotFoundError('Portofolio tujuan tidak ditemukan pada akun Anda.')
+    db.refresh(portfolio)
+    allowed = (active, replaced) if portfolio_id is not None else (active,)
+    if portfolio.status_portofolio not in allowed:
+        raise ValueError('Mode portofolio tujuan tidak sesuai. Muat ulang halaman.')
+    if db.query(Portofolio.id).filter(Portofolio.parent_portofolio_id == portfolio.id).first():
+        raise ValueError('Portofolio sudah memiliki rebalance berikutnya. Muat ulang posisi terbaru.')
+    return portfolio
+
+
+def add_live_capital(db: Session, user_id: str, amount: float, portfolio_id=None) -> PortfolioResponse:
     """Catat setoran sebagai kas tertunda, tanpa mengubah snapshot historis/NAV.
 
     Dana baru masuk ke kas eksekusi dan NAV pada rebalance live berikutnya.
@@ -1642,13 +2070,7 @@ def add_live_capital(db: Session, user_id: str, amount: float) -> PortfolioRespo
         user_uuid = UUID(user_id)
     except (ValueError, TypeError, AttributeError) as exc:
         raise UserNotFoundError("User ID pada token tidak valid.") from exc
-    portfolio = (db.query(Portofolio)
-                 .filter(Portofolio.user_id == user_uuid,
-                         Portofolio.status_portofolio == STATUS_ACTIVE)
-                 .order_by(Portofolio.created_at.desc(), Portofolio.id.desc())
-                 .with_for_update().first())
-    if portfolio is None:
-        raise PortfolioNotFoundError("Belum ada portofolio live aktif untuk ditambah modal.")
+    portfolio = _resolve_action_portfolio(db, user_uuid, portfolio_id)
     pending = _money(portfolio.pending_deposit or 0) + _money(amount)
     if not pending.is_finite():
         raise ValueError("Total setoran tidak valid.")
@@ -1693,16 +2115,13 @@ def update_harga_beli(db: Session, user_id: str, item_id: str, harga_beli: float
             "Item portofolio tidak ditemukan, bukan milik Anda, atau portofolionya sudah tidak aktif."
         )
 
-    total_investasi = float(item.jumlah_lot) * 100.0 * float(harga_beli)
-    if not math.isfinite(total_investasi) or total_investasi * 100 > 2**53 - 1:
-        raise ValueError("Total harga beli terlalu besar untuk dicatat dengan akurat.")
-
-    item.harga_beli = float(harga_beli)
-    # total_investasi dihitung ulang berdasar harga beli user (per lembar x 100)
-    item.total_investasi = total_investasi
-    db.flush()
-
-    db.commit()
+    # Keep the old price-only API compatible with the inline position editor,
+    # including explicit basis overrides equal to the snapshot reference price.
+    from src.backend.services.portfolio_holdings import update_live_holding
+    from src.backend.models.schemas.portfolio_schema import UpdateHoldingRequest
+    update_live_holding(db, user_id, str(item.portofolio_id), item.stock.ticker,
+        UpdateHoldingRequest(jumlah_lot=item.jumlah_lot, expected_lots=item.jumlah_lot,
+                             harga_beli=harga_beli))
     db.refresh(item)
     logger.info(
         "harga_beli item %s diubah menjadi Rp%.2f (basis pengguna Rp%.2f; kas tidak berubah)",
@@ -2383,8 +2802,9 @@ def _rebalance_cost_basis(
                     not all(math.isfinite(x) and x > 0 for x in (purchase, reference, item_total))):
                     continue
                 shares = item["lots"] * 100
-                if (abs(item_total - shares * purchase) <= 0.01 and
-                    abs(shares * purchase - shares * reference) > 0.01):
+                if ((getattr(node, 'rebalance_metadata', None) or {}).get('manual_cost_basis', {}).get(code) == purchase or
+                    (abs(item_total - shares * purchase) <= 0.01 and
+                     abs(shares * purchase - shares * reference) > 0.01)):
                     basis[code] = purchase
         positions = next_positions
         if replay_cache is not None:
@@ -2449,6 +2869,7 @@ def get_portfolio_performance(
             "positions": _snapshot_positions(db, node.id),
             "execution_prices": node.execution_prices,
             "transaction_costs": float(getattr(node, "transaction_costs", 0) or 0),
+            "manual_cost_basis": (getattr(node, 'rebalance_metadata', None) or {}).get('manual_cost_basis', {}),
         }
         for node in lineage
     ]
@@ -2479,9 +2900,16 @@ def get_portfolio_performance(
         for ticker, position in snapshot["positions"].items()
     }
     stock_ids = list({position["stock_id"] for snapshot in snapshots for position in snapshot["positions"].values()})
+    if not stock_ids:
+        # A manually corrected root can be entirely cash. Keep its original
+        # quote universe only to obtain observed valuation sessions, not positions.
+        zero_items = _query_items_with_ticker(db, portfolio.id)
+        stock_ids = [item.stock_id for item, _ in zero_items]
+        stock_id_to_ticker = {str(item.stock_id): code for item, code in zero_items}
 
     # Load only the stored universe required by the complete rebalance chain.
     sync_stats = None
+    splits_by_date = {}
     if not is_backtest:
         price_rows = _query_price_rows(db, stock_ids, price_query_start, valuation_end)
         available_ids = {str(row.stock_id) for row in price_rows
@@ -2532,6 +2960,10 @@ def get_portfolio_performance(
             raise PortfolioNotFoundError("Belum ada data harga pada rentang simulasi ini.")
         window["Date"] = pd.to_datetime(window["Date"])
         window["Ticker"] = window["Ticker"].astype(str).str.replace(".JK", "", regex=False)
+        if "Stock Splits" in window:
+            split_values = pd.to_numeric(window["Stock Splits"], errors="coerce")
+            split_rows = window.loc[split_values.notna() & ~split_values.isin([0, 1])]
+            splits_by_date = {day: set(group["Ticker"]) for day, group in split_rows.groupby("Date")}
         window["price"] = window["Close"]
         df_price = window.pivot_table(index="Date", columns="Ticker", values="price", aggfunc="last").sort_index()
 
@@ -2540,6 +2972,36 @@ def get_portfolio_performance(
         df_price = df_price.loc[df_price.index.date <= valuation_end]
     if df_price.empty:
         raise PortfolioNotFoundError("Tidak ada harga sebelum akhir window item snapshot.")
+    # Live positions become effective on their formation day, which can be
+    # later than the completed Close session used by GA. Keep a one-day mark
+    # from the persisted snapshot so later price syncs do not move that trade.
+    formation_marks: dict[date, dict[str, float]] = {}
+    if not is_backtest:
+        observed_days = set(df_price.index.date)
+        for snapshot in snapshots:
+            mark_day = snapshot["date"]
+            if (mark_day in observed_days or snapshot["execution_prices"] is None or
+                    valuation_end is not None and mark_day > valuation_end):
+                continue
+            marks = {
+                ticker: data.get("reference_price")
+                for ticker, data in snapshot["positions"].items()
+            }
+            for ticker, raw in snapshot["execution_prices"].items():
+                if ticker not in marks:
+                    try:
+                        marks[ticker] = float(raw)
+                    except (TypeError, ValueError):
+                        pass
+            if marks and all(
+                price is not None and math.isfinite(price) and price > 0
+                for price in marks.values()
+            ):
+                formation_marks[mark_day] = marks
+        if formation_marks:
+            df_price = df_price.reindex(
+                df_price.index.union(pd.to_datetime(list(formation_marks))).sort_values()
+            )
     actual_prices = df_price.copy()
     # A suspended ticker may use its last mark for at most seven calendar
     # days. Older marks are not sufficient evidence for a valid daily NAV.
@@ -2550,6 +3012,8 @@ def get_portfolio_performance(
         ).ffill()
         age = actual_prices.index.to_series() - last_seen
         df_price[ticker] = df_price[ticker].where(age <= pd.Timedelta(days=7))
+    for mark_day, marks in formation_marks.items():
+        df_price.loc[pd.Timestamp(mark_day), list(marks)] = list(marks.values())
     df_price = df_price.dropna(how="all")
     if df_price.empty:
         raise PortfolioNotFoundError("Data harga belum cukup untuk menghitung performa.")
@@ -2582,6 +3046,7 @@ def get_portfolio_performance(
     events: list[dict] = []
     reasons: list[str] = []
     accounting_status = "verified"
+    price_accounting_status = "verified"
     dividend_events: list[dict] = []
     dividend_data = {"source": "data/dividend_events_20_tahun.xlsx", "status": "available",
                      "coverage": "recorded_events_only", "reasons": []}
@@ -2611,18 +3076,30 @@ def get_portfolio_performance(
     cumulative_transaction_costs = Decimal("0")
     tolerance = Decimal("0.05")
 
-    def mark_problem(message: str, legacy: bool = False) -> None:
-        nonlocal accounting_status
+    def mark_problem(message: str, legacy: bool = False, *, price_ledger: bool = True) -> None:
+        nonlocal accounting_status, price_accounting_status
         if message not in reasons:
             reasons.append(message)
         if accounting_status != "invalid":
             accounting_status = "legacy_unverified" if legacy else "invalid"
+        if price_ledger and price_accounting_status != "invalid":
+            price_accounting_status = "legacy_unverified" if legacy else "invalid"
 
     for reason in dividend_data["reasons"]:
-        mark_problem(reason, legacy=True)
+        mark_problem(reason, legacy=True, price_ledger=False)
+    for mark_day in formation_marks:
+        mark_problem(
+            f"Valuasi {mark_day} memakai harga acuan snapshot dari sesi selesai terakhir; harga pasar pada hari pembentukan belum tersimpan.",
+            legacy=True,
+        )
 
+    split_affected = set()
     for timestamp in df_price.index:
         day = timestamp.date()
+        # Current ledger does not reconcile split lot quantities. Keep the
+        # existing NAV API, but do not certify its subsequent risk metrics.
+        split_affected.update(ticker for ticker in splits_by_date.get(timestamp, set())
+                              if positions.get(ticker, 0) > 0)
         day_contributions = Decimal("0")
         day_dividends = Decimal("0") if dividend_income is not None else None
         while dividend_index < len(dividend_schedule) and dividend_schedule[dividend_index]["ex_date"] <= day:
@@ -2784,8 +3261,9 @@ def get_portfolio_performance(
                     shares = data["lots"] * 100
                     edited_total = shares * _money(purchase)
                     reference_total = shares * _money(reference)
-                    if (abs(_money(item_total) - edited_total) <= tolerance and
-                        abs(edited_total - reference_total) > tolerance):
+                    if (snapshot['manual_cost_basis'].get(ticker) == purchase or
+                        (abs(_money(item_total) - edited_total) <= tolerance and
+                         abs(edited_total - reference_total) > tolerance)):
                         cost_basis[ticker] = _money(purchase)
             positions = next_positions
             after_nav = None
@@ -2820,7 +3298,8 @@ def get_portfolio_performance(
                 holdings_known = False
                 unrealized_pnl = None
                 continue
-            if ticker not in actual_prices.columns or pd.isna(actual_prices.at[timestamp, ticker]):
+            if (day in formation_marks or ticker not in actual_prices.columns or
+                    pd.isna(actual_prices.at[timestamp, ticker])):
                 stale_tickers.append(ticker)
             market_value = lots * 100 * _money(df_price.at[timestamp, ticker])
             holdings_value += market_value
@@ -2853,6 +3332,7 @@ def get_portfolio_performance(
             "total_contributions": total_contributions,
             "realized_pnl_cumulative": realized_pnl, "unrealized_pnl": unrealized_pnl,
             "stale_price_tickers": sorted(stale_tickers),
+            "unreconciled_split_tickers": sorted(split_affected),
         })
         prior_nav = nav
 
@@ -2862,8 +3342,18 @@ def get_portfolio_performance(
     series_df = pd.DataFrame(rows).set_index("date")
     ihsg_return = None
 
+    benchmark_observed_dates = set()
+    benchmark_previous_dates = {}
+    benchmark_prices = {}
+    market_session_dates = None
+    market_previous_dates = {}
+
     def benchmark_on_portfolio_days(index_closes):
         index_closes = index_closes.dropna().sort_index()
+        benchmark_observed_dates.update(index_closes.index)
+        benchmark_prices.update(index_closes.to_dict())
+        benchmark_previous_dates.update({day: previous.date().isoformat()
+                                        for previous, day in zip(index_closes.index, index_closes.index[1:])})
         if index_closes.empty:
             return None
         dates = series_df.index
@@ -2890,10 +3380,19 @@ def get_portfolio_performance(
                 filters.append(("Date", "<=", pd.Timestamp(valuation_end)))
             idx_data = pd.read_parquet(context_file, filters=filters)
             if not idx_data.empty:
+                from src.preprocessing.ihsg_sessions import validated_ihsg_rows
+                idx_data = validated_ihsg_rows(idx_data)
                 idx = idx_data.set_index(pd.to_datetime(idx_data["Date"]))["Close"].dropna().sort_index()
                 ihsg_return = benchmark_on_portfolio_days(idx)
         except Exception as exc:  # benchmark failure must not hide NAV
             logger.warning("Gagal membaca IHSG dari Parquet: %s", exc)
+
+    if is_backtest:
+        from src.preprocessing.ihsg_sessions import portfolio_session_calendar
+        market_session_dates = portfolio_session_calendar(benchmark_observed_dates, series_df.index)
+        ordered_sessions = sorted(market_session_dates or [])
+        market_previous_dates = {day: previous.date().isoformat()
+                                 for previous, day in zip(ordered_sessions, ordered_sessions[1:])}
 
     series = []
     for timestamp, row in series_df.iterrows():
@@ -2914,12 +3413,27 @@ def get_portfolio_performance(
             "realized_pnl_cumulative": float(row["realized_pnl_cumulative"]) if pd.notna(row["realized_pnl_cumulative"]) else None,
             "unrealized_pnl": float(row["unrealized_pnl"]) if pd.notna(row["unrealized_pnl"]) else None,
             "stale_price_tickers": row["stale_price_tickers"],
+            "unreconciled_split_tickers": row["unreconciled_split_tickers"],
             "ihsg_return": float(ihsg) if ihsg is not None and pd.notna(ihsg) else None,
+            "ihsg_observed": timestamp in benchmark_observed_dates,
+            "ihsg_previous_observed_date": benchmark_previous_dates.get(timestamp),
+            "is_market_session": (timestamp in market_session_dates if market_session_dates is not None else None),
+            "previous_market_session_date": market_previous_dates.get(timestamp),
         })
 
     final_state = positions
     final_row = series[-1] if series else None
+    return_metrics = calculate_return_metrics(
+        initial_capital=float(initial_capital),
+        final_nav=final_row["portfolio_value"] if final_row else None,
+        start_date=actual_start.isoformat(),
+        end_date=df_price.index.max().date().isoformat(),
+        twr_return_pct=(final_row["portfolio_return"] * 100
+                        if final_row and final_row["portfolio_return"] is not None else None),
+        contributions=[(point["date"], point["capital_contribution"]) for point in series],
+    )
     return {
+        **return_metrics,
         "start_date": actual_start.isoformat(),
         "requested_start_date": requested_start.isoformat(),
         "start_date_adjusted": actual_start != requested_start,
@@ -2928,8 +3442,13 @@ def get_portfolio_performance(
         "missing_price_tickers": sorted(set(missing_price_tickers)),
         "root_portfolio_id": str(lineage[0].id),
         "evaluated_portfolio_id": str(portfolio.id),
+        "benchmark_series": [{"date": day.isoformat(),
+                              "close": float(benchmark_prices[day]) if day in benchmark_prices else None}
+                             for day in sorted(market_session_dates or benchmark_observed_dates)],
         "rebalance_events": events,
         "accounting_status": accounting_status,
+        "price_accounting_status": price_accounting_status,
+        "split_check_status": "local_archive" if is_backtest else "unavailable_live_ledger",
         "accounting_reasons": reasons,
         "initial_capital": float(initial_capital),
         "total_contributions": float(total_contributions),

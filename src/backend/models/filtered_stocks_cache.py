@@ -21,18 +21,17 @@ class FilteredStockCache(Base):
     # SATUAN (penting, dipakai bersama preprocessing & data_loader):
     #   per/pbv        : kelipatan (mis. 13.34)
     #   eps            : rupiah per saham (mis. 466.74)
-    #   roe            : PERSEN   (mis. 20.44)
-    #   der            : PERSEN   (mis. 7.53)  -> data_loader LIVE mengubahnya
-    #                    menjadi RASIO (persen/100) saat merakit metrics_map
-    #                    agar setara dengan jalur backtest.
+    #   roe            : FRAKSI (mis. 0.2044 = 20.44%)
+    #   der            : RASIO  (mis. 0.0753 = 7.53%); None bila tidak tersedia.
+    # Filtering menormalkan satuan sumber sebelum menyimpan; data_loader LIVE
+    # membaca rasio ini langsung, setara dengan jalur backtest.
     per = Column(Float)
     pbv = Column(Float)
     eps = Column(Float)
     roe = Column(Float)
     der = Column(Float)
     
-    # dividend_yield : PERSEN (mis. 6.12) -> data_loader LIVE mengubahnya
-    #                  menjadi FRAKSI (persen/100), sama seperti backtest.
+    # dividend_yield : FRAKSI (mis. 0.0612 = 6.12%), sama seperti backtest.
     dividend_yield = Column(Float, default=0.0)
     
     # Metrik Teknikal

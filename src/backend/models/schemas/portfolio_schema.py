@@ -1,5 +1,6 @@
-from pydantic import BaseModel, Field, field_validator
-from typing import List, Optional, Generic, TypeVar, Literal
+from pydantic import BaseModel, Field, field_validator, model_validator
+from uuid import UUID
+from typing import List, Optional, Generic, TypeVar, Literal, Annotated
 from datetime import date, datetime
 
 # Tipe generik untuk payload di dalam envelope ApiResponse
@@ -15,15 +16,14 @@ class ApiResponse(BaseModel, Generic[T]):
 
 # Schema untuk Validasi Input (Request)
 class PortfolioGenerateRequest(BaseModel):
-    charge_transaction_fees: bool = False
-    fitness_policy: Literal["legacy", "net_cvar_ihsg_v1"] = "legacy"
+    charge_transaction_fees: bool = True
+    fitness_policy: Literal["legacy", "legacy_cvar_v1"] = "legacy_cvar_v1"
     fitness_horizon_days: int = Field(63, ge=1, le=252)
     fitness_cvar_tail_fraction: float = Field(.1, gt=0, le=1, allow_inf_nan=False)
     fitness_lambda_cvar: float = Field(.5, ge=0, allow_inf_nan=False)
-    fitness_lambda_benchmark_downside: float = Field(.5, ge=0, allow_inf_nan=False)
     budget: float = Field(..., gt=0, description="Total modal investasi dalam IDR")
     risk_profile: str = Field(..., description="Konservatif, Moderat, atau Agresif")
-    profile_policy: Literal["legacy", "composition_v1"] = Field(
+    profile_policy: Literal["legacy", "composition_v1", "composition_v2"] = Field(
         "legacy", description="Mode eksperimen batas komposisi; legacy sebagai pembanding")
     rebalance_model: Literal["legacy", "guarded_v1"] = "legacy"
     rebalance_buy_fee_rate: float = Field(.0015,ge=0,le=.05,allow_inf_nan=False)
@@ -38,11 +38,18 @@ class PortfolioGenerateRequest(BaseModel):
                     "langsung bisa dipakai oleh run_live_preprocessing/build_market_data.",
     )
     rebalance: bool = Field(False, description="Jika True, lakukan rebalancing dari portofolio aktif saat ini")
+    rebalance_portfolio_id: Optional[UUID] = None
     contribution_amount: float = Field(0, ge=0, description="Setoran tambahan pada rebalance backtest (IDR)")
     bear_management: bool = False
     bear_choice: Optional[Literal["recommended", "full"]] = None
     bear_preview_as_of: Optional[date] = None
     bear_preview_fingerprint: Optional[str] = None
+
+    @model_validator(mode='after')
+    def validate_rebalance_target(self):
+        if self.rebalance_portfolio_id is not None and not self.rebalance:
+            raise ValueError('Portofolio tujuan hanya berlaku untuk rebalance.')
+        return self
 
     @field_validator("name_portofolio")
     @classmethod
@@ -59,6 +66,9 @@ class PortfolioGenerateRequest(BaseModel):
 
 class AddCapitalRequest(BaseModel):
     amount: float = Field(..., gt=0, description="Setoran modal live dalam IDR; tersedia pada rebalance berikutnya")
+    portfolio_id: Optional[UUID] = None
+
+
 
 # Satu baris alokasi saham di dalam portofolio hasil GA
 class PortfolioItem(BaseModel):
@@ -74,6 +84,11 @@ class PortfolioItem(BaseModel):
 # Request ubah harga beli milik user pada satu item portofolio
 class UpdateHargaBeliRequest(BaseModel):
     harga_beli: float = Field(..., gt=0, allow_inf_nan=False, description="Harga beli aktual per lembar (IDR)")
+
+
+class UpdateHoldingRequest(UpdateHargaBeliRequest):
+    jumlah_lot: int = Field(..., ge=0, le=2147483647, strict=True)
+    expected_lots: int = Field(..., ge=0, le=2147483647, strict=True)
 
 
 # Baris riwayat portofolio (ringkasan, tanpa alokasi detail)
@@ -109,8 +124,20 @@ class RebalanceDeltaItem(BaseModel):
     realization_type: Optional[str] = None
 
 
+class DeferredRebalanceSignal(BaseModel):
+    ticker: str
+    action: Literal["BUY", "SELL"]
+    held_lots: int
+    target_lots: int
+    reason: str
+
+
 class PortfolioResponse(BaseModel):
-    fitness_policy: Literal["legacy", "net_cvar_ihsg_v1"] = "legacy"
+    price_date: Optional[date] = None
+    holdings_edited: bool = False
+    execution_prices: Optional[dict[str, float]] = None
+    is_list_active: Optional[bool] = None
+    fitness_policy: str = "legacy"  # Historical snapshots retain their original policy label.
     fitness_diagnostics: Optional[dict] = None
     transaction_costs: float = 0
     rebalance_diagnostics: Optional[dict] = None
@@ -142,6 +169,7 @@ class PortfolioResponse(BaseModel):
     allocations: List[PortfolioItem] = []
     narasi_llm: Optional[str]
     rebalance_deltas: Optional[List[RebalanceDeltaItem]] = None
+    deferred_signals: List[DeferredRebalanceSignal] = []
 
     class Config:
         from_attributes = True # Mengizinkan Pydantic membaca dari SQLAlchemy Model
@@ -156,18 +184,18 @@ class PortfolioResponse(BaseModel):
 # tanggal dalam rentang [start_date, end_date] kelipatan interval (mis. tiap 2
 # bulan pada 2022-2026 -> lebih dari 10 portofolio).
 class RebalanceSeriesGenerateRequest(BaseModel):
-    charge_transaction_fees: bool = False
-    fitness_policy: Literal["legacy", "net_cvar_ihsg_v1"] = "legacy"
+    charge_transaction_fees: bool = True
+    fitness_policy: Literal["legacy", "legacy_cvar_v1"] = "legacy_cvar_v1"
     fitness_horizon_days: int = Field(63, ge=1, le=252)
     fitness_cvar_tail_fraction: float = Field(.1, gt=0, le=1, allow_inf_nan=False)
     fitness_lambda_cvar: float = Field(.5, ge=0, allow_inf_nan=False)
-    fitness_lambda_benchmark_downside: float = Field(.5, ge=0, allow_inf_nan=False)
     rebalance_model: Literal["legacy", "guarded_v1"] = "legacy"
     rebalance_buy_fee_rate: float = Field(.0015,ge=0,le=.05,allow_inf_nan=False)
     rebalance_sell_fee_rate: float = Field(.0025,ge=0,le=.05,allow_inf_nan=False)
-    profile_policy: Literal["legacy", "composition_v1"] = "legacy"
+    profile_policy: Literal["legacy", "composition_v1", "composition_v2"] = "legacy"
     budget: float = Field(..., gt=0, description="Modal awal portofolio pada start_date (IDR)")
     risk_profile: str = Field(..., description="Konservatif, Moderat, atau Agresif")
+    base_portfolio_id: UUID = Field(..., description="Snapshot backtest terbaru yang akan dilanjutkan")
     name_portofolio: Optional[str] = Field(None, max_length=80)
     description: Optional[str] = Field(None, max_length=500)
     start_date: date = Field(
@@ -199,7 +227,7 @@ class RebalanceSeriesGenerateRequest(BaseModel):
 
 
 class SkippedRebalanceStep(BaseModel):
-    """Satu tanggal series yang dilewati karena MarketData tidak tersedia."""
+    """Tanggal dilewati karena data atau komposisi v2 yang tidak patuh."""
     date: date
     reason: str
 

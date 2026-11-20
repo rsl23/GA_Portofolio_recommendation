@@ -12,19 +12,21 @@ class Settings(BaseSettings):
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
 
     # ------------------------------------------------------------------
-    # LLM (Gemini) untuk narasi penjelasan hasil GA.
-    # Dipakai oleh src/backend/services/gemini_llm_caller.py; bila
-    # GEMINI_API_KEY kosong / GEMINI_ENABLED=false, narasi LLM dilewati dan
-    # controller memakai narasi template (lihat portfolio_controller).
+    # LLM (OpenAI Responses API) untuk narasi penjelasan hasil GA.
+    # OPENAI_ENABLED=false memakai narasi template.
     # ------------------------------------------------------------------
-    GEMINI_API_KEY: str = ""
-    GEMINI_ENABLED: bool = True
-    GEMINI_MODEL: str = "gemini-3.8-flash"
-    GEMINI_TEMPERATURE: float = 0.7
-    GEMINI_MAX_OUTPUT_TOKENS: int = 8192
-    GEMINI_THINKING_LEVEL: str = "low"
-    GEMINI_TIMEOUT_MS: int = 120_000
-    GEMINI_MAX_RETRIES: int = 3
+    OPENAI_API_KEY: str = ""
+    OPENAI_ENABLED: bool = True
+    OPENAI_MODEL: str = "gpt-6-luna"
+    OPENAI_REASONING_EFFORT: str = "medium"
+    OPENAI_MAX_OUTPUT_TOKENS: int = 4096
+    OPENAI_TIMEOUT_MS: int = 120_000
+    OPENAI_MAX_RETRIES: int = 3
+    OPENAI_RETRY_ENABLED: bool = False
+    OPENAI_RETURN_ERROR: bool = False
+    OPENAI_FALLBACK_MODELS: str = ""
+    OPENAI_BACKOFF_BASE: float = 2.0
+    OPENAI_BACKOFF_CAP: float = 30.0
 
     class Config:
         env_file = ".env"
