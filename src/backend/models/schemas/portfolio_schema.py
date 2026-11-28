@@ -24,7 +24,7 @@ class PortfolioGenerateRequest(BaseModel):
     budget: float = Field(..., gt=0, description="Total modal investasi dalam IDR")
     risk_profile: str = Field(..., description="Konservatif, Moderat, atau Agresif")
     profile_policy: Literal["legacy", "composition_v1", "composition_v2"] = Field(
-        "legacy", description="Mode eksperimen batas komposisi; legacy sebagai pembanding")
+        "composition_v2", description="Kebijakan batas komposisi sesuai profil risiko.")
     rebalance_model: Literal["legacy", "guarded_v1"] = "legacy"
     rebalance_buy_fee_rate: float = Field(.0015,ge=0,le=.05,allow_inf_nan=False)
     rebalance_sell_fee_rate: float = Field(.0025,ge=0,le=.05,allow_inf_nan=False)
@@ -38,6 +38,7 @@ class PortfolioGenerateRequest(BaseModel):
                     "langsung bisa dipakai oleh run_live_preprocessing/build_market_data.",
     )
     rebalance: bool = Field(False, description="Jika True, lakukan rebalancing dari portofolio aktif saat ini")
+    generate_llm_narrative: bool = Field(True, description="Aktifkan narasi LLM saat rebalance.")
     rebalance_portfolio_id: Optional[UUID] = None
     contribution_amount: float = Field(0, ge=0, description="Setoran tambahan pada rebalance backtest (IDR)")
     bear_management: bool = False
@@ -49,6 +50,8 @@ class PortfolioGenerateRequest(BaseModel):
     def validate_rebalance_target(self):
         if self.rebalance_portfolio_id is not None and not self.rebalance:
             raise ValueError('Portofolio tujuan hanya berlaku untuk rebalance.')
+        if self.rebalance and self.rebalance_model == "guarded_v1" and "profile_policy" not in self.model_fields_set:
+            self.profile_policy = "legacy"
         return self
 
     @field_validator("name_portofolio")
@@ -139,6 +142,8 @@ class PortfolioResponse(BaseModel):
     is_list_active: Optional[bool] = None
     fitness_policy: str = "legacy"  # Historical snapshots retain their original policy label.
     fitness_diagnostics: Optional[dict] = None
+    turnover_rate: Optional[float] = None
+    turnover_penalty_beta: Optional[float] = None
     transaction_costs: float = 0
     rebalance_diagnostics: Optional[dict] = None
     profile_composition: Optional[dict] = None  # diagnostics at generation; not persisted
@@ -184,6 +189,7 @@ class PortfolioResponse(BaseModel):
 # tanggal dalam rentang [start_date, end_date] kelipatan interval (mis. tiap 2
 # bulan pada 2022-2026 -> lebih dari 10 portofolio).
 class RebalanceSeriesGenerateRequest(BaseModel):
+    generate_llm_narrative: bool = Field(True, description="Aktifkan narasi LLM untuk setiap langkah rebalance.")
     charge_transaction_fees: bool = True
     fitness_policy: Literal["legacy", "legacy_cvar_v1"] = "legacy_cvar_v1"
     fitness_horizon_days: int = Field(63, ge=1, le=252)
@@ -192,7 +198,7 @@ class RebalanceSeriesGenerateRequest(BaseModel):
     rebalance_model: Literal["legacy", "guarded_v1"] = "legacy"
     rebalance_buy_fee_rate: float = Field(.0015,ge=0,le=.05,allow_inf_nan=False)
     rebalance_sell_fee_rate: float = Field(.0025,ge=0,le=.05,allow_inf_nan=False)
-    profile_policy: Literal["legacy", "composition_v1", "composition_v2"] = "legacy"
+    profile_policy: Literal["legacy", "composition_v1", "composition_v2"] = "composition_v2"
     budget: float = Field(..., gt=0, description="Modal awal portofolio pada start_date (IDR)")
     risk_profile: str = Field(..., description="Konservatif, Moderat, atau Agresif")
     base_portfolio_id: UUID = Field(..., description="Snapshot backtest terbaru yang akan dilanjutkan")
@@ -214,6 +220,12 @@ class RebalanceSeriesGenerateRequest(BaseModel):
     bear_choices: Optional[dict[date, Literal["recommended", "full"]]] = None
     bear_preview_dates: Optional[dict[date, date]] = None
     bear_preview_fingerprints: Optional[dict[date, str]] = None
+
+    @model_validator(mode="after")
+    def apply_guarded_profile_default(self):
+        if self.rebalance_model == "guarded_v1" and "profile_policy" not in self.model_fields_set:
+            self.profile_policy = "legacy"
+        return self
 
     @field_validator("name_portofolio")
     @classmethod

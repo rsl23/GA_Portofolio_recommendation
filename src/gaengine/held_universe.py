@@ -7,11 +7,17 @@ from .market_data import MarketData
 from .profile_policy import ProfileFeatures
 
 
-def extend_with_holdings(data,old_lots,history,sectors=None):
+class HeldHistoryUnavailableError(ValueError):
+    def __init__(self, ticker, message):
+        super().__init__(message)
+        self.ticker = ticker
+
+
+def extend_with_holdings(data,old_lots,history,sectors=None,*,allow_untraded_signal=False):
     """history: raw Close indexed by sessions, columns = ticker, <= price_date.
 
-    Missing/old marks reject the experiment instead of inventing a zero-risk
-    history. Current DB sector labels are a documented historical-data caveat.
+    No price before the start of the return window means insufficient history.
+    In delayed-execution mode, known trade marks can carry through suspensions.
     """
     outside=sorted(set(old_lots)-set(data.stock_codes))
     if not outside:
@@ -25,16 +31,19 @@ def extend_with_holdings(data,old_lots,history,sectors=None):
     returns=[];prices=[]
     for c in outside:
         if c not in history:
-            raise ValueError(f'Riwayat holdings {c} tidak tersedia; penjualan tidak dipaksakan.')
+            raise HeldHistoryUnavailableError(c, f'Riwayat holdings {c} tidak tersedia; penjualan tidak dipaksakan.')
         raw=history[c].reindex(history.index.union(days)).sort_index()
         raw=raw.where(pd.to_numeric(raw,errors='coerce')>0)
         seen=pd.Series(raw.index,index=raw.index).where(raw.notna()).ffill()
-        filled=raw.ffill().where(raw.index.to_series()-seen<=pd.Timedelta(days=7)).reindex(days)
+        filled = raw.ffill()
+        if not allow_untraded_signal:
+            filled = filled.where(raw.index.to_series()-seen<=pd.Timedelta(days=7))
+        filled = filled.reindex(days)
         if filled.isna().any() or not np.isfinite(filled).all():
-            raise ValueError(f'Riwayat holdings {c} tidak lengkap/stale; tidak dianggap aman.')
+            raise HeldHistoryUnavailableError(c, f'Riwayat holdings {c} tidak lengkap/stale; tidak dianggap aman.')
         # Do not forward-fill a decision-session execution mark.
-        if pd.Timestamp(data.price_date) not in history.index or pd.isna(history.at[pd.Timestamp(data.price_date),c]):
-            raise ValueError(f'Harga sinyal holdings {c} tidak tersedia.')
+        if not allow_untraded_signal and (pd.Timestamp(data.price_date) not in history.index or pd.isna(history.at[pd.Timestamp(data.price_date),c])):
+            raise HeldHistoryUnavailableError(c, f'Harga sinyal holdings {c} tidak tersedia.')
         returns.append(filled.pct_change(fill_method=None).fillna(0).to_numpy())
         prices.append(float(filled.iloc[-1])*100)
     codes=data.stock_codes+outside
@@ -54,35 +63,34 @@ def extend_with_holdings(data,old_lots,history,sectors=None):
         price_date=data.price_date,return_dates=list(days),profile_features=features,
         benchmark_returns=data.benchmark_returns,
         held_history_diagnostics=data.held_history_diagnostics,
+        eps_by_ticker=data.eps_by_ticker,
         buy_eligible=np.r_[np.ones(data.n_stocks,dtype=bool),np.zeros(len(outside),dtype=bool)],
         dividend_yields=(np.r_[data.dividend_yields,np.zeros(len(outside))] if data.dividend_yields is not None else None))
 
 
 def _held_signal_evidence(rows, signal_date, ticker, allow_untraded_signal):
-    """Accept a held-only valuation mark when it matches a recent real trade."""
+    """Distinguish a historical valuation mark from a tradable signal session."""
     signal_date = pd.Timestamp(signal_date)
     signal = rows.loc[rows.Date == signal_date]
     closes = pd.to_numeric(signal.Close, errors='coerce')
     volumes = pd.to_numeric(signal.Volume, errors='coerce')
     valid = closes.gt(0) & np.isfinite(closes)
-    if not valid.any():
-        raise ValueError(f'Harga sinyal holdings {ticker} tidak tersedia pada {signal_date.date()}.')
+    if not valid.any() and not allow_untraded_signal:
+        raise HeldHistoryUnavailableError(ticker, f'Harga sinyal holdings {ticker} tidak tersedia pada {signal_date.date()}.')
     if (volumes[valid] > 0).any():
         return {'signal_traded': True, 'signal_last_trade_date': signal_date.date().isoformat()}
     if not allow_untraded_signal:
-        raise ValueError(f'Harga sinyal holdings {ticker} tidak tersedia dari transaksi pada {signal_date.date()}.')
+        raise HeldHistoryUnavailableError(ticker, f'Harga sinyal holdings {ticker} tidak tersedia dari transaksi pada {signal_date.date()}.')
     traded = rows.loc[(rows.Date <= signal_date) &
                       (pd.to_numeric(rows.Volume, errors='coerce') > 0) &
                       (pd.to_numeric(rows.Close, errors='coerce') > 0)].sort_values('Date')
-    if traded.empty or signal_date - traded.iloc[-1].Date > pd.Timedelta(days=7):
-        raise ValueError(f'Harga sinyal holdings {ticker} stale pada {signal_date.date()}; '
-                         'transaksi terakhir lebih dari 7 hari lalu.')
-    signal_close = float(closes[valid].iloc[-1])
-    last_trade_close = float(traded.iloc[-1].Close)
-    if not np.isclose(signal_close, last_trade_close, rtol=0, atol=1e-8):
-        raise ValueError(f'Harga sinyal holdings {ticker} berubah tanpa transaksi pada {signal_date.date()}.')
+    if traded.empty:
+        raise HeldHistoryUnavailableError(
+            ticker, f'Harga sinyal holdings {ticker} stale pada {signal_date.date()}; '
+                    'tidak ada transaksi historis untuk penilaian.')
     return {'signal_traded': False,
-            'signal_last_trade_date': traded.iloc[-1].Date.date().isoformat()}
+            'signal_last_trade_date': traded.iloc[-1].Date.date().isoformat(),
+            'valuation_age_days': (signal_date - traded.iloc[-1].Date).days}
 
 
 def load_held_universe(data,old_lots,data_dir,sector_map=None,*,allow_untraded_signal=False):
@@ -91,26 +99,27 @@ def load_held_universe(data,old_lots,data_dir,sector_map=None,*,allow_untraded_s
     if data.return_dates is None:raise ValueError('Cache MarketData tidak memuat tanggal return; muat ulang.')
     bars=pd.read_parquet(data_dir/'Master_OHLCV_15Tahun.parquet',
         filters=[('Ticker','in',[c+'.JK' for c in outside]),
-                 ('Date','>=',pd.Timestamp(data.return_dates[0])-pd.Timedelta(days=14)),
                  ('Date','<=',pd.Timestamp(data.price_date))],columns=['Date','Ticker','Close','Volume'])
     bars['Date']=pd.to_datetime(bars.Date)
+    bars = bars.loc[bars.Date.le(pd.Timestamp(data.price_date))].copy()
     bars['Ticker']=bars.Ticker.str.removesuffix('.JK')
-    # Historical Close is a valuation mark, not evidence of an executable
-    # trade. Match the BUY universe's return-history convention: retain a
-    # provider-reported positive Close on zero-volume sessions. Removing it
-    # creates artificial holes only for stocks outside today's BUY screen.
-    # The opt-in v2 path can use an unchanged, recent traded Close for a
-    # pre-existing holding. This mark is only valuation evidence, not a fill.
+    # In delayed-execution mode carry past trades for valuation, independently
+    # of today's volume. Future prices must never enter the signal history.
     notes = dict(data.held_history_diagnostics or {})
     for c in outside:
         rows = bars.loc[bars.Ticker == c].sort_values('Date')
         signal_evidence = _held_signal_evidence(
             rows, data.price_date, c, allow_untraded_signal)
         window = rows.loc[rows.Date.isin(pd.DatetimeIndex(data.return_dates))]
-        notes[c] = dict(valuation_source='reported_close',
+        notes[c] = dict(valuation_source='last_traded_close' if allow_untraded_signal else 'reported_close',
             zero_volume_sessions=int((pd.to_numeric(window.Volume,errors='coerce') == 0).sum()),
             missing_volume_sessions=int(pd.to_numeric(window.Volume,errors='coerce').isna().sum()),
             execution_liquidity_assumed=False, **signal_evidence)
+    if allow_untraded_signal:
+        bars = bars.loc[pd.to_numeric(bars.Volume, errors='coerce').gt(0)
+                        & pd.to_numeric(bars.Close, errors='coerce').gt(0)
+                        & np.isfinite(pd.to_numeric(bars.Close, errors='coerce'))]
     history=bars.pivot_table(index='Date',columns='Ticker',values='Close',aggfunc='last')
-    extended = extend_with_holdings(data,old_lots,history,sector_map)
+    extended = extend_with_holdings(data,old_lots,history,sector_map,
+                                    allow_untraded_signal=allow_untraded_signal)
     return replace(extended, held_history_diagnostics=notes)

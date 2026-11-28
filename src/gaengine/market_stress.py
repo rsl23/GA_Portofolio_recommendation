@@ -144,7 +144,7 @@ class MarketStressData:
     def window_start(self) -> date:
         return stress_window_start(self.as_of, self.lookback_years)
 
-    def evaluate(self, weights: np.ndarray) -> dict:
+    def evaluate(self, weights: np.ndarray, *, include_details: bool = False) -> dict:
         """Score the basket together: cash has zero return in every scenario."""
         weights = np.asarray(weights, dtype=float)
         if (weights.shape != (len(self.stock_codes),) or not np.isfinite(weights).all()
@@ -159,11 +159,16 @@ class MarketStressData:
         absolute_loss = np.maximum(-scenario_returns, 0)
         relative_loss = np.maximum(self.market_returns - scenario_returns, 0)
         risk = float(np.mean(.5 * absolute_loss + .5 * relative_loss))
-        missing = float(np.mean((~self.known) @ weights))
+        missing_by_event = (~self.known) @ weights
+        missing = float(np.mean(missing_by_event))
         invested = float(weights.sum())
-        return {"risk": risk, "missing_exposure": missing,
-                "event_returns_for_scoring": scenario_returns.tolist(),
-                "evidence_coverage": 1 - missing / invested if invested > 1e-12 else 1.0}
+        result = {"risk": risk, "missing_exposure": missing,
+                  "event_returns_for_scoring": scenario_returns.tolist(),
+                  "evidence_coverage": 1 - missing / invested if invested > 1e-12 else 1.0}
+        if include_details:
+            result.update(absolute_losses=absolute_loss.tolist(), relative_losses=relative_loss.tolist(),
+                          missing_exposure_by_event=missing_by_event.tolist())
+        return result
 
     def summary(self) -> dict:
         per_stock = {}

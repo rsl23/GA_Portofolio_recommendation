@@ -24,6 +24,7 @@ from .population import create_initial_population, create_rebalance_population
 from .profile_policy import ProfileConstraintError, ProfilePolicy, _project
 from .progress import report_candidates, report_generation
 from .fitness_context import fitness_inputs_scope
+from .ga_config import RiskProfile
 
 
 @dataclass(frozen=True)
@@ -37,12 +38,41 @@ class Limits:
 
 
 POLICY_VERSION = "composition-v2-risk-caps-v3"
+ADAPTIVE_POLICY_VERSION = "composition-v2-conservative-adaptive-v1"
 
 LIMITS = {
     "Conservative": Limits(0.0, 1.10, 0.60, 0.20, 0.35, 0.0),
     "Moderate": Limits(0.0, 1.25, 0.30, 0.25, 0.45, 0.10),
     "Aggressive": Limits(0.0, 1.50, 0.00, 0.35, 0.60, 0.25),
 }
+ADAPTIVE_CONSERVATIVE_LIMITS = Limits(0.0, 1.15, 0.40, 0.22, 0.40, 0.10)
+ADAPTIVE_VOLATILITY_PENALTY = 0.30
+ADAPTIVE_DRAWDOWN_SESSIONS = 126
+ADAPTIVE_DRAWDOWN_LIMIT = 0.12
+
+
+def uses_adaptive_conservative(config):
+    return (config.composition_v2_adaptive and config.is_rebalance
+            and config.profile is RiskProfile.CONSERVATIVE
+            and config.fitness_policy == "legacy_cvar_v1")
+
+
+def configure_conservative_rebalance(config, market_status):
+    """Freeze the signal-date fitness choice for optimization and execution."""
+    if (not config.is_rebalance or config.profile is not RiskProfile.CONSERVATIVE
+            or config.fitness_policy != "legacy_cvar_v1" or market_status != "normal"):
+        return config
+    history = np.asarray(config.data.profile_features.benchmark_returns, dtype=float)
+    history = history[-ADAPTIVE_DRAWDOWN_SESSIONS:]
+    if (history.size < ADAPTIVE_DRAWDOWN_SESSIONS
+            or not np.isfinite(history).all() or np.any(history <= -1.0)):
+        return config
+    wealth = np.cumprod(1.0 + history)
+    drawdown = 1.0 - float(wealth[-1]) / max(1.0, float(wealth.max()))
+    if drawdown >= ADAPTIVE_DRAWDOWN_LIMIT:
+        return config
+    return replace(config, composition_v2_adaptive=True, dividend_bonus_override=0.45,
+                   mdd_penalty_override=1.30, lambda_cvar=0.65 / config.profile.lambda_mdd)
 
 
 def _prepare(config):
@@ -53,7 +83,8 @@ def _prepare(config):
         raise ProfileConstraintError("Attach as-of profile_features before running composition_v2.")
     if not hasattr(features, "covariance"):
         features.prepare(config.data)
-    limits = LIMITS[config.profile.value]
+    limits = (ADAPTIVE_CONSERVATIVE_LIMITS if uses_adaptive_conservative(config)
+              else LIMITS[config.profile.value])
     if config.max_stocks * limits.max_stock_weight < 1 - 1e-9:
         raise ProfileConstraintError("max_stocks is too small for the stock-weight cap.")
     if int(features.core_mask.sum()) * limits.max_stock_weight < limits.min_core_weight - 1e-9:
@@ -91,7 +122,7 @@ def metrics(config, lots, *, prices_per_lot=None):
     }
     return {
         "version": "composition_v2_experiment",
-        "policy_version": POLICY_VERSION,
+        "policy_version": ADAPTIVE_POLICY_VERSION if uses_adaptive_conservative(config) else POLICY_VERSION,
         "risk_basis": "invested_equity_basket",
         "profile": config.profile.value,
         "as_of": features.as_of,
@@ -250,6 +281,8 @@ class ExperimentalChromosome(Chromosome):
         signal = float(np.clip(self.roi_annual / result["benchmark_volatility"], -2, 2))
         self.upside_signal = signal
         self.fitness = float(base + result["limits"]["upside_coefficient"] * signal)
+        if uses_adaptive_conservative(self.config):
+            self.fitness -= ADAPTIVE_VOLATILITY_PENALTY * result["volatility_ratio"]
         return self.fitness
 
 

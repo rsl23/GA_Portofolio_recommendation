@@ -40,7 +40,7 @@ def nonblocking_analysis_logging():
     names = ("src.gaengine.progress", "src.gaengine.data_loader",
              "src.backend.controller.portfolio_controller",
              "src.backend.services.portfolio_progress",
-             "src.backend.services.openai_llm_caller", "src.backend.services.portfolio_news")
+             "src.postprocessing.openai_llm_caller", "src.postprocessing.portfolio_news")
     bridges = []
     for name in names:
         logger = logging.getLogger(name)

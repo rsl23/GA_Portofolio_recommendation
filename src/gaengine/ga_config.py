@@ -95,6 +95,7 @@ class GAConfig:
     risk_profile: str = "Moderate"
     profile_policy: str = "legacy"
     fitness_policy: str = "legacy"
+    composition_v2_adaptive: bool = False
     risk_free_rate: float = 0.0625
     correlation_penalty: float = 0.5   # gamma
     fundamental_bonus: float = 0.8     # alpha

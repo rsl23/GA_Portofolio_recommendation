@@ -7,7 +7,6 @@ from pydantic import BaseModel, Field
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from src.backend.models.database import get_db
-from src.backend.models.users import User
 from src.backend.core.deps import get_current_user
 from src.backend.models.schemas.portfolio_schema import (
     ApiResponse,
@@ -81,10 +80,6 @@ def api_generate_rebalance_series_stream(
     return portfolio_progress_response(operation)
 
 
-class BearPolicyUpdate(BaseModel):
-    policy: Literal["manual", "always_follow", "always_full"]
-
-
 class BearImpactRequest(BaseModel):
     start_date: date | None = None
     end_date: date | None = None
@@ -149,26 +144,6 @@ def portfolio_evaluation_endpoint(
         except (OSError, ValueError, KeyError) as exc:
             result["bear"] = {"status": "unavailable", "reason": str(exc)}
     return ApiResponse(data=result)
-
-
-@router.get("/bear-policy", response_model=ApiResponse[dict])
-def api_get_bear_policy(db: Session = Depends(get_db),
-                        current_user: dict = Depends(get_current_user)):
-    user = db.query(User).filter(User.id == UUID(current_user["sub"])).first()
-    if user is None:
-        raise HTTPException(status_code=404, detail="User tidak ditemukan.")
-    return ApiResponse(data={"policy": user.bear_allocation_policy})
-
-
-@router.patch("/bear-policy", response_model=ApiResponse[dict])
-def api_update_bear_policy(body: BearPolicyUpdate, db: Session = Depends(get_db),
-                           current_user: dict = Depends(get_current_user)):
-    user = db.query(User).filter(User.id == UUID(current_user["sub"])).first()
-    if user is None:
-        raise HTTPException(status_code=404, detail="User tidak ditemukan.")
-    user.bear_allocation_policy = body.policy
-    db.commit()
-    return ApiResponse(data={"policy": body.policy})
 
 
 @router.get("/bear-market-preview", response_model=ApiResponse[dict])
@@ -447,6 +422,41 @@ def api_my_portfolio(
         ),
         data=hasil,
     )
+
+
+@router.get("/{portfolio_id}/news", response_model=ApiResponse[dict])
+def api_portfolio_news(
+    portfolio_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Read dated issuer news independently of portfolio generation."""
+    from src.backend.models.portofolios import Portofolio
+    from src.backend.controller.portfolio_controller import _snapshot_positions
+    from src.postprocessing.portfolio_news import load_portfolio_news
+    from src.postprocessing.news_context import normalize_news_context
+    from src.postprocessing.cancellable_io import cancellable_io
+
+    portfolio = db.query(Portofolio).filter(
+        Portofolio.id == portfolio_id, Portofolio.user_id == UUID(current_user["sub"]),
+    ).first()
+    if portfolio is None:
+        raise HTTPException(status_code=404, detail="Portofolio tidak ditemukan.")
+    metadata = portfolio.rebalance_metadata or {}
+    positions = _snapshot_positions(db, portfolio.id)
+    context = {
+        "tanggal_acuan": portfolio.date_ref or portfolio.created_at,
+        "tanggal_harga_keputusan": metadata.get("signal_date") or metadata.get("valuation_mark_date"),
+        "emiten_terpilih": [{"ticker": code} for code in positions],
+    }
+    saved_news = metadata.get("news_context") or {}
+    if saved_news.get("status") in {"available", "disabled"} or saved_news.get("items"):
+        return ApiResponse(data=normalize_news_context(context, saved_news))
+    try:
+        news = cancellable_io(lambda: load_portfolio_news(context), timeout=15.)
+    except Exception:
+        news = normalize_news_context(context, {"reason": "Sumber berita belum dapat diakses. Coba kembali nanti."})
+    return ApiResponse(data=news)
 
 
 @router.get("/my-portfolio/history", response_model=ApiResponse[list[PortfolioHistoryItem]])

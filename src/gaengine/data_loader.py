@@ -9,7 +9,7 @@ Yang berbeda hanyalah SUMBER DATA-nya; perakitan matriks (returns, korelasi,
 skor fundamental) memakai SATU kode yang sama sehingga hasil live & backtest
 apple-to-apple.
 
-    mode LIVE      -> filtered_stock_cache (DB) + yfinance 1y + ZAPI Pluang
+    mode LIVE      -> filtered_stock_cache (TradingView + dividen Pluang) + yfinance 1y
                       + BI rate API (fallback tabel resmi Bank Indonesia)
     mode BACKTEST  -> run_live_preprocessing(backtest=True, date=date_ref)
                       + Master_OHLCV_15Tahun.parquet
@@ -184,58 +184,11 @@ def _fmt_rf(rf: Optional[float]) -> str:
 # ======================================================================
 # HELPER MODE LIVE
 # ======================================================================
-def _parse_float_string(val_str):
-    """
-    Mengubah string teks finansial seperti 'Rp466.74', '13.61x', '20.44%', atau '-'
-    menjadi tipe data float bersih yang bisa disimpan di database.
-    """
-    if not val_str or val_str == "-" or val_str == "N/A":
-        return np.nan
-
-    # Hapus karakter mata uang, pengali, persen, koma ribuan, dan spasi kosong
-    clean_str = str(val_str).replace("Rp", "").replace(",", "").replace("x", "").replace("%", "").strip()
-
-    try:
-        return float(clean_str)
-    except ValueError:
-        return 0.0
-
-
 def process_single_fundamental(kode):
-    """Fungsi mandiri untuk 1 saham: tarik & parse data fundamental Pluang."""
-    from src.backend.services.api_pluang import fetch_api_pluang_fundamentals
-    
-    data = fetch_api_pluang_fundamentals(kode)
-    if not data:
-        return None
-
-    try:
-        actual_data = data.get("data", {})
-        
-        ratios = actual_data.get("ratios", {})
-        overview = actual_data.get("overview", {})
-
-        # Ekstraksi string dari JSON sesuai path
-        eps_str = overview.get("eps", "0")
-        per_str = ratios.get("valuation", {}).get("pe", "0")
-        pbv_str = ratios.get("valuation", {}).get("pb", "0")
-        roe_str = ratios.get("profitability", {}).get("roe", "0")
-        der_str = ratios.get("solvency", {}).get("de", "0")
-        div_str = ratios.get("dividend", {}).get("ttm", "0")
-
-        # Parse semua ke bentuk Float bersih
-        return {
-            "kode": kode,
-            "eps": _parse_float_string(eps_str),
-            "per": _parse_float_string(per_str),
-            "pbv": _parse_float_string(pbv_str),
-            "roe": _parse_float_string(roe_str),
-            "der": _parse_float_string(der_str),
-            "dividend_yield": _parse_float_string(div_str)
-        }
-    except Exception as e:
-        print(f"Error parsing data fundamental Pluang untuk {kode}: {e}")
-        return None
+    """Optional manual refresh fetches only Pluang dividend yield."""
+    from src.backend.services.api_pluang import fetch_api_pluang_fundamentals, parse_pluang_fundamentals
+    parsed = parse_pluang_fundamentals(fetch_api_pluang_fundamentals(kode))
+    return {"kode": kode, "dividend_yield": parsed["dividend_yield"]} if parsed is not None else None
 
 
 def take_ohlcv_data(as_of: Optional[date] = None):
@@ -280,8 +233,8 @@ def take_ohlcv_data(as_of: Optional[date] = None):
 
 def take_fundamental_data():
     """
-    LIVE: Tarik data fundamental Pluang untuk saham yang lolos filter dan
-    update kolom eps/per/pbv/roe/der/dividend_yield di filtered_stock_cache.
+    LIVE: Penyegaran manual hanya untuk dividend_yield Pluang pada cache.
+    EPS/PER/PBV/ROE/DER dari TradingView tidak ditimpa.
 
     CATATAN: Multithreading (10 workers) sengaja dinonaktifkan; fetch berjalan
     SEQUENTIAL agar tidak membebani server API ZAPI.
@@ -310,11 +263,6 @@ def take_fundamental_data():
                 .first()
             )
             if db_item:
-                db_item.eps = res_dict["eps"]
-                db_item.per = res_dict["per"]
-                db_item.pbv = res_dict["pbv"]
-                db_item.roe = res_dict["roe"]
-                db_item.der = res_dict["der"]
                 db_item.dividend_yield = res_dict["dividend_yield"]
 
         db.commit()
@@ -633,17 +581,6 @@ def _provide_backtest_data(date_ref: date, lookback_days: int):
     if not traded_days:
         raise ValueError(f"Tidak ada hari dengan volume perdagangan hingga {date_ref}.")
     last_session = max(traded_days)
-    traded_codes = set(df_price.loc[
-        (df_price["Date"] == last_session) & (volume > 0), "Ticker",
-    ])
-    unavailable = sorted(set(codes) - traded_codes)
-    if unavailable:
-        logger.info("[BACKTEST] %d kandidat tidak berdagang pada hari keputusan %s; "
-                    "dikeluarkan sebelum GA: %s", len(unavailable), last_session.date(),
-                    unavailable[:TRACE_SAMPLE])
-    codes = [code for code in codes if code in traded_codes]
-    if not codes:
-        raise ValueError(f"Tidak ada kandidat yang berdagang pada {last_session.date()}.")
     window = df_price[
         (df_price["Date"] <= ts_ref) &
         (df_price["Date"] > ts_ref - pd.Timedelta(days=lookback_days)) &
@@ -653,10 +590,20 @@ def _provide_backtest_data(date_ref: date, lookback_days: int):
     if window.empty:
         raise ValueError(f"Tidak ada data OHLCV untuk window {lookback_days} hari sebelum {date_ref}.")
 
-    df_close = (
-        window.pivot_table(index="Date", columns="Ticker", values="Close", aggfunc="last")
-        .sort_index()
-    )
+    # Signal valuation uses only trades already observed by the cutoff. A
+    # suspension carries the last trade as a mark, never as an executable price.
+    past_trades = df_price.loc[
+        (df_price["Date"] <= ts_ref) & df_price["Ticker"].isin(codes)
+        & (volume > 0) & pd.to_numeric(df_price["Close"], errors="coerce").gt(0)
+        & np.isfinite(pd.to_numeric(df_price["Close"], errors="coerce"))
+    ]
+    df_close = past_trades.pivot_table(
+        index="Date", columns="Ticker", values="Close", aggfunc="last",
+    ).sort_index()
+    sessions = pd.DatetimeIndex(sorted(traded_days))
+    df_close = df_close.reindex(df_close.index.union(sessions)).ffill().reindex(sessions)
+    traded_codes = set(past_trades.loc[past_trades.Date == last_session, "Ticker"])
+    df_close.attrs['untraded_tickers'] = sorted(set(codes) - traded_codes)
 
     # Likuiditas = ADTV 60 HARI BURSA TERAKHIR (ETV = Close x Volume), bukan
     # rata-rata seluruh window. Urutkan kronologis per ticker dulu agar
@@ -723,6 +670,7 @@ def _provide_backtest_data(date_ref: date, lookback_days: int):
             div_map.get(t, 0.0),
         ]
 
+    df_close.attrs["eps_by_ticker"] = {t: _safe_value(df_lolos.get("EPS"), t) for t in codes}
     logger.info("[BACKTEST] metrics_map selesai: %s", _probe_metrics_map(metrics_map))
     logger.info("[BACKTEST] _provide_backtest_data selesai dalam %.2fs -> "
                 "df_close=%s, metrics_map(%d), risk_free=%s, liquidity(n=%d)",
@@ -805,7 +753,7 @@ def _provide_live_data(as_of: Optional[date] = None):
     """
     Sumber data LIVE:
       - OHLCV 1 tahun  : yfinance (daftar dari filtered_stock_cache)
-      - Fundamental    : ZAPI Pluang -> kolom filtered_stock_cache
+      - Fundamental    : filtered_stock_cache (TradingView + dividen Pluang)
       - Risk-free rate : API BI (policy-rate terbaru)
 
     Returns: (df_close, metrics_map, risk_free, liquidity)
@@ -814,6 +762,7 @@ def _provide_live_data(as_of: Optional[date] = None):
     report_progress("market", "Mengumpulkan riwayat harga saham",
                     "Menyiapkan harga dan aktivitas perdagangan dari sesi pasar yang sudah selesai.")
     df_ohlcv = take_ohlcv_data(as_of=as_of) if as_of is not None else take_ohlcv_data()
+    # Fundamental is refreshed by preprocessing; do not fetch again for every GA run.
     # take_fundamental_data()
 
     if df_ohlcv is None or df_ohlcv.empty:
@@ -898,6 +847,7 @@ def _provide_live_data(as_of: Optional[date] = None):
     logger.info("[LIVE] df_close=%s", _probe_frame(df_close))
     logger.info("[LIVE] liquidity (ADTV %d hari, IDR)=%s",
                 LIQUIDITY_WINDOW_DAYS, _probe_series(liquidity))
+    df_close.attrs["eps_by_ticker"] = {s.kode: _to_float(getattr(s, "eps", None)) for s in records}
     logger.info("[LIVE] metrics_map: %s", _probe_metrics_map(metrics_map))
     logger.info("[LIVE] risk_free dari API BI: %s", _fmt_rf(risk_free))
     return df_close, metrics_map, risk_free, liquidity
@@ -954,17 +904,12 @@ def _assemble_market_data(
         return None
     df_close = df_close.sort_index()
 
-    # Daily cache entries may survive until the next refresh. Recheck the live
-    # session's volume even when stock_filtering ran on an earlier session.
-    untraded = set(df_close.attrs.get('untraded_tickers') or [])
-    excluded = sorted(set(df_close.columns) & untraded)
-    if excluded:
-        logger.info('Kandidat volume nol/tidak valid pada %s dikeluarkan sebelum GA: %s',
-                    pd.Timestamp(df_close.index[-1]).date(), excluded)
+    # Tradability belongs to execution, not candidate selection. Retain the
+    # provider's untraded diagnostics for the order-filling stage.
     # 1. Kandidat: ada di OHLCV & fundamental, harga terakhir >= min_price
     candidates = [
         c for c in df_close.columns
-        if c not in untraded and c in metrics_map
+        if c in metrics_map
         and pd.notna(df_close[c].iloc[-1]) and df_close[c].iloc[-1] >= min_price
     ]
     candidates = sorted(candidates)
@@ -1023,6 +968,8 @@ def _assemble_market_data(
         price_sources=({c: df_close.attrs['price_sources'][c] for c in candidates}
                        if 'price_sources' in df_close.attrs else None),
         untraded_tickers=df_close.attrs.get('untraded_tickers'),
+        eps_by_ticker={c: value for c, value in df_close.attrs.get("eps_by_ticker", {}).items()
+                       if c in candidates},
     )
 
 
@@ -1092,20 +1039,23 @@ def build_market_data(
                 market_data, df_close, liquidity, DATA_DIR, sector_map,
                 live_benchmark=profile_benchmark_live,
             )
-        # Explicit dividend reward uses the same as-of archive in live/backtest;
-        # live cache dividend_yield has mixed provider units, so do not use it.
-        dividend_date = market_data.price_date
-        if backtest and date_ref is not None:
-            dividend_date = min(dividend_date, pd.Timestamp(date_ref).date())
-        try:
-            div_yields = _load_dividend_yields(
-                market_data.stock_codes, dividend_date,
-                pd.Series(market_data.prices_per_lot / 100, index=market_data.stock_codes),
-            )
-            market_data.dividend_yields = np.array([div_yields.get(c, np.nan) for c in market_data.stock_codes])
-        except (OSError, ValueError, ImportError, KeyError) as exc:
-            logger.warning("Bonus dividen tidak tersedia; tidak diberi reward: %s", exc)
-            market_data.dividend_yields = np.full(market_data.n_stocks, np.nan)
+        if backtest:
+            # Historical decisions use dividend events available as of that date.
+            dividend_date = market_data.price_date
+            if date_ref is not None:
+                dividend_date = min(dividend_date, pd.Timestamp(date_ref).date())
+            try:
+                div_yields = _load_dividend_yields(
+                    market_data.stock_codes, dividend_date,
+                    pd.Series(market_data.prices_per_lot / 100, index=market_data.stock_codes),
+                )
+                market_data.dividend_yields = np.array([div_yields.get(c, np.nan) for c in market_data.stock_codes])
+            except (OSError, ValueError, ImportError, KeyError) as exc:
+                logger.warning("Bonus dividen tidak tersedia; tidak diberi reward: %s", exc)
+                market_data.dividend_yields = np.full(market_data.n_stocks, np.nan)
+        else:
+            # Live screening already stored Pluang yield in the cache.
+            market_data.dividend_yields = market_data.fundamental_metrics[:, 4].copy()
         if include_market_stress:
             decision_date = market_data.price_date
             if backtest and date_ref is not None:

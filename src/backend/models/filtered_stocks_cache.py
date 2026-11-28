@@ -32,7 +32,7 @@ class FilteredStockCache(Base):
     der = Column(Float)
     
     # dividend_yield : FRAKSI (mis. 0.0612 = 6.12%), sama seperti backtest.
-    dividend_yield = Column(Float, default=0.0)
+    dividend_yield = Column(Float, nullable=True)
     
     # Metrik Teknikal
     adtv_60 = Column(Float)
