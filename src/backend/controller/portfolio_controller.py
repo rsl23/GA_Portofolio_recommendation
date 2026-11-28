@@ -31,6 +31,8 @@ from src.backend.models.schemas.portfolio_schema import (
 )
 from src.postprocessing.openai_llm_caller import LLM_ERROR_PREFIX, explain_portfolio
 from src.postprocessing.narrative_style import NARRATIVE_VERSION
+from src.postprocessing.prompt_builder import build_portfolio_context
+from src.postprocessing.portfolio_explanation import build_portfolio_explanation, render_explanation_text
 from src.backend.services.portfolio_dividends import (
     DividendDataUnavailableError, dividend_entitlements, load_dividend_history,
 )
@@ -1631,39 +1633,35 @@ def generate_new_portfolio(
         )
     narasi += " Kinerja historis tidak menjamin hasil investasi mendatang dan informasi ini bukan nasihat keuangan."
 
-    # 4b. Narasi LLM (OpenAI): menjelaskan MENGAPA & BAGAIMANA portofolio ini
-    #     terpilih oleh GA -- metrik fitness function (Sharpe, MDD, korelasi,
-    #     bonus fundamental), batasan budget/diversifikasi, serta peran tiap
-    #     emiten pemenang. Bahan/prompt dirakit src/postprocessing/prompt_builder.py,
-    #     pemanggilan model ada di src/postprocessing/openai_llm_caller.py.
-    #     Bila gagal (tanpa API key, timeout, dsb) -> None, narasi template dipakai.
+    # Explain the combination; stock notes describe characteristics, not causal
+    # selection reasons. The same computed context supports LLM-off and fallback.
+    narrative_kwargs = dict(
+        solution=solution, selection_solution=selection_solution,
+        market_data=market_data, config=config, allocations=allocations,
+        mode="backtest" if backtest else "live", date_ref=date_ref,
+        budget=request.budget, expected_return=expected_return,
+        generations_run=len(engine.history), rebalance_deltas=rebalance_deltas,
+        reporting={
+            "cash_after": float(cash_after), "transaction_costs": float(transaction_costs),
+            "investment_total": float(holdings_after),
+            "execution_prices": {code: float(price) for code, price in execution_price_map.items()},
+            "exposure_limit": exposure_limit,
+            "uncovered_positions": sorted(frozen - set(market_data.stock_codes)),
+            "guarded_decision": {"reason": rebalance_diagnostics.get("reason")} if guarded else None,
+        },
+    )
+    narrative_context = None
+    try:
+        narrative_context = build_portfolio_context(**narrative_kwargs)
+    except (ValueError, TypeError, KeyError, AttributeError) as exc:
+        logger.warning("Konteks penjelasan terstruktur belum tersedia: %s", exc)
     use_llm = not request.rebalance or request.generate_llm_narrative
     narasi_llm = None
     if use_llm:
         report_progress("narrative", "Merangkai penjelasan untuk Anda",
                         "Menjelaskan hasil portofolio, merangkum risiko, dan mencari konteks berita sesuai tanggal keputusan.")
         narasi_llm = explain_portfolio(
-            solution=solution,
-            selection_solution=selection_solution,
-            market_data=market_data,
-            config=config,
-            allocations=allocations,
-            mode="backtest" if backtest else "live",
-            date_ref=date_ref,
-            budget=request.budget,
-            expected_return=expected_return,
-            generations_run=len(engine.history),
-            fallback=None,
-            rebalance_deltas=rebalance_deltas,
-            reporting={
-                "cash_after": float(cash_after),
-                "transaction_costs": float(transaction_costs),
-                "investment_total": float(holdings_after),
-                "execution_prices": {code: float(price) for code, price in execution_price_map.items()},
-                "exposure_limit": exposure_limit,
-                "uncovered_positions": sorted(frozen - set(market_data.stock_codes)),
-                "guarded_decision": {"reason": rebalance_diagnostics.get("reason")} if guarded else None,
-            },
+            context=narrative_context, fallback=None, **narrative_kwargs,
         )
     if narasi_llm and narasi_llm.startswith(LLM_ERROR_PREFIX):
         narasi_llm = None
@@ -1706,6 +1704,14 @@ def generate_new_portfolio(
 
     if backtest and not narasi_llm:
         narasi += f" Simulasi memakai data historis per {date_ref}, bukan kondisi pasar saat ini."
+
+    explanation = getattr(narasi_llm, "explanation", None)
+    if explanation is None and not narasi_llm and narrative_context is not None:
+        explanation = build_portfolio_explanation(narrative_context)
+    if explanation is not None:
+        explanation["limitations"] = list(dict.fromkeys(explanation["limitations"] + execution_notes))
+        rebalance_diagnostics["explanation"] = explanation
+        narasi = render_explanation_text(explanation)
 
     report_progress("saving", "Menyimpan hasil analisis",
                     "Menyiapkan rincian portofolio agar siap Anda tinjau.")
@@ -2122,8 +2128,8 @@ def generate_rebalance_series(
         scheduled_dates=schedule,
         portfolios=portfolios,
         skipped=skipped,
-        evaluation_mode=("legacy" if not request.bear_management else
-                         "automatic_strategy" if policy in ("always_follow", "always_full") else "what_if"),
+        # The request carries per-date choices, not an automatic strategy policy.
+        evaluation_mode="what_if" if request.bear_management else "legacy",
     )
 
 

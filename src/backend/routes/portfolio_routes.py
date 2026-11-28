@@ -8,6 +8,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from src.backend.models.database import get_db
 from src.backend.core.deps import get_current_user
+from src.backend.services.analysis_queue import analysis_slot
 from src.backend.models.schemas.portfolio_schema import (
     ApiResponse,
     PortfolioGenerateRequest,
@@ -62,7 +63,7 @@ def api_generate_portfolio_stream(
         with SessionLocal() as db:
             return _generate_portfolio_response(request, body, db=db, current_user=current_user)
 
-    return portfolio_progress_response(operation)
+    return portfolio_progress_response(operation, user_id=current_user["sub"])
 
 
 @router.post("/generate-rebalance-series/stream")
@@ -77,7 +78,7 @@ def api_generate_rebalance_series_stream(
         with SessionLocal() as db:
             return _generate_rebalance_series_response(body, db=db, current_user=current_user)
 
-    return portfolio_progress_response(operation)
+    return portfolio_progress_response(operation, user_id=current_user["sub"])
 
 
 class BearImpactRequest(BaseModel):
@@ -203,7 +204,8 @@ def api_generate_portfolio(
     # still return JSON to the same request, without a 404 or a second mutation.
     if "text/event-stream" in getattr(request, "headers", {}).get("accept", ""):
         return api_generate_portfolio_stream(request, body, current_user=current_user)
-    return _generate_portfolio_response(request, body, db, current_user)
+    with analysis_slot(current_user["sub"]):
+        return _generate_portfolio_response(request, body, db, current_user)
 
 
 def _generate_portfolio_response(request, body, db, current_user):
@@ -309,7 +311,8 @@ def api_generate_rebalance_series(
     """Jalankan rebalance berantai, dengan pilihan respons JSON atau progres SSE."""
     if request is not None and "text/event-stream" in request.headers.get("accept", ""):
         return api_generate_rebalance_series_stream(body, current_user=current_user)
-    return _generate_rebalance_series_response(body, db, current_user)
+    with analysis_slot(current_user["sub"]):
+        return _generate_rebalance_series_response(body, db, current_user)
 
 
 def _generate_rebalance_series_response(body, db, current_user):

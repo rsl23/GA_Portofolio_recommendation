@@ -1,4 +1,6 @@
 import os
+from uuid import UUID
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
@@ -6,10 +8,20 @@ class Settings(BaseSettings):
     X_API_KEY: str = os.getenv("X_API_KEY", "")
     BASE_URL: str = os.getenv("BASE_URL", "https://api.zpi.web.id/v1")
     DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite:///./portfolio.db")
-    JWT_SECRET_KEY: str = os.getenv("JWT_SECRET_KEY", "genfolio_ta_secret_key_min_32_bytes_long!!")
+    JWT_SECRET_KEY: str = os.getenv("JWT_SECRET_KEY")
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
+
+    ANALYSIS_MAX_CONCURRENT: int = Field(default=1, ge=1, le=8)
+    ANALYSIS_MAX_QUEUED: int = Field(default=20, ge=0, le=100)
+    # Comma-separated immutable account IDs; an empty list grants no admin access.
+    ADMIN_USER_IDS: str = ""
+
+    @field_validator("ADMIN_USER_IDS")
+    @classmethod
+    def validate_admin_ids(cls, value: str) -> str:
+        return ",".join(str(UUID(item.strip())) for item in value.split(",") if item.strip())
 
     # ------------------------------------------------------------------
     # LLM (OpenAI Responses API) untuk narasi penjelasan hasil GA.

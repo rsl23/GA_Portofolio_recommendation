@@ -8,6 +8,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from src.backend.services.api_idx import fetch_api_idx_saham, fetch_api_stock_summary
+from src.backend.services.api_pluang import fetch_api_pluang_fundamentals, parse_pluang_fundamentals
+from src.backend.services.api_tradingview import fetch_api_tradingview_fundamentals, parse_tradingview_fundamentals
 from src.backend.models.database import SessionLocal
 from src.backend.models.stock_universe import StockUniverse
 
@@ -733,6 +735,51 @@ def fetch_fundamental_minimal(ticker):
         return None
 
 
+def fetch_pluang_fundamental_minimal(ticker):
+    """Live fundamentals from ZAPI Pluang, normalized before screening."""
+    try:
+        parsed = parse_pluang_fundamentals(fetch_api_pluang_fundamentals(ticker))
+        if parsed is None:
+            return None
+        return {
+            'Kode': ticker, 'EPS': parsed['eps'], 'ROE': parsed['roe'],
+            'DER': parsed['der'], 'PER': parsed['per'], 'PBV': parsed['pbv'],
+            'dividend_yield_ttm': parsed['dividend_yield'],
+        }
+    except Exception as exc:
+        logger.warning("Fundamental Pluang %s belum tersedia (%s).", ticker, type(exc).__name__)
+        return None
+
+
+def fetch_tradingview_fundamental_minimal(ticker, close):
+    """Use TradingView for fundamentals and Pluang for dividend yield TTM."""
+    try:
+        parsed = parse_tradingview_fundamentals(fetch_api_tradingview_fundamentals(ticker), close, code=ticker)
+        if parsed is None:
+            return None
+        dividend_yield = np.nan
+        try:
+            pluang = parse_pluang_fundamentals(fetch_api_pluang_fundamentals(ticker))
+            if pluang is not None:
+                dividend_yield = _fundamental_number(pluang['dividend_yield'])
+        except Exception as exc:
+            logger.warning("Dividen Pluang %s belum tersedia (%s).", ticker, type(exc).__name__)
+        return {
+            'Kode': ticker, 'EPS': parsed['eps'], 'ROE': parsed['roe'],
+            'DER': parsed['der'], 'PER': parsed['per'], 'PBV': parsed['pbv'],
+            'dividend_yield_ttm': dividend_yield,
+        }
+    except Exception as exc:
+        logger.warning("Fundamental TradingView %s belum tersedia (%s).", ticker, type(exc).__name__)
+        return None
+
+
+# Mode TradingView memakai Pluang hanya untuk dividend yield TTM.
+LIVE_FUNDAMENTAL_PROVIDER = 'tradingview'
+# LIVE_FUNDAMENTAL_PROVIDER = 'pluang'
+# LIVE_FUNDAMENTAL_PROVIDER = 'yfinance'
+
+
 def _fundamental_number(value):
     """Keep unavailable metrics missing; one missing field must not erase others."""
     try:
@@ -823,11 +870,10 @@ def _fill_live_screening_closes(frame, quotes):
     return frame
 
 def filter_traded_candidates(codes, session_date, *, bars=None):
-    """Keep only positive Close and traded volume on the exact requested session.
+    """Screen valuation evidence, independently of execution-day volume.
 
-    Missing rows/volume are not filled from another day. Candidate screening
-    must use a session no later than the GA decision date. Execution-session
-    availability is checked separately after the GA has made its decision.
+    A zero-volume session does not invalidate an otherwise eligible candidate.
+    Actual traded volume is required later when filling the resulting orders.
     """
     codes = list(codes)
     if not codes:
@@ -841,14 +887,12 @@ def filter_traded_candidates(codes, session_date, *, bars=None):
                      ('Ticker', 'in', [f'{code}.JK' for code in codes])],
         )
     close = pd.to_numeric(bars['Close'], errors='coerce')
-    volume = pd.to_numeric(bars['Volume'], errors='coerce')
     valid = (pd.to_datetime(bars['Date']).dt.normalize().eq(session)
-             & np.isfinite(close) & close.gt(0)
-             & np.isfinite(volume) & volume.gt(0))
+             & np.isfinite(close) & close.gt(0))
     traded = set(bars.loc[valid, 'Ticker'].astype(str).str.removesuffix('.JK'))
     excluded = [code for code in codes if code not in traded]
     if excluded:
-        print(f"   [!] Tidak ada Close/volume perdagangan valid pada sesi acuan "
+        print(f"   [!] Tidak ada harga penilaian valid pada sesi acuan "
               f"{session.date()} ({len(excluded)} saham); dikeluarkan sebelum GA: {excluded[:7]}...")
     return [code for code in codes if code in traded]
 
@@ -954,7 +998,7 @@ def run_live_preprocessing(backtest: bool = False, date: date = None):
         )
         df_fund = df_fund_full[df_fund_full['Kode'].isin(tickers_master)].set_index('Kode')
     else:
-        print("2. Mengunduh Fundamental & OHLCV via yfinance...")
+        print(f"2. Mengunduh OHLCV via yfinance & Fundamental via {LIVE_FUNDAMENTAL_PROVIDER}...")
 
         # Use provider Close consistently with the GA price loader. Automatic
         # adjustment would change Close x Volume and the abnormal-price signals.
@@ -968,6 +1012,7 @@ def run_live_preprocessing(backtest: bool = False, date: date = None):
         # Cache Close and its source date must describe the same observed bar.
         # Do not store today's IDX date against a previous Yahoo quote.
         session = pd.Timestamp(df_tech.index[-1])
+        df_master['Close'] = pd.to_numeric(df_master['Close'], errors='coerce').astype(float)
         for code in df_master.index:
             frame = df_tech[code + '.JK'] if isinstance(df_tech.columns, pd.MultiIndex) else df_tech
             df_master.at[code, 'Close'] = _fundamental_number(frame['Close'].iloc[-1])
@@ -976,11 +1021,30 @@ def run_live_preprocessing(backtest: bool = False, date: date = None):
 
         # Eksekusi Multithreading untuk data fundamental (EPS, ROE, DER)
         fundamentals = []
-        with ThreadPoolExecutor(max_workers=20) as executor:
-            futures = {executor.submit(fetch_fundamental_minimal, t): t for t in df_master.index}
-            for future in as_completed(futures):
+        # ZAPI requests are sequential to avoid overloading the API; Yahoo retains parallel fetching.
+        if LIVE_FUNDAMENTAL_PROVIDER == 'tradingview':
+            def fetcher(code):
+                return fetch_tradingview_fundamental_minimal(code, df_master.at[code, 'Close'])
+            workers = 1
+        elif LIVE_FUNDAMENTAL_PROVIDER == 'pluang':
+            fetcher, workers = fetch_pluang_fundamental_minimal, 1
+        elif LIVE_FUNDAMENTAL_PROVIDER == 'yfinance':
+            fetcher, workers = fetch_fundamental_minimal, 20
+        else:
+            raise ValueError(f"Provider fundamental live tidak dikenal: {LIVE_FUNDAMENTAL_PROVIDER}")
+        total_fundamentals = len(df_master.index)
+        provider_label = ('TradingView + dividen Pluang'
+                          if LIVE_FUNDAMENTAL_PROVIDER == 'tradingview' else LIVE_FUNDAMENTAL_PROVIDER)
+        print(f"2a. Mengambil fundamental {provider_label}: "
+              f"{total_fundamentals} saham, {workers} worker...", flush=True)
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(fetcher, t): t for t in df_master.index}
+            for completed, future in enumerate(as_completed(futures), start=1):
                 res = future.result()
                 if res: fundamentals.append(res)
+                if completed == 1 or completed % 5 == 0 or completed == total_fundamentals:
+                    print(f"   [{completed}/{total_fundamentals}] Fundamental "
+                          f"{futures[future]}: {len(fundamentals)} respons tersedia", flush=True)
 
         df_fund = pd.DataFrame(fundamentals, columns=[
             'Kode', 'EPS', 'ROE', 'DER', 'PER', 'PBV', 'dividend_yield_ttm']).set_index('Kode')
@@ -1161,9 +1225,11 @@ def run_live_preprocessing(backtest: bool = False, date: date = None):
     rows = []
     for code in df_lolos.index:
         frame = df_tech[code + '.JK'] if isinstance(df_tech.columns, pd.MultiIndex) else df_tech
-        observed = frame.loc[pd.to_datetime(frame.index).normalize() == session]
+        observed = frame.loc[pd.to_datetime(frame.index).normalize() <= session].sort_index()
         if not observed.empty:
-            row = observed.iloc[-1]
+            row = observed.iloc[-1].copy()
+            valid_closes = pd.to_numeric(observed['Close'], errors='coerce')
+            row['Close'] = valid_closes.where(np.isfinite(valid_closes) & valid_closes.gt(0)).ffill().iloc[-1]
             rows.append(dict(Date=session, Ticker=code,
                              Close=row['Close'], Volume=row['Volume']))
     selected = filter_traded_candidates(

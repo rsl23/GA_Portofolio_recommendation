@@ -1,8 +1,13 @@
 import jwt
+from uuid import UUID
 from fastapi import Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from src.backend.core.security import decode_token
+from src.backend.core.config import settings
+from src.backend.models.database import get_db
+from src.backend.models.users import User
+from sqlalchemy.orm import Session
 
 # Skema Bearer: mengambil token dari header "Authorization: Bearer <token>"
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -49,6 +54,22 @@ def get_current_user(
         )
 
     return payload
+
+
+def get_current_admin(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Admin authority comes from server configuration, never client claims/IP."""
+    try:
+        user_id = UUID(current_user.get("sub", ""))
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise HTTPException(403, "Akses hanya untuk admin.") from exc
+    if str(user_id) not in settings.ADMIN_USER_IDS.split(","):
+        raise HTTPException(403, "Akses hanya untuk admin.")
+    if db.query(User).filter(User.id == user_id).first() is None:
+        raise HTTPException(403, "Akun admin tidak tersedia.")
+    return current_user
 
 
 def get_refresh_payload(

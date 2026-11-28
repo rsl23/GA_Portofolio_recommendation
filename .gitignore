@@ -67,6 +67,7 @@ logs/
 *.csv
 docs/
 test_*
+!test_analysis_admission.py
 reports/
 
 tuning/

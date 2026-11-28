@@ -37,17 +37,6 @@ def recommend_fraction(status: str, severity: float | None, risk_profile: str,
     return round(base - severity * (base - minimum), 6)
 
 
-def resolve_bear_choice(policy: str, status: str, manual_choice: str | None = None) -> str | None:
-    """Resolve account policy; always_full is an explicit standing full-capital choice."""
-    if policy == "always_full":
-        return "full"
-    if policy == "always_follow":
-        return "recommended" if status != "unknown" else manual_choice
-    if policy == "manual":
-        return manual_choice
-    raise ValueError("Kebijakan alokasi akun tidak dikenal.")
-
-
 def effective_fraction(assessment: dict, risk_profile: str, choice: str | None) -> float:
     """Resolve explicit user choice; unknown never silently becomes full."""
     if choice == "full":

@@ -14,7 +14,7 @@ from src.backend.controller.market_controller import (
     run_daily_pipeline,
 )
 from src.backend.services.price_history_service import sync_market_data
-from src.backend.core.deps import get_current_user
+from src.backend.core.deps import get_current_admin
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -22,16 +22,8 @@ _manual_pipeline_lock = Lock()
 
 
 @router.post("/run-daily-pipeline", response_model=ApiResponse[dict])
-def run_daily_pipeline_endpoint(request: Request):
-    """Manually run the existing daily pipeline from the local machine only.
-
-    This diagnostic endpoint intentionally has no JWT dependency. It must not
-    be exposed through a public reverse proxy: the pipeline is expensive and
-    refreshes shared database caches. The scheduler remains unchanged.
-    """
-    client_host = request.client.host if request.client else None
-    if client_host not in ("127.0.0.1", "::1"):
-        raise HTTPException(status_code=403, detail="Endpoint pipeline manual hanya tersedia dari localhost.")
+def run_daily_pipeline_endpoint(request: Request, current_admin: dict = Depends(get_current_admin)):
+    """Refresh shared market caches only for an authenticated configured admin."""
     if not _manual_pipeline_lock.acquire(blocking=False):
         raise HTTPException(status_code=409, detail="Pipeline manual masih berjalan.")
     try:
@@ -65,6 +57,7 @@ def filter_stocks_endpoint(
     background_tasks: BackgroundTasks,
     backtest: bool = False,
     date_ref: date | None = None,
+    current_admin: dict = Depends(get_current_admin),
 ):
     """
     Endpoint tipis: seluruh logika ada di market_controller.
@@ -104,14 +97,14 @@ def filter_stocks_last_update_endpoint(db: Session = Depends(get_db)):
 @router.post("/sync-prices", response_model=ApiResponse[dict])
 def sync_prices_endpoint(
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
+    current_admin: dict = Depends(get_current_admin),
 ):
     """
     Lengkapi tanggal harga yang belum tersimpan (OHLCV via yfinance) untuk
     saham yang pernah dibeli dalam mode LIVE. Rentang dimulai dari pembelian
     live terawal hingga
     sesi terakhir yang selesai; tanggal lengkap tidak diunduh ulang.
-    Dipanggil oleh job harian (cron/scheduler) atau manual oleh user login.
+    Dipanggil oleh job harian (cron/scheduler) atau manual oleh admin.
     """
     stats = sync_market_data(db)
     return ApiResponse(
